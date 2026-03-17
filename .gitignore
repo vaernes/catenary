@@ -1,0 +1,39 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# ISO build artifacts
+*.iso
+iso_root/
+
+# Bootloader (if not tracked or custom built)
+limine/
+
+# Temporary files
+tmp/
+*.tmp
+
+# Editor/OS specific
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+assets/guest/linux-bzImage
+# QEMU logs and output
+qemu_*.log
+qemu_output.txt
+kernel.elf
+qemu.log
+patch_*.py
+patch_*.patch
+parse_*.py
+parse_*.patch
+patch_*.sh
+fix_*.py
+generate_*.py
+*.orig
+qemu.pid
+kernel.asm
+test_disk.img
