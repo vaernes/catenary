@@ -269,3 +269,11 @@ pub fn schedule() void {
         gdt.setKernelRsp0(t.kernel_int_stack_top);
     }
 }
+
+/// Called from vmexitStub (on the VMX host stack) when the guest session is
+/// complete and the VMX thread should yield to other ready threads indefinitely.
+pub export fn catenary_vmx_guest_done() callconv(.c) noreturn {
+    while (true) {
+        schedule();
+    }
+}

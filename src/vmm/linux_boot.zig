@@ -50,6 +50,10 @@ const init_size_offset: usize = 0x260;
 const handover_offset_offset: usize = 0x264;
 const type_of_loader_offset: usize = 0x210;
 const cmd_line_ptr_offset: usize = 0x228;
+const ramdisk_image_offset: usize = 0x218;
+const ramdisk_size_offset: usize = 0x21C;
+
+pub const default_initrd_gpa: u64 = 0x0800_0000;
 const vid_mode_offset: usize = 0x1FA;
 const alt_mem_k_offset: usize = 0x1E0;
 const e820_entries_offset: usize = 0x1E8;
@@ -170,7 +174,7 @@ fn writeE820Entry(page: []u8, index: usize, addr: u64, size: u64, entry_type: u3
     writeLe32(page, base + 16, entry_type);
 }
 
-pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, cmdline: []const u8, guest_ram_bytes: u64) [zero_page_size]u8 {
+pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, cmdline: []const u8, guest_ram_bytes: u64, initrd_gpa: u64, initrd_size: u64) [zero_page_size]u8 {
     _ = cmdline;
     var page: [zero_page_size]u8 = [_]u8{0} ** zero_page_size;
     const template = bootParamsTemplate(parsed);
@@ -193,6 +197,11 @@ pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, c
     writeE820Entry(page[0..], 0, 0x00000000, 0x0009FC00, e820_type_ram);
     writeE820Entry(page[0..], 1, 0x0009FC00, 0x00060400, e820_type_reserved); // EBDA/BIOS/VGA hole
     writeE820Entry(page[0..], 2, 0x00100000, guest_ram_bytes - 0x100000, e820_type_ram);
+
+    if (initrd_size > 0) {
+        writeLe32(page[0..], ramdisk_image_offset, @as(u32, @truncate(initrd_gpa)));
+        writeLe32(page[0..], ramdisk_size_offset, @as(u32, @truncate(initrd_size)));
+    }
 
     return page;
 }

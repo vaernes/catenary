@@ -5,7 +5,10 @@
 const std = @import("std");
 
 fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile ("" : [ret] "={rax}" (-> u64) : [val] "{rax}" (addr)));
+    return @ptrFromInt(asm volatile (""
+        : [ret] "={rax}" (-> u64),
+        : [val] "{rax}" (addr),
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -20,7 +23,7 @@ fn outb(port: u16, val: u8) void {
         : .{ .memory = true });
 }
 fn serialWrite(s: []const u8) void {
-    for (s) |c| outb(0x3F8, c);
+    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
 }
 
 fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {

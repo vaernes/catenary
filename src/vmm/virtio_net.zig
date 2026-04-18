@@ -267,7 +267,7 @@ fn handleTxBuffer(inst: *DeviceInstance, gpa: u64, len: u32) void {
         buffer,
     ) catch return;
 
-    _ = router.routePageWithLocalNode(hhdm_offset, table, null, msg_phys) catch {
+    _ = router.routePageWithLocalNode(hhdm_offset, table, msg_phys) catch {
         // Drop on failure; PMM will clean up the page eventually
     };
 }

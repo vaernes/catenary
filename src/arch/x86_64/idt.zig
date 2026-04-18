@@ -31,6 +31,21 @@ pub fn setGate(vector: u8, isr: *const fn () callconv(.naked) void, flags: u8) v
     };
 }
 
+fn ignoreIsr() callconv(.naked) void {
+    asm volatile (
+        \\pushq %rax
+        \\pushq %rdx
+        \\movw $0x20, %dx
+        \\movb $0x20, %al
+        \\outb %al, %dx
+        \\movw $0xA0, %dx
+        \\outb %al, %dx
+        \\popq %rdx
+        \\popq %rax
+        \\iretq
+    );
+}
+
 fn genericIsr() callconv(.naked) void {
     asm volatile (
         \\movq $0, %rsi
@@ -154,8 +169,11 @@ pub fn init() void {
     // lidt executes would find no valid handler and triple-fault on real hardware.
 
     // Initialize all to generic handler
-    for (0..256) |i| {
-        setGate(@as(u8, @intCast(i)), genericIsr, 0x8E); // 0x8E: Present, 64-bit Interrupt Gate
+    for (0..32) |i| {
+        setGate(@as(u8, @intCast(i)), genericIsr, 0x8E);
+    }
+    for (32..256) |i| {
+        setGate(@as(u8, @intCast(i)), ignoreIsr, 0x8E);
     }
 
     setGate(8, genericIsr, 0x8E); // Double Fault

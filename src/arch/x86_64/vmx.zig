@@ -12,6 +12,7 @@ const virtio_blk = @import("../../vmm/virtio_blk.zig");
 const dipc = @import("../../ipc/dipc.zig");
 const microvm_bridge = @import("../../vmm/microvm_bridge.zig");
 const guest_image_blob = @import("guest_image_blob");
+const guest_initramfs_blob = @import("guest_initramfs_blob");
 
 const endpoint_table = @import("../../ipc/endpoint_table.zig");
 
@@ -177,6 +178,8 @@ const EXIT_CTL_SAVE_PAT: u32 = 1 << 18;
 const EXIT_CTL_LOAD_PAT: u32 = 1 << 19;
 const EXIT_CTL_SAVE_EFER: u32 = 1 << 20;
 const EXIT_CTL_LOAD_EFER: u32 = 1 << 21;
+const EXIT_CTL_ACK_INTERRUPT: u32 = 1 << 15;
+const PIN_BASED_EXTERNAL_INTERRUPT_EXITING: u32 = 1 << 0;
 
 const ENTRY_CTL_IA32E_GUEST: u32 = 1 << 9;
 const ENTRY_CTL_LOAD_PAT: u32 = 1 << 14;
@@ -196,11 +199,11 @@ const LINUX_DEBUG_EXCEPTION_BITMAP: u32 =
     (@as(u32, 1) << 13) | // #GP
     0; // #PF
 
-const DEFAULT_CMDLINE = "console=ttyS0 earlyprintk=serial,ttyS0 nokaslr root=/dev/vda rw init=/init";
+const DEFAULT_CMDLINE = "console=ttyS0 nokaslr rdinit=/init";
 const GUEST_IDENTITY_PD_TABLES: usize = 8; // 8 * 1GiB mapped via 2MiB leaves
 const GUEST_IDENTITY_MAP_BYTES: u64 = @as(u64, GUEST_IDENTITY_PD_TABLES) * 1024 * 1024 * 1024;
 const EPT_PREFAULT_WINDOW_PAGES_DEMO: usize = 512; // 512 * 4KiB = 2MiB
-const EPT_PREFAULT_WINDOW_PAGES_LINUX: usize = 1; // on-demand for Linux handoff debugging
+const EPT_PREFAULT_WINDOW_PAGES_LINUX: usize = 64; // map 64 pages per EPT violation to reduce VMEXIT overhead
 const MAX_GUEST_MAPS: usize = 262144;
 const GUEST_POOL_PAGES: usize = 65536;
 const PREEMPTION_TIMER_INITIAL: u32 = 0x7FFFFFFF;
@@ -222,6 +225,9 @@ var pit_configured: bool = false;
 // -- Interrupt injection state --
 var timer_irq_pending: bool = false;
 var preemption_timer_active: bool = false;
+// COM1 (ttyS0) IER shadow and THRE IRQ4 pending flag
+var serial_ier: u8 = 0;
+var serial_irq4_pending: bool = false;
 var timer_inject_count: u64 = 0;
 var timer_exit_count: u64 = 0;
 
@@ -818,7 +824,18 @@ fn stageParsedGuest(parsed: *const linux_boot.ParsedBzImage, layout: linux_boot.
 
     const protected = linux_boot.protectedModeImage(parsed);
     const cmdline = DEFAULT_CMDLINE ++ "\x00";
-    const boot_params_page = linux_boot.buildBootParamsPage(parsed, layout, cmdline, linux_boot.default_guest_ram_bytes);
+
+    // Load the initramfs at a fixed GPA above the kernel region.
+    const initramfs_data = guest_initramfs_blob.get();
+    const initrd_gpa: u64 = linux_boot.default_initrd_gpa;
+    try copyIntoGuest(initrd_gpa, initramfs_data);
+    serialWrite("VMX: initramfs loaded gpa=0x");
+    printHex(initrd_gpa);
+    serialWrite(" size=0x");
+    printHex(initramfs_data.len);
+    serialWrite("\n");
+
+    const boot_params_page = linux_boot.buildBootParamsPage(parsed, layout, cmdline, linux_boot.default_guest_ram_bytes, initrd_gpa, initramfs_data.len);
 
     try copyIntoGuest(layout.boot_params_gpa, boot_params_page[0..]);
     try copyIntoGuest(layout.cmdline_gpa, cmdline);
@@ -933,7 +950,10 @@ fn loadControlFields(vmx_basic: u64) VmxError!void {
     const entry_msr = if (use_true) IA32_VMX_TRUE_ENTRY_CTLS else IA32_VMX_ENTRY_CTLS;
     const proc2_msr = if (use_true) IA32_VMX_TRUE_PROCBASED_CTLS2 else IA32_VMX_PROCBASED_CTLS2;
 
-    const pin_requested: u32 = if (preferLinuxEntry()) PIN_BASED_PREEMPTION_TIMER else 0;
+    const pin_requested: u32 = if (preferLinuxEntry())
+        PIN_BASED_PREEMPTION_TIMER | PIN_BASED_EXTERNAL_INTERRUPT_EXITING
+    else
+        0;
     const pin_based = adjustVmxControls(pin_msr, pin_requested);
     const proc_based_requested = PRIMARY_CTL_HLT_EXITING | PRIMARY_CTL_IO_EXITING | PRIMARY_CTL_MSR_EXITING |
         (if (VMX_USE_EPT) PRIMARY_CTL_SECONDARY else 0);
@@ -943,7 +963,8 @@ fn loadControlFields(vmx_basic: u64) VmxError!void {
     else
         adjustVmxControls(proc2_msr, 0);
 
-    const vmexit_requested = EXIT_CTL_HOST_IA32E | EXIT_CTL_SAVE_PAT | EXIT_CTL_LOAD_PAT | EXIT_CTL_SAVE_EFER | EXIT_CTL_LOAD_EFER;
+    const vmexit_requested = EXIT_CTL_HOST_IA32E | EXIT_CTL_SAVE_PAT | EXIT_CTL_LOAD_PAT | EXIT_CTL_SAVE_EFER | EXIT_CTL_LOAD_EFER |
+        (if (preferLinuxEntry()) EXIT_CTL_ACK_INTERRUPT else 0);
     const vmexit = adjustVmxControls(exit_msr, vmexit_requested);
     const vmentry_requested = ENTRY_CTL_IA32E_GUEST | ENTRY_CTL_LOAD_PAT | ENTRY_CTL_LOAD_EFER;
     const vmentry = adjustVmxControls(entry_msr, vmentry_requested);
@@ -1143,16 +1164,36 @@ fn handleIoExit(regs: *GuestRegs) void {
     } else if (port == 0x61) {
         handlePort61(is_in, regs);
     } else if (port == 0x3F8 and !is_in) {
-        // COM1 TX
+        // COM1 TX: forward char to host serial
         const c = @as(u8, @truncate(regs.rax));
         const s = [_]u8{c};
         serialWrite(&s);
-    } else if (port == 0x3FD and is_in) {
-        // COM1 LSR (Line Status Register) - pretend THRE (transmit ring empty) is set
-        regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x60;
+    } else if (port == 0x3F9) {
+        if (is_in) {
+            // COM1 IER read
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | serial_ier;
+        } else {
+            // COM1 IER write - track THRE interrupt enable (bit 1)
+            serial_ier = @as(u8, @truncate(regs.rax));
+            if ((serial_ier & 0x02) != 0 and (pic_master_imr & 0x10) == 0) {
+                serial_irq4_pending = true;
+            } else if ((serial_ier & 0x02) == 0) {
+                serial_irq4_pending = false;
+            }
+        }
     } else if (port == 0x3FA and is_in) {
-        // COM1 IIR - no interrupt pending
-        regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x01;
+        // COM1 IIR: return THRE interrupt (0x02) when THRI enabled, else no interrupt (0x01)
+        if ((serial_ier & 0x02) != 0) {
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x02;
+        } else {
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x01;
+        }
+    } else if (port == 0x3FD and is_in) {
+        // COM1 LSR (Line Status Register) - THRE+TEMT always set (no physical TX FIFO)
+        regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x60;
+    } else if (port == 0x3FE and is_in) {
+        // COM1 MSR - report DCD+DSR+CTS asserted (no delta bits)
+        regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0xB0;
     } else if (is_in) {
         // Default 0 for unhandled IN
         regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00);
@@ -1196,10 +1237,10 @@ fn handleEptViolation() bool {
         EPT_PREFAULT_WINDOW_PAGES_LINUX
     else
         EPT_PREFAULT_WINDOW_PAGES_DEMO;
-    const window_base = if (window_pages == 1)
-        (gpa & 0x000F_FFFF_FFFF_F000)
-    else
-        (gpa & 0x000F_FFFF_FFE0_0000);
+    // Align window base to window_pages * PAGE_SIZE boundary so prefaulted
+    // pages are always contiguous and cover the faulting address.
+    const window_size: u64 = @as(u64, window_pages) * pmm.PAGE_SIZE;
+    const window_base = (gpa / window_size) * window_size;
 
     for (0..window_pages) |i| {
         const page_gpa = window_base + (@as(u64, @intCast(i)) * pmm.PAGE_SIZE);
@@ -1545,13 +1586,29 @@ fn handlePort61(is_in: bool, regs: *GuestRegs) void {
 }
 
 fn tryInjectTimerIrq() void {
-    if (!timer_irq_pending) return;
-
     const rflags = vmread(VMCS_GUEST_RFLAGS) orelse return;
     const interruptibility = vmread(VMCS_GUEST_INTERRUPTIBILITY) orelse return;
+    const guest_interruptible = (rflags & (1 << 9)) != 0 and (interruptibility & 0x3) == 0;
+
+    // Inject COM1 THRE interrupt (IRQ4) when the ttyS0 driver has THRI enabled.
+    // This drives interrupt-mode TX so userspace write() calls reach the serial port.
+    if (serial_irq4_pending) {
+        if (guest_interruptible) {
+            const vector: u64 = @as(u64, pic_master_vector_base) + 4;
+            _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, vector | (1 << 31));
+            serial_irq4_pending = false;
+            return; // one interrupt per VMENTRY
+        }
+        // Interrupt window will let us retry
+        const proc = vmread(VMCS_CTRL_CPU_BASED) orelse return;
+        _ = vmwrite(VMCS_CTRL_CPU_BASED, proc | PRIMARY_CTL_INTERRUPT_WINDOW);
+        return;
+    }
+
+    if (!timer_irq_pending) return;
 
     // Guest must have IF=1 and no STI/MOV-SS blocking
-    if ((rflags & (1 << 9)) == 0 or (interruptibility & 0x3) != 0) {
+    if (!guest_interruptible) {
         // Enable interrupt-window exiting to retry when guest becomes interruptible
         const proc = vmread(VMCS_CTRL_CPU_BASED) orelse return;
         _ = vmwrite(VMCS_CTRL_CPU_BASED, proc | PRIMARY_CTL_INTERRUPT_WINDOW);
@@ -1769,7 +1826,12 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
             return true;
         },
         VMEXIT_REASON_EXTERNAL_INTERRUPT => {
-            // Resume guest after host handles pending IRQ routing.
+            // The Catenary PIT fired while the Linux guest was running.  ACK
+            // the PIC master and yield to the Catenary scheduler so that Ring-3
+            // services continue to make progress alongside the guest.
+            cpu.outb(0x20, 0x20); // EOI to PIC master
+            const scheduler = @import("../../kernel/scheduler.zig");
+            scheduler.schedule();
             return true;
         },
         VMEXIT_REASON_XSETBV => {
@@ -1916,10 +1978,8 @@ fn vmexitStub() callconv(.naked) noreturn {
         \\jz 2f
         \\callq catenary_vmx_vmresume_failed
         \\2:
-        \\cli
-        \\1:
-        \\hlt
-        \\jmp 1b
+        \\addq $120, %rsp
+        \\callq catenary_vmx_guest_done
     );
 }
 
@@ -1963,6 +2023,12 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
     if (!isVmxSupported()) return error.VmxUnsupported;
 
     cpu.writeCr4(cpu.readCr4() | CR4_VMXE);
+    // Enable OSXSAVE so the host can execute XSETBV when handling guest
+    // XSETBV VMEXITs.  loadHostState() captures CR4 into VMCS_HOST_CR4,
+    // so this bit is also restored after every VMEXIT.
+    if (cpu.cpuid(1, 0).ecx & (@as(u32, 1) << 26) != 0) {
+        cpu.writeCr4(cpu.readCr4() | cpu.CR4_OSXSAVE);
+    }
     try ensureFeatureControl();
 
     const vmx_basic = cpu.rdmsr(IA32_VMX_BASIC);

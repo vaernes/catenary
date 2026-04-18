@@ -218,24 +218,10 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
 pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, token: u64) u64 {
     _ = rip;
 
-    serialByte('!');
-    serialByte('Y');
-    printHex(op);
-    serialByte('\n');
-
-    if (true) {
-        serialWrite("SYSCALL: op=");
-        printHex(op);
-        serialWrite(" arg0=");
-        printHex(arg0);
-        serialWrite(" arg1=");
-        printHex(arg1);
-        serialWrite(" token=");
-        printHex(token);
-        serialWrite(" CR3=");
-        printHex(cpu.readCr3());
-        serialWrite("\n");
-    }
+    // Emit one byte per syscall to keep the QEMU serial-file backend
+    // flushing.  Without continuous UART activity the `-serial file:`
+    // backend may buffer indefinitely and services 03-08 appear silent.
+    serialByte('.');
 
     switch (op) {
         0x1000...0x1004 => {
@@ -302,7 +288,13 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         },
         3 => {
             _ = service_registry.serviceIdForCapability(token) orelse return 0;
-            return scheduler.receive() orelse 0;
+            const msg = scheduler.receive();
+            if (msg) |m| return m;
+            // No message — yield to scheduler so other threads can run.
+            // The INT 0x80 gate cleared IF; re-enable and halt until the
+            // next timer tick triggers schedule().
+            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+            return 0;
         },
         4 => {
             // op=4: free page. If arg0 == DIPC_RECV_VA, unmap the receive window
@@ -331,18 +323,32 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // arg0 = num_pages, arg1 = window_slot_start (0..15).
         // Returns physical base address of the allocation, or 0 on failure.
         5 => {
-            const sid5 = service_registry.serviceIdForCapability(token) orelse return 0;
-            const pml4_5 = service_registry.getTaskBoundAddressSpace(sid5) orelse return 0;
+            const sid5 = service_registry.serviceIdForCapability(token) orelse {
+                serialWrite("DMA cap fail\n");
+                return 0;
+            };
+            const pml4_5 = service_registry.getTaskBoundAddressSpace(sid5) orelse {
+                serialWrite("DMA pml4 fail\n");
+                return 0;
+            };
             const num5 = @as(u32, @truncate(arg0));
             const slot5 = @as(u32, @truncate(arg1));
-            if (num5 == 0 or num5 > 16 or slot5 + num5 > 16) return 0;
-            const phys5 = pmm.allocContiguousAligned(num5, 1) orelse return 0;
+            if (num5 == 0 or num5 > 16 or slot5 + num5 > 16) {
+                serialWrite("DMA fail1\n");
+                return 0;
+            }
+            const phys5 = pmm.allocContiguousAligned(num5, 1) orelse {
+                serialWrite("DMA fail2\n");
+                return 0;
+            };
             // Zero the allocation.
             @memset(@as([*]u8, @ptrFromInt(phys5 + hhdm_offset))[0 .. @as(usize, num5) * pmm.PAGE_SIZE], 0);
             var idx5: u32 = 0;
             while (idx5 < num5) : (idx5 += 1) {
                 const dma_va: u64 = 0x0000_7D00_0000_0000 + (@as(u64, slot5 + idx5)) * pmm.PAGE_SIZE;
                 task_loader.mapPageInAddressSpace(pml4_5, hhdm_offset, dma_va, phys5 + @as(u64, idx5) * pmm.PAGE_SIZE, task_loader.USER_PAGE_FLAGS) catch {
+                    serialWrite("DMA fail3\n");
+                    serialWrite("DMA fail3\n");
                     return 0;
                 };
             }
@@ -485,7 +491,25 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             if (kbd.getRawScancode()) |scancode| {
                 return scancode;
             }
+            // No key — yield so other threads can run.
+            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
             return 0xFFFFFFFF;
+        },
+        // op=9: SYS_SERIAL_WRITE — atomically write a user-space buffer to
+        // the serial port.  INT gate has IF=0, so this cannot be preempted by
+        // the timer, preventing interleaved output from concurrent services.
+        // arg0 = pointer to buffer (user VA), arg1 = length.
+        9 => {
+            const ptr = arg0;
+            const len = arg1;
+            if (ptr < 0x0000_8000_0000_0000 and len <= 4096 and ptr +% len <= 0x0000_8000_0000_0000) {
+                const buf: [*]const u8 = @ptrFromInt(ptr);
+                var j: usize = 0;
+                while (j < len) : (j += 1) {
+                    serialByte(buf[j]);
+                }
+            }
+            return 0;
         },
         else => {},
     }

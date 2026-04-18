@@ -22,7 +22,7 @@ fn outb(port: u16, val: u8) void {
         : .{ .memory = true });
 }
 fn serialWrite(s: []const u8) void {
-    for (s) |c| outb(0x3F8, c);
+    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
 }
 fn printHex(n: u64) void {
     const hex = "0123456789ABCDEF";
@@ -266,7 +266,7 @@ fn submitAdmin(sqe: NvmeSqe) u16 {
 
     // Poll CQ until we see a completion with the correct phase bit.
     const cq: [*]volatile NvmeCqe = ptrFrom([*]volatile NvmeCqe, ADM_CQ_VA);
-    var timeout: u32 = 2_000_000;
+    var timeout: u64 = 20_000_000;
     while (timeout > 0) : (timeout -= 1) {
         const entry = &cq[@as(usize, g_adm_cq_head % ADM_Q_DEPTH)];
         const phase: u1 = @truncate(entry.status & 1);

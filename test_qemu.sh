@@ -7,10 +7,10 @@ set -euo pipefail
 # - passes only if the Linux guest reaches an early serial milestone
 
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
-SMOKE_PATTERN=${SMOKE_PATTERN:-"dashd: starting.*containerd: starting.*clusterd: requesting local MicroVM launch.*inputd: registered at endpoint 8.*windowd: registered at endpoint 9"}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
-CORE_PATTERNS=${CORE_PATTERNS:-"Catenary OS booting...;selftest: PASS paging.canonical;Timer initialized."}
+CORE_PATTERNS=${CORE_PATTERNS:-"booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"}
 VMX_EPT_PATTERNS=${VMX_EPT_PATTERNS:-""}
+VMX_LINUX_PATTERNS=${VMX_LINUX_PATTERNS:-""}
 
 echo "[+] Building Catenary OS..."
 zig build ${ZIG_BUILD_ARGS:-}
@@ -22,6 +22,11 @@ cp zig-out/bin/kernel.elf iso_root/boot/
 cp zig-out/bin/netd iso_root/modules/netd.elf
 cp zig-out/bin/storaged iso_root/modules/storaged.elf
 cp zig-out/bin/dashd iso_root/modules/dashd.elf
+cp zig-out/bin/containerd iso_root/modules/containerd.elf
+cp zig-out/bin/clusterd iso_root/modules/clusterd.elf
+cp zig-out/bin/inputd iso_root/modules/inputd.elf
+cp zig-out/bin/windowd iso_root/modules/windowd.elf
+cp zig-out/bin/configd iso_root/modules/configd.elf
 cp limine.conf iso_root/
 cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/
 
@@ -67,13 +72,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[+] Waiting for core milestones and guest milestone: ${SMOKE_PATTERN}"
+echo "[+] Waiting for all milestones (timeout ${TIMEOUT_SECS}s)..."
 ok=0
 core_ok=1
+IFS=';' read -r -a all_patterns <<< "${CORE_PATTERNS}"
 for ((i=0; i<${TIMEOUT_SECS}; i++)); do
-    if [ -f qemu_serial.log ] && grep -Fq "${SMOKE_PATTERN}" qemu_serial.log; then
-        ok=1
-        break
+    if [ -f qemu_serial.log ]; then
+        all_found=1
+        for p in "${all_patterns[@]}"; do
+            if ! grep -Fq "${p}" qemu_serial.log; then
+                all_found=0
+                break
+            fi
+        done
+        if [ "${all_found}" -eq 1 ]; then
+            ok=1
+            break
+        fi
     fi
     sleep 1
 done
@@ -82,19 +97,20 @@ echo "[+] Serial log (tail):"
 tail -n 200 qemu_serial.log || true
 
 if [ "${ok}" -eq 1 ]; then
-    IFS=';' read -r -a core_patterns <<< "${CORE_PATTERNS}"
-    for pattern in "${core_patterns[@]}"; do
-        if ! grep -Fq "${pattern}" qemu_serial.log; then
-            echo "[!] SMOKE FAIL: missing core milestone '${pattern}'"
-            core_ok=0
-        fi
-    done
-
     if [ -n "${VMX_EPT_PATTERNS}" ]; then
         IFS=';' read -r -a vmx_patterns <<< "${VMX_EPT_PATTERNS}"
         for pattern in "${vmx_patterns[@]}"; do
             if ! grep -Fq "${pattern}" qemu_serial.log; then
                 echo "[!] SMOKE FAIL: missing VMX/EPT milestone '${pattern}'"
+                core_ok=0
+            fi
+        done
+    fi
+    if [ -n "${VMX_LINUX_PATTERNS}" ]; then
+        IFS=';' read -r -a linux_patterns <<< "${VMX_LINUX_PATTERNS}"
+        for pattern in "${linux_patterns[@]}"; do
+            if ! grep -Fq "${pattern}" qemu_serial.log; then
+                echo "[!] SMOKE FAIL: missing Linux guest milestone '${pattern}'"
                 core_ok=0
             fi
         done
@@ -107,7 +123,12 @@ if [ "${ok}" -eq 1 ] && [ "${core_ok}" -eq 1 ]; then
 fi
 
 if [ "${ok}" -eq 0 ]; then
-    echo "[!] SMOKE FAIL: did not observe '${SMOKE_PATTERN}' within ${TIMEOUT_SECS}s"
+    echo "[!] SMOKE FAIL: not all milestones observed within ${TIMEOUT_SECS}s"
+    for p in "${all_patterns[@]}"; do
+        if ! grep -Fq "${p}" qemu_serial.log 2>/dev/null; then
+            echo "[!]   missing: '${p}'"
+        fi
+    done
 fi
 
 echo "[!] Failure summary (last matching lines):"

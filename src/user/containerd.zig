@@ -1,7 +1,10 @@
 const std = @import("std");
 
 fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile ("" : [ret] "={rax}" (-> u64) : [val] "{rax}" (addr)));
+    return @ptrFromInt(asm volatile (""
+        : [ret] "={rax}" (-> u64),
+        : [val] "{rax}" (addr),
+    ));
 }
 
 fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
@@ -49,7 +52,6 @@ const BootstrapDescriptor = extern struct {
     reserved_router_endpoint: u64,
     reserved_storaged_endpoint: u64,
     reserved_dashd_endpoint: u64,
-    reserved_containerd_endpoint: u64,
     microvm_ingress_magic: u32,
     microvm_ingress_version: u16,
     microvm_ingress_len: u16,
@@ -67,7 +69,7 @@ fn outb(port: u16, val: u8) void {
 }
 
 fn serialWrite(s: []const u8) void {
-    for (s) |c| outb(0x3F8, c);
+    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
 }
 
 fn printHex(n: u64) void {
@@ -95,58 +97,88 @@ pub export fn umain() noreturn {
     // Allocate 2 DMA pages: 1 for data payload, 1 for DIPC scratch
     const data_phys = syscall(SYS_ALLOC_DMA, 1, 0, token);
     const dipc_phys = syscall(SYS_ALLOC_DMA, 1, 1, token);
-    
+
     if (data_phys == 0 or dipc_phys == 0) {
         serialWrite("containerd: DMA alloc failed\n");
-        while(true) asm volatile("pause");
+        while (true) asm volatile ("pause");
     }
 
     serialWrite("containerd: simulating image pull...\n");
-    
+
     // Fill data page with dummy ext4 superblock or tarball header
     const data_va: [*]u8 = ptrFrom([*]u8, DMA_BASE_VA + 0 * 4096);
     for (0..4096) |i| {
         data_va[i] = 0xAB; // Dummy layer byte
     }
-    
+
     // Send a block write request to storaged via DIPC
     const scratch: [*]u8 = ptrFrom([*]u8, DMA_BASE_VA + 1 * 4096);
-    
+
     // DIPC PageHeader
-    scratch[0] = 0x43; scratch[1] = 0x50; scratch[2] = 0x49; scratch[3] = 0x44;
-    scratch[4] = 1; scratch[5] = 0;
-    scratch[6] = 64; scratch[7] = 0;
-    scratch[8] = 48; scratch[9] = 0; scratch[10] = 0; scratch[11] = 0; // payload_len=48
-    
+    scratch[0] = 0x43;
+    scratch[1] = 0x50;
+    scratch[2] = 0x49;
+    scratch[3] = 0x44;
+    scratch[4] = 1;
+    scratch[5] = 0;
+    scratch[6] = 64;
+    scratch[7] = 0;
+    scratch[8] = 48;
+    scratch[9] = 0;
+    scratch[10] = 0;
+    scratch[11] = 0; // payload_len=48
+
     @memset(scratch[12..20], 0); // auth
-    
+
     // src (node + endpoint 6)
     @memcpy(scratch[20..36], &bs.local_node);
-    scratch[36] = 6; @memset(scratch[37..44], 0);
-    
+    scratch[36] = 6;
+    @memset(scratch[37..44], 0);
+
     // dst (node + storaged endpoint)
     @memcpy(scratch[44..60], &bs.local_node);
     const sid = bs.reserved_storaged_endpoint;
-    scratch[60] = @truncate(sid); scratch[61] = @truncate(sid >> 8);
-    scratch[62] = @truncate(sid >> 16); scratch[63] = @truncate(sid >> 24);
-    scratch[64] = @truncate(sid >> 32); scratch[65] = @truncate(sid >> 40);
-    scratch[66] = @truncate(sid >> 48); scratch[67] = @truncate(sid >> 56);
+    scratch[60] = @truncate(sid);
+    scratch[61] = @truncate(sid >> 8);
+    scratch[62] = @truncate(sid >> 16);
+    scratch[63] = @truncate(sid >> 24);
+    scratch[64] = @truncate(sid >> 32);
+    scratch[65] = @truncate(sid >> 40);
+    scratch[66] = @truncate(sid >> 48);
+    scratch[67] = @truncate(sid >> 56);
 
     // BlkRequest payload at offset 64
     // req_type = 1 (write)
-    scratch[64] = 1; scratch[65] = 0; scratch[66] = 0; scratch[67] = 0;
+    scratch[64] = 1;
+    scratch[65] = 0;
+    scratch[66] = 0;
+    scratch[67] = 0;
     // _reserved
-    scratch[68] = 0; scratch[69] = 0; scratch[70] = 0; scratch[71] = 0;
+    scratch[68] = 0;
+    scratch[69] = 0;
+    scratch[70] = 0;
+    scratch[71] = 0;
     // sector = 1024 (some offset)
-    scratch[72] = 0; scratch[73] = 4; scratch[74] = 0; scratch[75] = 0;
-    scratch[76] = 0; scratch[77] = 0; scratch[78] = 0; scratch[79] = 0;
-    
+    scratch[72] = 0;
+    scratch[73] = 4;
+    scratch[74] = 0;
+    scratch[75] = 0;
+    scratch[76] = 0;
+    scratch[77] = 0;
+    scratch[78] = 0;
+    scratch[79] = 0;
+
     // vmid = 0 (we are not a VM)
-    scratch[80] = 0; scratch[81] = 0; scratch[82] = 0; scratch[83] = 0;
+    scratch[80] = 0;
+    scratch[81] = 0;
+    scratch[82] = 0;
+    scratch[83] = 0;
     // chain_head = 0
-    scratch[84] = 0; scratch[85] = 0;
+    scratch[84] = 0;
+    scratch[85] = 0;
     // data_len = 4096
-    scratch[86] = 0; scratch[87] = 16;
+    scratch[86] = 0;
+    scratch[87] = 16;
     // data_hpa
     scratch[88] = @truncate(data_phys);
     scratch[89] = @truncate(data_phys >> 8);

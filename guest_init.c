@@ -180,6 +180,10 @@ static void run_entrypoint(void) {
  * Entry point
  * ----------------------------------------------------------------------- */
 int main(void) {
+    /* Disable stdio buffering so output appears immediately on ttyS0. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     printf("Catenary OS Guest Init: starting\n");
 
     mount_basics();

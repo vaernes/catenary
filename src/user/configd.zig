@@ -146,7 +146,7 @@ fn outb(port: u16, val: u8) void {
 }
 
 fn serialWrite(s: []const u8) void {
-    for (s) |c| outb(0x3F8, c);
+    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
 }
 
 // ---------------------------------------------------------------------------
