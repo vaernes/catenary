@@ -32,9 +32,9 @@ pub fn controlLoop() void {
 
             // Kernel-control: consume + free.
             if (hdr.magic == dipc.WireMagic and hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control)) {
-                _ = control_handler.handleKernelControlPage(hhdm_offset, &table, page_phys) catch {
-                    // TODO: proper error logging
-                    continue;
+                control_handler.handleKernelControlPage(hhdm_offset, &table, page_phys) catch {
+                    const serialWrite = @import("../kernel/fb.zig").serialWrite;
+                    serialWrite("MANAGER: control_handler error!\n");
                 };
                 dipc.freePageMessage(page_phys);
                 continue;

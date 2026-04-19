@@ -94,7 +94,11 @@ pub const PollNetdResult = extern struct {
 pub const CreateMicrovmPayload = extern struct {
     /// Guest RAM in 4 KiB pages (e.g. 16384 = 64 MiB).
     mem_pages: u32,
-    _reserved: u32 = 0,
+    vcpus: u32,
+    kernel_phys: u64,
+    kernel_size: u64,
+    initramfs_phys: u64,
+    initramfs_size: u64,
 };
 
 /// Request the kernel to transition instance_id to running and initiate VMX launch.

@@ -15,6 +15,7 @@ pub const Thread = struct {
     mailbox: Mailbox = .{},
     is_vmx: bool = false,
     vmid: u32 = 0,
+    vcpu_idx: u32 = 0,
     /// Top of this thread's dedicated kernel interrupt stack (TSS.rsp0).
     /// 0 = kernel thread, no Ring-3 transitions.
     kernel_int_stack_top: u64 = 0,
@@ -180,7 +181,7 @@ pub fn sendToService(sid: u32, data: u64) bool {
     return false;
 }
 
-pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32) !u32 {
+pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx: u32) !u32 {
     for (0..THREAD_TARGET_COUNT) |i| {
         if (threads[i].state == .Empty) {
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
@@ -218,6 +219,7 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32) !u32 {
             threads[i].id = id;
             threads[i].is_vmx = is_vmx;
             threads[i].vmid = vmid;
+            threads[i].vcpu_idx = vcpu_idx;
             threads[i].state = .Ready;
             return id;
         }

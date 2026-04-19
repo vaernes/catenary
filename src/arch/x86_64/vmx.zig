@@ -1202,15 +1202,143 @@ fn handleIoExit(regs: *GuestRegs) void {
     advanceGuestRip();
 }
 
-fn handleEptViolation() bool {
+fn decodeMmioWrite(rip_ptr: [*]const u8, regs: *GuestRegs) u32 {
+    var i: usize = 0;
+    var rex_r = false;
+    if (rip_ptr[i] >= 0x40 and rip_ptr[i] <= 0x4F) {
+        if ((rip_ptr[i] & 0x04) != 0) rex_r = true;
+        i += 1;
+    }
+    var reg_idx: u8 = 0;
+    if (rip_ptr[i] == 0x89) {
+        i += 1;
+        const modrm = rip_ptr[i];
+        reg_idx = (modrm >> 3) & 7;
+        if (rex_r) {
+            reg_idx += 8;
+        }
+    } else if (rip_ptr[i] == 0xA3) {
+        reg_idx = 0;
+    } else if (rip_ptr[i] == 0xC7) {
+        i += 1;
+    }
+    const val: u64 = switch (reg_idx) {
+        0 => regs.rax,
+        1 => regs.rcx,
+        2 => regs.rdx,
+        3 => regs.rbx,
+        4 => 0,
+        5 => regs.rbp,
+        6 => regs.rsi,
+        7 => regs.rdi,
+        8 => regs.r8,
+        9 => regs.r9,
+        10 => regs.r10,
+        11 => regs.r11,
+        12 => regs.r12,
+        13 => regs.r13,
+        14 => regs.r14,
+        15 => regs.r15,
+        else => regs.rax,
+    };
+    return @as(u32, @truncate(val));
+}
+
+fn translateGlaToGpa(gla: u64) ?u64 {
+    const cr0 = vmread(VMCS_GUEST_CR0) orelse 0;
+    if ((cr0 & (1 << 31)) == 0) return gla;
+    const cr3 = vmread(VMCS_GUEST_CR3) orelse 0;
+    const pml4_gpa = cr3 & 0x000F_FFFF_FFFF_F000;
+    const pml4_ptr = guestPagePtr(pml4_gpa) orelse return null;
+    const pml4 = @as(*const [512]u64, @ptrCast(@alignCast(pml4_ptr)));
+    const pml4e = pml4[@as(usize, @intCast((gla >> 39) & 0x1FF))];
+    if ((pml4e & 1) == 0) return null;
+
+    const pdpt_gpa = pml4e & 0x000F_FFFF_FFFF_F000;
+    const pdpt_ptr = guestPagePtr(pdpt_gpa) orelse return null;
+    const pdpt = @as(*const [512]u64, @ptrCast(@alignCast(pdpt_ptr)));
+    const pdpte = pdpt[@as(usize, @intCast((gla >> 30) & 0x1FF))];
+    if ((pdpte & 1) == 0) return null;
+    if ((pdpte & (1 << 7)) != 0) return (pdpte & 0x000F_FFFF_C000_0000) | (gla & 0x3FFF_FFFF);
+
+    const pd_gpa = pdpte & 0x000F_FFFF_FFFF_F000;
+    const pd_ptr = guestPagePtr(pd_gpa) orelse return null;
+    const pd = @as(*const [512]u64, @ptrCast(@alignCast(pd_ptr)));
+    const pde = pd[@as(usize, @intCast((gla >> 21) & 0x1FF))];
+    if ((pde & 1) == 0) return null;
+    if ((pde & (1 << 7)) != 0) return (pde & 0x000F_FFFF_FFE0_0000) | (gla & 0x1F_FFFF);
+
+    const pt_gpa = pde & 0x000F_FFFF_FFFF_F000;
+    const pt_ptr = guestPagePtr(pt_gpa) orelse return null;
+    const pt = @as(*const [512]u64, @ptrCast(@alignCast(pt_ptr)));
+    const pte = pt[@as(usize, @intCast((gla >> 12) & 0x1FF))];
+    if ((pte & 1) == 0) return null;
+    return (pte & 0x000F_FFFF_FFFF_F000) | (gla & 0xFFF);
+}
+
+fn handleEptViolation(regs: *GuestRegs) bool {
     const gpa = vmread(VMCS_GUEST_PHYSICAL_ADDRESS) orelse 0;
     const gla = vmread(VMCS_GUEST_LINEAR_ADDRESS) orelse 0;
     const rip = vmread(VMCS_GUEST_RIP) orelse 0;
+    const qualification = vmread(VMCS_EXIT_QUALIFICATION) orelse 0;
+    const is_write = (qualification & 2) != 0;
+
+    var val: u32 = 0;
+    if (is_write) {
+        if (translateGlaToGpa(rip)) |rip_gpa| {
+            if (guestPagePtr(rip_gpa & 0x000F_FFFF_FFFF_F000)) |page| {
+                const rip_off = rip_gpa & 0xFFF;
+                const rip_ptr = page[rip_off..].ptr;
+                val = decodeMmioWrite(rip_ptr, regs);
+            }
+        }
+    }
 
     if (gpa >= VIRTIO_DEV_MMIO_BASE and gpa < VIRTIO_DEV_MMIO_BASE + VIRTIO_DEV_MMIO_SIZE) {
+        const vmid = current_instance_id orelse return false;
+        const offset = gpa - VIRTIO_DEV_MMIO_BASE;
+        if (is_write) {
+            virtio_net.handleWrite(vmid, offset, val);
+        } else {
+            regs.rax = virtio_net.handleRead(vmid, offset);
+        }
+        advanceGuestRip();
         return true;
     }
     if (gpa >= VIRTIO_BLK_MMIO_BASE and gpa < VIRTIO_BLK_MMIO_BASE + VIRTIO_BLK_MMIO_SIZE) {
+        const vmid = current_instance_id orelse return false;
+        const offset = gpa - VIRTIO_BLK_MMIO_BASE;
+        if (is_write) {
+            virtio_blk.handleWrite(vmid, offset, val);
+        } else {
+            regs.rax = virtio_blk.handleRead(vmid, offset);
+        }
+        advanceGuestRip();
+        return true;
+    }
+    if (gpa >= 0xFEE00000 and gpa < 0xFEE01000) {
+        const offset = gpa - 0xFEE00000;
+        if (offset == 0x300 or offset == 0x310) {
+            if (is_write) {
+                serialWrite("VMX: LAPIC ICR write val=0x");
+                printHex(val);
+
+                const delivery_mode = (val >> 8) & 7;
+                const vector = val & 0xFF;
+                if (delivery_mode == 5) {
+                    serialWrite(" INIT APIC\n");
+                } else if (delivery_mode == 6) {
+                    serialWrite(" SIPI APIC target vCPU: 0x");
+                    printHex(vector);
+                    serialWrite("\n");
+                } else {
+                    serialWrite("\n");
+                }
+            } else {
+                serialWrite("VMX: LAPIC ICR read\n");
+            }
+        }
+        advanceGuestRip();
         return true;
     }
 
@@ -1844,7 +1972,7 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
             return true;
         },
         VMEXIT_REASON_EPT_VIOLATION => {
-            return handleEptViolation();
+            return handleEptViolation(regs);
         },
         VMEXIT_REASON_EPT_MISCONFIG => {
             return handleEptMisconfig(regs);

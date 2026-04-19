@@ -73,6 +73,11 @@ pub const Descriptor = extern struct {
     microvm_ingress_version: u16,
     microvm_ingress_len: u16,
     capability_token: u64, // Per-service randomized token for kernel-trap auth
+    config_size: u64 = 0,
+    linux_bzimage_phys: u64 = 0,
+    linux_bzimage_size: u64 = 0,
+    initramfs_phys: u64 = 0,
+    initramfs_size: u64 = 0,
 };
 
 pub fn validate(desc: Descriptor) DescriptorError!void {

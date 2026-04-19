@@ -304,8 +304,8 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
     // header_len
     dipc_buf[6] = 64;
     dipc_buf[7] = 0;
-    // payload_len = ControlHeader(8) + CreateMicrovmPayload(8) = 16
-    dipc_buf[8] = 16;
+    // payload_len = ControlHeader(8) + CreateMicrovmPayload(40) = 48
+    dipc_buf[8] = 48;
     dipc_buf[9] = 0;
     dipc_buf[10] = 0;
     dipc_buf[11] = 0;
@@ -334,14 +334,83 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
     // CreateMicrovmPayload at offset 72
     // mem_pages = 256 (1 GiB / 4 KiB = 256 pages for a 1 MiB VM)
     const mem_pages: u32 = 256;
+
+    const ini_file =
+        \\[microvm]
+        \\vcpus=2
+        \\mem_pages=256
+    ;
+
+    var vcpus: u32 = 1;
+    {
+        var i: usize = 0;
+        while (i < ini_file.len) {
+            // Check for vcpus=
+            var is_match = true;
+            const prefix = "vcpus=";
+            if (i + prefix.len <= ini_file.len) {
+                for (prefix, 0..) |c, j| {
+                    if (ini_file[i + j] != c) {
+                        is_match = false;
+                        break;
+                    }
+                }
+                if (is_match) {
+                    var v: u32 = 0;
+                    var j = i + prefix.len;
+                    while (j < ini_file.len and ini_file[j] >= '0' and ini_file[j] <= '9') {
+                        v = v * 10 + (ini_file[j] - '0');
+                        j += 1;
+                    }
+                    if (v > 0) vcpus = v;
+                    break;
+                }
+            }
+            while (i < ini_file.len and ini_file[i] != '\n') i += 1;
+            if (i < ini_file.len) i += 1; // skip newline
+        }
+    }
+
     dipc_buf[72] = @truncate(mem_pages & 0xFF);
     dipc_buf[73] = @truncate((mem_pages >> 8) & 0xFF);
     dipc_buf[74] = @truncate((mem_pages >> 16) & 0xFF);
     dipc_buf[75] = @truncate((mem_pages >> 24) & 0xFF);
-    dipc_buf[76] = 0;
-    dipc_buf[77] = 0;
-    dipc_buf[78] = 0;
-    dipc_buf[79] = 0;
+    dipc_buf[76] = @truncate(vcpus & 0xFF);
+    dipc_buf[77] = @truncate((vcpus >> 8) & 0xFF);
+    dipc_buf[78] = @truncate((vcpus >> 16) & 0xFF);
+    dipc_buf[79] = @truncate((vcpus >> 24) & 0xFF);
+    dipc_buf[80] = 0;
+    dipc_buf[81] = 0;
+    dipc_buf[82] = 0;
+    dipc_buf[83] = 0;
+    dipc_buf[84] = 0;
+    dipc_buf[85] = 0;
+    dipc_buf[86] = 0;
+    dipc_buf[87] = 0;
+    dipc_buf[88] = 0;
+    dipc_buf[89] = 0;
+    dipc_buf[90] = 0;
+    dipc_buf[91] = 0;
+    dipc_buf[92] = 0;
+    dipc_buf[93] = 0;
+    dipc_buf[94] = 0;
+    dipc_buf[95] = 0;
+    dipc_buf[96] = 0;
+    dipc_buf[97] = 0;
+    dipc_buf[98] = 0;
+    dipc_buf[99] = 0;
+    dipc_buf[100] = 0;
+    dipc_buf[101] = 0;
+    dipc_buf[102] = 0;
+    dipc_buf[103] = 0;
+    dipc_buf[104] = 0;
+    dipc_buf[105] = 0;
+    dipc_buf[106] = 0;
+    dipc_buf[107] = 0;
+    dipc_buf[108] = 0;
+    dipc_buf[109] = 0;
+    dipc_buf[110] = 0;
+    dipc_buf[111] = 0;
 
     // The kernel's SYS_SEND_PAGE copies from the DMA phys page, re-signs, and routes.
     _ = syscall(SYS_SEND_PAGE, dipc_phys_slot1, 0, token);

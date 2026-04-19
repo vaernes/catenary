@@ -23,20 +23,6 @@ pub fn build(b: *std.Build) void {
     const vmm_launch_val = b.option(bool, "vmm_launch_linux", "Launch Linux guest on boot") orelse false;
     opts.addOption(bool, "vmm_launch_linux", vmm_launch_val);
 
-    const guest_img = b.addOptions();
-    guest_img.addOption([]const u8, "linux_bzImage", "assets/guest/linux-bzImage");
-
-    const guest_image_blob = b.createModule(.{
-        .root_source_file = b.path("guest_linux_image.zig"),
-        .target = kernel_target,
-        .optimize = optimize,
-    });
-
-    const guest_initramfs_blob = b.createModule(.{
-        .root_source_file = b.path("guest_initramfs_image.zig"),
-        .target = kernel_target,
-        .optimize = optimize,
-    });
 
     const exe = b.addExecutable(.{
         .name = "kernel.elf",
@@ -49,9 +35,6 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addOptions("build_options", opts);
-    exe.root_module.addOptions("guest_linux_image", guest_img);
-    exe.root_module.addImport("guest_image_blob", guest_image_blob);
-    exe.root_module.addImport("guest_initramfs_blob", guest_initramfs_blob);
 
     if (arch == .x86_64) {
         exe.root_module.single_threaded = true;

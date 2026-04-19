@@ -201,7 +201,19 @@ pub fn handleKernelControlPage(
             if (remaining != @sizeOf(control_protocol.CreateMicrovmPayload)) return error.BadPayload;
             const p: *const control_protocol.CreateMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
             const microvm_registry = @import("../vmm/microvm_registry.zig");
-            _ = microvm_registry.createInstance(p.mem_pages, hhdm_offset, table) catch return error.BadPayload;
+            if (microvm_registry.create(p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
+                const serialWrite = @import("../kernel/fb.zig").serialWrite;
+                serialWrite("configd: MicroVM created via DIPC\n");
+
+                // STUB: We launch it here for now to simulate the configd/clusterd flow
+                // This replaces the static init() from configd.zig
+                const vmx = @import("../arch/x86_64/vmx.zig");
+                vmx.launchFromRegistry(id) catch {
+                    serialWrite("configd: VMX launch failed\n");
+                };
+            } else {
+                return error.BadPayload;
+            }
         },
         .start_microvm => {
             if (remaining != @sizeOf(control_protocol.StartMicrovmPayload)) return error.BadPayload;

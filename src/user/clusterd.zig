@@ -1,7 +1,11 @@
 const std = @import("std");
+const lib = @import("lib.zig");
 
 fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile ("" : [ret] "={rax}" (-> u64) : [val] "{rax}" (addr)));
+    return @ptrFromInt(asm volatile (""
+        : [ret] "={rax}" (-> u64),
+        : [val] "{rax}" (addr),
+    ));
 }
 
 fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
@@ -52,6 +56,10 @@ const BootstrapDescriptor = extern struct {
     microvm_ingress_version: u16,
     microvm_ingress_len: u16,
     capability_token: u64,
+    kernel_phys: u64,
+    kernel_size: u64,
+    initramfs_phys: u64,
+    initramfs_size: u64,
 };
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
@@ -80,40 +88,63 @@ pub export fn umain() noreturn {
     const dipc_phys = syscall(SYS_ALLOC_DMA, 1, 0, token);
     if (dipc_phys == 0) {
         serialWrite("clusterd: DMA alloc failed\n");
-        while(true) asm volatile("pause");
+        while (true) asm volatile ("pause");
     }
 
     serialWrite("clusterd: requesting local MicroVM launch...\n");
-    
+
     const scratch: [*]u8 = ptrFrom([*]u8, DMA_BASE_VA);
-    
+
     // DIPC PageHeader
-    scratch[0] = 0x43; scratch[1] = 0x50; scratch[2] = 0x49; scratch[3] = 0x44;
-    scratch[4] = 1; scratch[5] = 0;
-    scratch[6] = 64; scratch[7] = 0;
-    scratch[8] = 16; scratch[9] = 0; scratch[10] = 0; scratch[11] = 0; // payload_len=16
+    scratch[0] = 0x43;
+    scratch[1] = 0x50;
+    scratch[2] = 0x49;
+    scratch[3] = 0x44;
+    scratch[4] = 1;
+    scratch[5] = 0;
+    scratch[6] = 64;
+    scratch[7] = 0;
+    scratch[8] = 48;
+    scratch[9] = 0;
+    scratch[10] = 0;
+    scratch[11] = 0; // payload_len=48 (8 header + 40 payload)
     @memset(scratch[12..20], 0); // auth
-    
+
     // src (node + endpoint 7)
     @memcpy(scratch[20..36], &bs.local_node);
-    scratch[36] = 7; @memset(scratch[37..44], 0);
-    
+    scratch[36] = 7;
+    @memset(scratch[37..44], 0);
+
     // dst (node + kernel control endpoint)
     @memcpy(scratch[44..60], &bs.local_node); // local node for now
     const kc_id = bs.reserved_kernel_control_endpoint;
-    scratch[60] = @truncate(kc_id); scratch[61] = @truncate(kc_id >> 8);
-    scratch[62] = @truncate(kc_id >> 16); scratch[63] = @truncate(kc_id >> 24);
-    scratch[64] = @truncate(kc_id >> 32); scratch[65] = @truncate(kc_id >> 40);
-    scratch[66] = @truncate(kc_id >> 48); scratch[67] = @truncate(kc_id >> 56);
+    scratch[60] = @truncate(kc_id);
+    scratch[61] = @truncate(kc_id >> 8);
+    scratch[62] = @truncate(kc_id >> 16);
+    scratch[63] = @truncate(kc_id >> 24);
+    scratch[64] = @truncate(kc_id >> 32);
+    scratch[65] = @truncate(kc_id >> 40);
+    scratch[66] = @truncate(kc_id >> 48);
+    scratch[67] = @truncate(kc_id >> 56);
 
-    // ControlHeader (op=6 create_microvm, payload_len=8)
-    scratch[64] = 6; scratch[65] = 0; // op
-    scratch[66] = 0; scratch[67] = 0; // _reserved
-    scratch[68] = 8; scratch[69] = 0; scratch[70] = 0; scratch[71] = 0; // len
+    // ControlHeader (op=6 create_microvm, payload_len=40)
+    scratch[64] = 6;
+    scratch[65] = 0; // op
+    scratch[66] = 0;
+    scratch[67] = 0; // _reserved
+    scratch[68] = 40;
+    scratch[69] = 0;
+    scratch[70] = 0;
+    scratch[71] = 0; // len
 
-    // CreateMicrovmPayload
-    scratch[72] = 0; scratch[73] = 64; scratch[74] = 0; scratch[75] = 0; // mem_pages = 16384 (64MiB)
-    scratch[76] = 0; scratch[77] = 0; scratch[78] = 0; scratch[79] = 0; // _reserved
+    // CreateMicrovmPayload (40 bytes)
+    const payload: *align(1) lib.CreateMicrovmPayload = @ptrCast(@alignCast(scratch[72..112]));
+    payload.mem_pages = 16384;
+    payload.vcpus = 1;
+    payload.kernel_phys = bs.kernel_phys;
+    payload.kernel_size = bs.kernel_size;
+    payload.initramfs_phys = bs.initramfs_phys;
+    payload.initramfs_size = bs.initramfs_size;
 
     _ = syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
 
