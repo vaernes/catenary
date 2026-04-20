@@ -198,13 +198,11 @@ pub fn handleKernelControlPage(
             if (remaining != @sizeOf(control_protocol.RegistrySyncPayload)) return error.BadPayload;
             const p: *const control_protocol.RegistrySyncPayload = @ptrCast(@alignCast(payload_ptr));
             const sr = @import("../services/service_registry.zig");
-            // Just mark it as reserved or active if we wanted to mirror it.
-            // For now, we print it to serial to show we received a sync.
-            const arch_cpu2 = @import("../arch/x86_64/cpu.zig");
-            _ = arch_cpu2;
-            // TODO: Actually insert into local registry as remote service
-            _ = sr;
-            _ = p;
+            if (!sr.registerRemoteService(p.service_id, p.service_kind, p.state)) {
+                serialWrite("kernel_control: registry sync failed to register remote service\n");
+            } else {
+                serialWrite("kernel_control: remote service registered from sync\n");
+            }
         },
         // poll_netd_inbox and assign_node_addr are handled directly in the trap bridge
         // (user_mode.zig) and do not go through the DIPC page path, so the kernel

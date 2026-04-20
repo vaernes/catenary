@@ -19,6 +19,7 @@ pub const Slot = struct {
     service_id: u32 = 0,
     class: service_bootstrap.ProcessClass = .user_service,
     kind: service_bootstrap.ServiceKind = .netd,
+    is_remote: bool = false,
     runtime_mode: service_bootstrap.RuntimeMode = .oneshot,
     state: ServiceState = .empty,
     entry_rip: u64 = 0,
@@ -104,6 +105,31 @@ pub fn init() void {
 
 fn ensureInit() void {
     if (!initialized) init();
+}
+
+pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8) bool {
+    ensureInit();
+    // Try to find if we already track this remote service
+    for (0..MAX_SERVICES) |i| {
+        if (slots[i].in_use and slots[i].service_id == service_id and slots[i].is_remote) {
+            slots[i].state = @enumFromInt(state);
+            return true;
+        }
+    }
+    // Find an empty slot
+    for (0..MAX_SERVICES) |i| {
+        if (!slots[i].in_use) {
+            slots[i] = Slot{
+                .in_use = true,
+                .is_remote = true,
+                .service_id = service_id,
+                .kind = @enumFromInt(kind_val),
+                .state = @enumFromInt(state),
+            };
+            return true;
+        }
+    }
+    return false;
 }
 
 pub fn reserve(kind: service_bootstrap.ServiceKind) ?u32 {
