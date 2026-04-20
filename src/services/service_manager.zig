@@ -89,7 +89,8 @@ fn launchService(
         return error.LoadFailed;
     };
 
-    const sid = service_registry.reserve(kind) orelse {
+    const user_id: service_bootstrap.UserId = if (kind == .vmm or kind == .clusterd) .vm_deployer else .core;
+    const sid = service_registry.reserve(kind, user_id) orelse {
         main.serialWrite("service_manager: service_registry.reserve failed\n");
         return error.LaunchFailed;
     };
@@ -103,6 +104,7 @@ fn launchService(
         local_node,
         sid,
         kind,
+        user_id,
         mode,
         task.entry,
         task.stack_top,

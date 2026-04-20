@@ -70,6 +70,7 @@ pub fn allocLaunch(
     local_node: dipc.Ipv6Addr,
     service_id: u32,
     kind: service_bootstrap.ServiceKind,
+    user_id: service_bootstrap.UserId,
     runtime_mode: service_bootstrap.RuntimeMode,
     entry_rip: u64,
     stack_top: u64,
@@ -81,15 +82,15 @@ pub fn allocLaunch(
     const token = registry.getCapabilityToken(service_id);
 
     const bootstrap: service_bootstrap.Descriptor = switch (kind) {
-        .netd => service_bootstrap.forNetd(local_node, service_id, runtime_mode, token),
-        .vmm => service_bootstrap.forVmm(local_node, service_id, token),
-        .storaged => service_bootstrap.forStoraged(local_node, service_id, token),
-        .dashd => service_bootstrap.forDashd(local_node, service_id, token),
-        .containerd => service_bootstrap.forContainerd(local_node, service_id, token),
-        .clusterd => service_bootstrap.forClusterd(local_node, service_id, token),
-        .inputd => service_bootstrap.forInputd(local_node, service_id, token),
-        .windowd => service_bootstrap.forWindowd(local_node, service_id, token),
-        .configd => service_bootstrap.forConfigd(local_node, service_id, token),
+        .netd => service_bootstrap.forNetd(local_node, service_id, user_id, runtime_mode, token),
+        .vmm => service_bootstrap.forVmm(local_node, service_id, user_id, token),
+        .storaged => service_bootstrap.forStoraged(local_node, service_id, user_id, token),
+        .dashd => service_bootstrap.forDashd(local_node, service_id, user_id, token),
+        .containerd => service_bootstrap.forContainerd(local_node, service_id, user_id, token),
+        .clusterd => service_bootstrap.forClusterd(local_node, service_id, user_id, token),
+        .inputd => service_bootstrap.forInputd(local_node, service_id, user_id, token),
+        .windowd => service_bootstrap.forWindowd(local_node, service_id, user_id, token),
+        .configd => service_bootstrap.forConfigd(local_node, service_id, user_id, token),
     };
 
     const page_virt = page_phys + hhdm_offset;

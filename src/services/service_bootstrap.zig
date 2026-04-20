@@ -18,6 +18,11 @@ pub const ProcessClass = enum(u16) {
     microvm_workload = 3,
 };
 
+pub const UserId = enum(u32) {
+    core = 0,
+    vm_deployer = 1,
+};
+
 pub const ServiceKind = enum(u16) {
     netd = 1,
     vmm = 2,
@@ -116,6 +121,7 @@ pub const Descriptor = extern struct {
     runtime_mode: u16,
     _reserved0: u16 = 0,
     service_id: u32,
+    user_id: u32, // Use u32 for ABI stability
     flags: u32 = 0,
     persistent_trap_vector: u8,
     _reserved1: u8 = 0,
@@ -150,7 +156,7 @@ pub fn validate(desc: Descriptor) DescriptorError!void {
     // ... enum checks skipped for now as we use u16 in the struct ...
 }
 
-pub fn forNetd(local_node: dipc.Ipv6Addr, service_id: u32, runtime_mode: RuntimeMode, capability_token: u64) Descriptor {
+pub fn forNetd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, runtime_mode: RuntimeMode, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -159,6 +165,7 @@ pub fn forNetd(local_node: dipc.Ipv6Addr, service_id: u32, runtime_mode: Runtime
         .service_kind = @intFromEnum(ServiceKind.netd),
         .runtime_mode = @intFromEnum(runtime_mode),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = if (runtime_mode == .persistent) PersistentTrapVector else 0,
         .persistent_heartbeat_op = if (runtime_mode == .persistent) PersistentHeartbeatOp else 0,
         .persistent_stop_op = if (runtime_mode == .persistent) PersistentStopOp else 0,
@@ -179,7 +186,7 @@ pub fn forNetd(local_node: dipc.Ipv6Addr, service_id: u32, runtime_mode: Runtime
     };
 }
 
-pub fn forVmm(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forVmm(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -188,6 +195,7 @@ pub fn forVmm(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64)
         .service_kind = @intFromEnum(ServiceKind.vmm),
         .runtime_mode = @intFromEnum(RuntimeMode.persistent),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = PersistentTrapVector,
         .persistent_heartbeat_op = PersistentHeartbeatOp,
         .persistent_stop_op = PersistentStopOp,
@@ -208,7 +216,7 @@ pub fn forVmm(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64)
     };
 }
 
-pub fn forStoraged(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forStoraged(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -217,6 +225,7 @@ pub fn forStoraged(local_node: dipc.Ipv6Addr, service_id: u32, capability_token:
         .service_kind = @intFromEnum(ServiceKind.storaged),
         .runtime_mode = @intFromEnum(RuntimeMode.oneshot),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = 0,
         .persistent_heartbeat_op = 0,
         .persistent_stop_op = 0,
@@ -237,7 +246,7 @@ pub fn forStoraged(local_node: dipc.Ipv6Addr, service_id: u32, capability_token:
     };
 }
 
-pub fn forDashd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forDashd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -246,6 +255,7 @@ pub fn forDashd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u6
         .service_kind = @intFromEnum(ServiceKind.dashd),
         .runtime_mode = @intFromEnum(RuntimeMode.persistent),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = PersistentTrapVector,
         .persistent_heartbeat_op = PersistentHeartbeatOp,
         .persistent_stop_op = PersistentStopOp,
@@ -266,7 +276,7 @@ pub fn forDashd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u6
     };
 }
 
-pub fn forContainerd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forContainerd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -275,6 +285,7 @@ pub fn forContainerd(local_node: dipc.Ipv6Addr, service_id: u32, capability_toke
         .service_kind = @intFromEnum(ServiceKind.containerd),
         .runtime_mode = @intFromEnum(RuntimeMode.oneshot),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = 0,
         .persistent_heartbeat_op = 0,
         .persistent_stop_op = 0,
@@ -295,7 +306,7 @@ pub fn forContainerd(local_node: dipc.Ipv6Addr, service_id: u32, capability_toke
     };
 }
 
-pub fn forClusterd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forClusterd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -304,6 +315,7 @@ pub fn forClusterd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token:
         .service_kind = @intFromEnum(ServiceKind.clusterd),
         .runtime_mode = @intFromEnum(RuntimeMode.oneshot),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = 0,
         .persistent_heartbeat_op = 0,
         .persistent_stop_op = 0,
@@ -324,7 +336,7 @@ pub fn forClusterd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token:
     };
 }
 
-pub fn forInputd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forInputd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -333,6 +345,7 @@ pub fn forInputd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u
         .service_kind = @intFromEnum(ServiceKind.inputd),
         .runtime_mode = @intFromEnum(RuntimeMode.persistent),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = PersistentTrapVector,
         .persistent_heartbeat_op = PersistentHeartbeatOp,
         .persistent_stop_op = PersistentStopOp,
@@ -353,7 +366,7 @@ pub fn forInputd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u
     };
 }
 
-pub fn forWindowd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forWindowd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -362,6 +375,7 @@ pub fn forWindowd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: 
         .service_kind = @intFromEnum(ServiceKind.windowd),
         .runtime_mode = @intFromEnum(RuntimeMode.persistent),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = PersistentTrapVector,
         .persistent_heartbeat_op = PersistentHeartbeatOp,
         .persistent_stop_op = PersistentStopOp,
@@ -382,7 +396,7 @@ pub fn forWindowd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: 
     };
 }
 
-pub fn forConfigd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: u64) Descriptor {
+pub fn forConfigd(local_node: dipc.Ipv6Addr, service_id: u32, user_id: UserId, capability_token: u64) Descriptor {
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
@@ -391,6 +405,7 @@ pub fn forConfigd(local_node: dipc.Ipv6Addr, service_id: u32, capability_token: 
         .service_kind = @intFromEnum(ServiceKind.configd),
         .runtime_mode = @intFromEnum(RuntimeMode.persistent),
         .service_id = service_id,
+        .user_id = @intFromEnum(user_id),
         .persistent_trap_vector = PersistentTrapVector,
         .persistent_heartbeat_op = PersistentHeartbeatOp,
         .persistent_stop_op = PersistentStopOp,

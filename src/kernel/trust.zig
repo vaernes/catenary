@@ -11,6 +11,7 @@ pub const KernelManifest = struct {
     // Future placeholders for measured boot
     load_address_virtual: u64,
     entry_point_virtual: u64,
+    kernel_hash: [32]u8 = [_]u8{0} ** 32,
 
     pub fn report(self: KernelManifest, serialWrite: *const fn ([]const u8) void, printHex: *const fn (u64) void) void {
         serialWrite("--- KERNEL TRUST MANIFEST ---\n");
@@ -45,6 +46,7 @@ fn writeManifest(dst: *KernelManifest, src: KernelManifest) void {
     dst.capability_seed = src.capability_seed;
     dst.load_address_virtual = src.load_address_virtual;
     dst.entry_point_virtual = src.entry_point_virtual;
+    dst.kernel_hash = src.kernel_hash;
 }
 
 pub fn storeManifest(manifest: KernelManifest) *KernelManifest {

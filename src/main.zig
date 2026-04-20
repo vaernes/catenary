@@ -118,6 +118,15 @@ pub fn serialWrite(s: []const u8) void {
     }
 }
 
+fn measureKernel(hhdm_offset: u64, phys_base: u64, size: u64) [32]u8 {
+    var out: [32]u8 = undefined;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    const ptr: [*]const u8 = @ptrFromInt(phys_base + hhdm_offset);
+    hash.update(ptr[0..size]);
+    hash.final(&out);
+    return out;
+}
+
 fn bootLog(s: []const u8) void {
     serialWrite(s);
     if (comptime builtin.cpu.arch == .x86_64) {
@@ -349,8 +358,16 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 .capability_seed = ent ^ 0xC4A7_E2D1_5F30_9B6C,
                 .load_address_virtual = virtual_base,
                 .entry_point_virtual = virtual_base,
+                .kernel_hash = measureKernel(hhdm.offset, physical_base, kernel_size),
             };
             _ = trust.storeManifest(manifest);
+            bootLog("Kernel measurement (SHA-256): ");
+            for (manifest.kernel_hash) |b| {
+                const hex = "0123456789ABCDEF";
+                outb(0x3F8, hex[b >> 4]);
+                outb(0x3F8, hex[b & 0xF]);
+            }
+            bootLog("\n");
             dipc.setAuthKey(manifest.capability_seed ^ 0xD19C_A77E_2045_B68F);
             service_registry.init();
             if (comptime builtin.cpu.arch == .x86_64) {

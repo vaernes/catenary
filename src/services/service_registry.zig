@@ -20,6 +20,7 @@ pub const Slot = struct {
     service_id: u32 = 0,
     class: service_bootstrap.ProcessClass = .user_service,
     kind: service_bootstrap.ServiceKind = .netd,
+    user_id: service_bootstrap.UserId = .core,
     is_remote: bool = false,
     remote_node: dipc.Ipv6Addr = dipc.Ipv6Addr{ .bytes = [_]u8{0} ** 16 },
     runtime_mode: service_bootstrap.RuntimeMode = .oneshot,
@@ -139,13 +140,14 @@ pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8, remote_n
     return false;
 }
 
-pub fn reserve(kind: service_bootstrap.ServiceKind) ?u32 {
-    const allocation = reserveWithToken(kind) orelse return null;
+pub fn reserve(kind: service_bootstrap.ServiceKind, user_id: service_bootstrap.UserId) ?u32 {
+    const allocation = reserveWithToken(kind, user_id) orelse return null;
     return allocation.service_id;
 }
 
 pub fn reserveWithToken(
     kind: service_bootstrap.ServiceKind,
+    user_id: service_bootstrap.UserId,
 ) ?struct { service_id: u32, capability_token: u64 } {
     ensureInit();
     refreshCapabilitySecret();
@@ -159,6 +161,7 @@ pub fn reserveWithToken(
                 .in_use = true,
                 .service_id = service_id,
                 .kind = kind,
+                .user_id = user_id,
                 .state = .reserved,
                 .capability_token = token,
                 .capability_revoked = false,
@@ -217,13 +220,13 @@ pub fn rotateCapability(service_id: u32) ?u64 {
     return slot.capability_token;
 }
 
-pub fn ensureService(kind: service_bootstrap.ServiceKind) ?u32 {
+pub fn ensureService(kind: service_bootstrap.ServiceKind, user_id: service_bootstrap.UserId) ?u32 {
     ensureInit();
     for (0..MAX_SERVICES) |i| {
         const slot = slots[i];
         if (slot.in_use and slot.kind == kind) return slot.service_id;
     }
-    return reserve(kind);
+    return reserve(kind, user_id);
 }
 
 pub fn bindLaunch(
