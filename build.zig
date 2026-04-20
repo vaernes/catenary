@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
     const vmm_launch_val = b.option(bool, "vmm_launch_linux", "Launch Linux guest on boot") orelse false;
     opts.addOption(bool, "vmm_launch_linux", vmm_launch_val);
     opts.addOption(bool, "serial_syscall_keepalive", b.option(bool, "serial_syscall_keepalive", "Emit per-syscall UART keepalive for QEMU serial-file backends") orelse false);
+    opts.addOption(?[]const u8, "expected_kernel_hash", b.option([]const u8, "expected_kernel_hash", "Expected SHA-256 hash of the kernel for Secure Boot verification") orelse null);
 
     const exe = b.addExecutable(.{
         .name = "kernel.elf",

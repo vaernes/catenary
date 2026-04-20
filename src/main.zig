@@ -134,7 +134,7 @@ fn bootLog(s: []const u8) void {
     }
 }
 
-inline fn outb(port: u16, val: u8) void {
+pub inline fn outb(port: u16, val: u8) void {
     if (comptime builtin.cpu.arch == .x86_64) {
         asm volatile ("outb %[val], %[port]"
             :
@@ -368,6 +368,38 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 outb(0x3F8, hex[b & 0xF]);
             }
             bootLog("\n");
+            
+            if (build_options.expected_kernel_hash) |expected_hex| {
+                bootLog("SECURE BOOT: Verifying kernel integrity...\n");
+                var expected_bytes: [32]u8 = [_]u8{0} ** 32;
+                var ok = true;
+                if (expected_hex.len == 64) {
+                    for (0..32) |idx| {
+                        const h = std.fmt.charToDigit(expected_hex[idx * 2], 16) catch { ok = false; break; };
+                        const l = std.fmt.charToDigit(expected_hex[idx * 2 + 1], 16) catch { ok = false; break; };
+                        expected_bytes[idx] = @as(u8, @intCast(h << 4 | l));
+                    }
+                } else {
+                    ok = false;
+                }
+
+                if (!ok) {
+                    bootLog("SECURE BOOT ERROR: Invalid golden hash format!\n");
+                    while (true) arch.cpu.halt();
+                }
+
+                if (!std.mem.eql(u8, &manifest.kernel_hash, &expected_bytes)) {
+                    bootLog("SECURE BOOT FATAL: Kernel integrity check FAILED!\n");
+                    bootLog("Expected: ");
+                    bootLog(expected_hex);
+                    bootLog("\n");
+                    while (true) arch.cpu.halt();
+                }
+                bootLog("SECURE BOOT: Integrity verified. Kernel trusted.\n");
+            } else {
+                bootLog("SECURE BOOT WARNING: No golden hash provided. Booting in permissive mode.\n");
+            }
+
             dipc.setAuthKey(manifest.capability_seed ^ 0xD19C_A77E_2045_B68F);
             service_registry.init();
             if (comptime builtin.cpu.arch == .x86_64) {

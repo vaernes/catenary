@@ -1,4 +1,13 @@
 const std = @import("std");
+const service_bootstrap = @import("../services/service_bootstrap.zig");
+
+pub const MAX_SERVICE_HASHES: usize = 16;
+
+pub const ServiceHash = struct {
+    kind: service_bootstrap.ServiceKind = .netd,
+    hash: [32]u8 = [_]u8{0} ** 32,
+    is_valid: bool = false,
+};
 
 pub const KernelManifest = struct {
     magic: u64 = 0x4341544D414E4946, // "CATMANIF"
@@ -12,6 +21,7 @@ pub const KernelManifest = struct {
     load_address_virtual: u64,
     entry_point_virtual: u64,
     kernel_hash: [32]u8 = [_]u8{0} ** 32,
+    service_hashes: [MAX_SERVICE_HASHES]ServiceHash = [_]ServiceHash{.{}} ** MAX_SERVICE_HASHES,
 
     pub fn report(self: KernelManifest, serialWrite: *const fn ([]const u8) void, printHex: *const fn (u64) void) void {
         serialWrite("--- KERNEL TRUST MANIFEST ---\n");
@@ -47,6 +57,7 @@ fn writeManifest(dst: *KernelManifest, src: KernelManifest) void {
     dst.load_address_virtual = src.load_address_virtual;
     dst.entry_point_virtual = src.entry_point_virtual;
     dst.kernel_hash = src.kernel_hash;
+    dst.service_hashes = src.service_hashes;
 }
 
 pub fn storeManifest(manifest: KernelManifest) *KernelManifest {

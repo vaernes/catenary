@@ -61,12 +61,12 @@ const COMMON_OPS_LOW: u32 =
     (1 << 2) | // SYS_REGISTER_ENDPOINT
     (1 << 3) | // SYS_RECV
     (1 << 4) | // SYS_FREE_PAGE
+    (1 << 5) | // SYS_DMA_ALLOC
     (1 << 6) | // SYS_SEND
     (1 << 9) | // SYS_SERIAL_WRITE
     (1 << 17); // SYS_MAP_RECV
 
 const HW_ACCESS_OPS_LOW: u32 =
-    (1 << 5) | // SYS_DMA_ALLOC
     (1 << 7) | // SYS_MMIO_MAP
     (1 << 13) | // SYS_PCI_READ
     (1 << 14); // SYS_PCI_WRITE

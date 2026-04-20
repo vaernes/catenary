@@ -7,6 +7,7 @@ const service_registry = @import("service_registry.zig");
 const service_launch = @import("service_launch.zig");
 const service_bootstrap = @import("service_bootstrap.zig");
 const task_loader = @import("task_loader.zig");
+const trust = @import("../kernel/trust.zig");
 
 const main = @import("../main.zig");
 const kernel = @import("../main.zig");
@@ -84,6 +85,49 @@ fn launchService(
     kind: service_bootstrap.ServiceKind,
     elf_bytes: []const u8,
 ) ManagerError!void {
+    // Service Integrity Verification (Secure Boot Stage 3)
+    var measurement: [32]u8 = undefined;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(elf_bytes);
+    hash.final(&measurement);
+
+    main.serialWrite("Service measurement (");
+    main.serialWrite(serviceName(kind));
+    main.serialWrite("): ");
+    for (measurement) |b| {
+        const hex = "0123456789ABCDEF";
+        main.outb(0x3F8, hex[b >> 4]);
+        main.outb(0x3F8, hex[b & 0xF]);
+    }
+    main.serialWrite("\n");
+
+    if (trust.global_manifest_ptr.magic == 0x4341544D414E4946) {
+        var found_match = false;
+        var has_manifest_entry = false;
+        for (trust.global_manifest_ptr.service_hashes) |sh| {
+            if (sh.is_valid and sh.kind == kind) {
+                has_manifest_entry = true;
+                if (std.mem.eql(u8, &measurement, &sh.hash)) {
+                    found_match = true;
+                }
+                break;
+            }
+        }
+
+        if (has_manifest_entry and !found_match) {
+            main.serialWrite("SECURE BOOT FATAL: Service integrity check FAILED for ");
+            main.serialWrite(serviceName(kind));
+            main.serialWrite("\n");
+            return error.LaunchFailed;
+        } else if (!has_manifest_entry) {
+            main.serialWrite("SECURE BOOT WARNING: No manifest entry for ");
+            main.serialWrite(serviceName(kind));
+            main.serialWrite(". Permissive mode active.\n");
+        } else {
+            main.serialWrite("SECURE BOOT: Service verified.\n");
+        }
+    }
+
     const task = task_loader.loadElfIntoNewSpace(elf_bytes, hhdm_offset) catch {
         main.serialWrite("service_manager: loadElfIntoNewSpace failed\n");
         return error.LoadFailed;
