@@ -33,10 +33,22 @@ const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48B;
 const IA32_VMX_TRUE_PROCBASED_CTLS2: u32 = 0x48B;
 const IA32_APIC_BASE: u32 = 0x1B;
+const IA32_BIOS_SIGN_ID: u32 = 0x8B;
+const IA32_MTRRCAP: u32 = 0xFE;
 const IA32_FS_BASE: u32 = 0xC0000100;
 const IA32_GS_BASE: u32 = 0xC0000101;
 const IA32_EFER: u32 = 0xC0000080;
 const IA32_PAT: u32 = 0x277;
+const IA32_ARCH_CAPABILITIES: u32 = 0x10A;
+const IA32_MISC_ENABLE: u32 = 0x1A0;
+const AMD64_PATCH_LEVEL: u32 = 0xC0011029;
+const MSR_CORE_PERF_FIXED_CTR_CTRL: u32 = 0x38D;
+const MSR_CORE_PERF_GLOBAL_STATUS: u32 = 0x38E;
+const MSR_CORE_PERF_GLOBAL_CTRL: u32 = 0x38F;
+const MSR_CORE_PERF_GLOBAL_OVF_CTRL: u32 = 0x390;
+const MSR_SNB_UNC_PERF_GLOBAL_CTRL: u32 = 0x391;
+const MSR_SNB_UNC_FIXED_CTR_CTRL: u32 = 0x394;
+const MSR_SNB_UNC_FIXED_CTR: u32 = 0x395;
 
 const FEATURE_CONTROL_LOCK: u64 = 1 << 0;
 const FEATURE_CONTROL_VMXON_OUTSIDE_SMX: u64 = 1 << 2;
@@ -58,6 +70,7 @@ const VMCS_CTRL_VMEXIT: u64 = 0x400C;
 const VMCS_CTRL_VMENTRY: u64 = 0x4012;
 const VMCS_CTRL_SECONDARY_CPU_BASED: u64 = 0x401E;
 const VMCS_CTRL_EPT_POINTER: u64 = 0x201A;
+const VMCS_CTRL_MSR_BITMAPS: u64 = 0x2004;
 const VMCS_CTRL_CR0_GUEST_HOST_MASK: u64 = 0x6000;
 const VMCS_CTRL_CR4_GUEST_HOST_MASK: u64 = 0x6002;
 const VMCS_CTRL_CR0_READ_SHADOW: u64 = 0x6004;
@@ -239,6 +252,11 @@ const MAX_GUEST_MAPS: usize = 262144;
 const GUEST_POOL_PAGES: usize = 65536;
 const PREEMPTION_TIMER_INITIAL: u32 = 0x7FFFFFFF;
 const PREEMPTION_TIMER_RELOAD: u32 = 100000; // ~1ms at 100MHz preemption timer freq
+const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0CF8;
+const PCI_CONFIG_DATA_PORT: u16 = 0x0CFC;
+const PCI_CONFIG_ADDRESS_ENABLE: u32 = 0x8000_0000;
+const PCI_ROOT_VENDOR_DEVICE: u32 = 0x29C0_8086; // Intel Q35 host bridge
+const PCI_ROOT_CLASS_REVISION: u32 = 0x0600_0000;
 var pic_master_imr: u8 = 0xFF;
 var pic_slave_imr: u8 = 0xFF;
 var pic_master_icw_step: u8 = 0;
@@ -271,10 +289,153 @@ var timer_inject_count: u64 = 0;
 var timer_exit_count: u64 = 0;
 var unknown_msr_read_logs: u8 = 0;
 var unknown_msr_write_logs: u8 = 0;
+var pci_config_address: u32 = 0;
+var pci_root_command: u16 = 0;
+var vmx_msr_bitmap align(4096) = [_]u8{0} ** 4096;
 
 // -- Port 0x61 (System Control Port B) emulation --
 var port_61_value: u8 = 0;
 var port_61_reads: u32 = 0;
+
+fn ioMask(size: u8) u64 {
+    return switch (size) {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        4 => 0xFFFF_FFFF,
+        else => 0xFF,
+    };
+}
+
+fn ioAccessSize(qualification: u64) u8 {
+    return switch (@as(u3, @truncate(qualification & 0x7))) {
+        0 => 1,
+        1 => 2,
+        3 => 4,
+        else => 1,
+    };
+}
+
+fn readGuestIoValue(regs: *const GuestRegs, size: u8) u32 {
+    return @as(u32, @truncate(regs.rax & ioMask(size)));
+}
+
+fn writeGuestIoValue(regs: *GuestRegs, size: u8, value: u32) void {
+    switch (size) {
+        1 => regs.rax = (regs.rax & ~@as(u64, 0xFF)) | (value & 0xFF),
+        2 => regs.rax = (regs.rax & ~@as(u64, 0xFFFF)) | (value & 0xFFFF),
+        4 => regs.rax = value,
+        else => regs.rax = (regs.rax & ~@as(u64, 0xFF)) | (value & 0xFF),
+    }
+}
+
+fn setMsrBitmapBit(msr: u32, intercept_read: bool, intercept_write: bool) void {
+    const is_high = msr >= 0xC000_0000 and msr <= 0xC000_1FFF;
+    const is_low = msr <= 0x1FFF;
+    if (!is_low and !is_high) return;
+
+    const bit_index: usize = if (is_low) msr else msr - 0xC000_0000;
+    const byte_index = bit_index >> 3;
+    const bit = @as(u3, @truncate(bit_index & 7));
+    const read_base: usize = if (is_low) 0 else 1024;
+    const write_base: usize = if (is_low) 2048 else 3072;
+
+    if (intercept_read) vmx_msr_bitmap[read_base + byte_index] |= @as(u8, 1) << bit;
+    if (intercept_write) vmx_msr_bitmap[write_base + byte_index] |= @as(u8, 1) << bit;
+}
+
+fn configureMsrBitmap() VmxError!void {
+    @memset(vmx_msr_bitmap[0..], 0);
+
+    setMsrBitmapBit(IA32_BIOS_SIGN_ID, true, false);
+    setMsrBitmapBit(IA32_MTRRCAP, true, false);
+    setMsrBitmapBit(IA32_ARCH_CAPABILITIES, true, false);
+    setMsrBitmapBit(IA32_MISC_ENABLE, true, false);
+
+    setMsrBitmapBit(MSR_CORE_PERF_FIXED_CTR_CTRL, true, true);
+    setMsrBitmapBit(MSR_CORE_PERF_GLOBAL_STATUS, true, false);
+    setMsrBitmapBit(MSR_CORE_PERF_GLOBAL_CTRL, true, true);
+    setMsrBitmapBit(MSR_CORE_PERF_GLOBAL_OVF_CTRL, true, true);
+    setMsrBitmapBit(MSR_SNB_UNC_PERF_GLOBAL_CTRL, true, true);
+    setMsrBitmapBit(MSR_SNB_UNC_FIXED_CTR_CTRL, true, true);
+    setMsrBitmapBit(MSR_SNB_UNC_FIXED_CTR, true, false);
+
+    const bitmap_hpa = translateHostVirtToPhys(@intFromPtr(&vmx_msr_bitmap)) orelse return error.Unsupported;
+    try vmwriteChecked(VMCS_CTRL_MSR_BITMAPS, bitmap_hpa);
+}
+
+fn pciConfigReadDword(addr: u32) u32 {
+    if ((addr & PCI_CONFIG_ADDRESS_ENABLE) == 0) return 0xFFFF_FFFF;
+
+    const bus = @as(u8, @truncate(addr >> 16));
+    const device = @as(u5, @truncate((addr >> 11) & 0x1F));
+    const function = @as(u3, @truncate((addr >> 8) & 0x7));
+    const reg = @as(u8, @truncate(addr & 0xFC));
+
+    if (bus != 0 or device != 0 or function != 0) return 0xFFFF_FFFF;
+
+    return switch (reg) {
+        0x00 => PCI_ROOT_VENDOR_DEVICE,
+        0x04 => pci_root_command,
+        0x08 => PCI_ROOT_CLASS_REVISION,
+        0x0C => 0,
+        0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x30, 0x34, 0x3C => 0,
+        else => 0,
+    };
+}
+
+fn pciConfigWriteDword(addr: u32, value: u32, mask: u32) void {
+    if ((addr & PCI_CONFIG_ADDRESS_ENABLE) == 0) return;
+
+    const bus = @as(u8, @truncate(addr >> 16));
+    const device = @as(u5, @truncate((addr >> 11) & 0x1F));
+    const function = @as(u3, @truncate((addr >> 8) & 0x7));
+    const reg = @as(u8, @truncate(addr & 0xFC));
+
+    if (bus != 0 or device != 0 or function != 0) return;
+
+    switch (reg) {
+        0x04 => {
+            const current = @as(u32, pci_root_command);
+            const merged = (current & ~mask) | (value & mask);
+            pci_root_command = @as(u16, @truncate(merged & 0x0000_FFFF));
+        },
+        else => {},
+    }
+}
+
+fn handlePciConfigIo(port: u16, is_in: bool, size: u8, regs: *GuestRegs) bool {
+    if (port == PCI_CONFIG_ADDRESS_PORT and size == 4) {
+        if (is_in) {
+            writeGuestIoValue(regs, 4, pci_config_address);
+        } else {
+            pci_config_address = readGuestIoValue(regs, 4) & 0x8000_FFFC;
+        }
+        return true;
+    }
+
+    if (port >= PCI_CONFIG_DATA_PORT and port <= PCI_CONFIG_DATA_PORT + 3) {
+        const data_offset = @as(u8, @truncate(port - PCI_CONFIG_DATA_PORT));
+        const shift = @as(u5, @truncate(data_offset * 8));
+        const full = pciConfigReadDword(pci_config_address);
+        const value = switch (size) {
+            1 => (full >> shift) & 0xFF,
+            2 => (full >> shift) & 0xFFFF,
+            4 => full,
+            else => full & 0xFF,
+        };
+
+        if (is_in) {
+            writeGuestIoValue(regs, size, value);
+        } else {
+            const mask = @as(u32, @truncate(ioMask(size))) << shift;
+            const shifted = readGuestIoValue(regs, size) << shift;
+            pciConfigWriteDword(pci_config_address, shifted, mask);
+        }
+        return true;
+    }
+
+    return false;
+}
 
 fn lapicRegIndex(offset: u64) ?usize {
     if (offset >= LAPIC_MMIO_SIZE or (offset & 0xF) != 0) return null;
@@ -374,6 +535,9 @@ fn resetGuestDeviceState() void {
     timer_exit_count = 0;
     unknown_msr_read_logs = 0;
     unknown_msr_write_logs = 0;
+
+    pci_config_address = 0;
+    pci_root_command = 0;
 
     port_61_value = 0;
     port_61_reads = 0;
@@ -1149,6 +1313,7 @@ fn loadControlFields(vmx_basic: u64) VmxError!void {
     if (VMX_USE_EPT) {
         try vmwriteChecked(VMCS_CTRL_SECONDARY_CPU_BASED, proc2_based);
     }
+    try configureMsrBitmap();
     const exception_bitmap: u32 = if (preferLinuxEntry()) (@as(u32, 1) << 8) else 0; // Only #DF for Linux
     try vmwriteChecked(VMCS_CTRL_EXCEPTION_BITMAP, exception_bitmap);
     try vmwriteChecked(VMCS_CTRL_VMEXIT, vmexit);
@@ -1297,6 +1462,11 @@ fn handleCpuid(regs: *GuestRegs) void {
         out.ecx &= ~@as(u32, 1 << 31); // Clear HYPERVISOR bit
         out.ecx &= ~@as(u32, 1 << 21); // Hide x2APIC; only xAPIC-style behavior is emulated.
         out.ecx &= ~@as(u32, 1 << 24); // Hide TSC-deadline timer; LAPIC deadline MSRs are not emulated.
+    } else if (leaf == 0xA) {
+        out.eax = 0;
+        out.ebx = 0;
+        out.ecx = 0;
+        out.edx = 0;
     } else if (leaf >= 0x40000000 and leaf <= 0x400000FF) {
         out.eax = 0;
         out.ebx = 0;
@@ -1313,9 +1483,22 @@ fn handleCpuid(regs: *GuestRegs) void {
 
 fn handleMsrRead(regs: *GuestRegs) void {
     const msr = @as(u32, @truncate(regs.rcx));
-    const value = switch (msr) {
+    const value: u64 = switch (msr) {
         IA32_APIC_BASE => guest_apic_base,
         IA32_EFER, IA32_PAT, IA32_FS_BASE, IA32_GS_BASE => cpu.rdmsr(msr),
+        IA32_BIOS_SIGN_ID,
+        IA32_MTRRCAP,
+        IA32_ARCH_CAPABILITIES,
+        IA32_MISC_ENABLE,
+        AMD64_PATCH_LEVEL,
+        MSR_CORE_PERF_FIXED_CTR_CTRL,
+        MSR_CORE_PERF_GLOBAL_STATUS,
+        MSR_CORE_PERF_GLOBAL_CTRL,
+        MSR_CORE_PERF_GLOBAL_OVF_CTRL,
+        MSR_SNB_UNC_PERF_GLOBAL_CTRL,
+        MSR_SNB_UNC_FIXED_CTR_CTRL,
+        MSR_SNB_UNC_FIXED_CTR,
+        => 0,
         else => blk: {
             if (guest_linux_entry_active and unknown_msr_read_logs < 8) {
                 const rip = vmread(VMCS_GUEST_RIP) orelse 0;
@@ -1342,6 +1525,12 @@ fn handleMsrWrite(regs: *GuestRegs) void {
             guest_apic_base = (value & 0x0000_0000_FFFF_FD00) | 0x0000_0000_FEE0_0000;
         },
         IA32_FS_BASE, IA32_GS_BASE, IA32_EFER => cpu.wrmsr(msr, value),
+        MSR_CORE_PERF_FIXED_CTR_CTRL,
+        MSR_CORE_PERF_GLOBAL_CTRL,
+        MSR_CORE_PERF_GLOBAL_OVF_CTRL,
+        MSR_SNB_UNC_PERF_GLOBAL_CTRL,
+        MSR_SNB_UNC_FIXED_CTR_CTRL,
+        => {},
         else => {
             if (guest_linux_entry_active and unknown_msr_write_logs < 8) {
                 const rip = vmread(VMCS_GUEST_RIP) orelse 0;
@@ -1362,8 +1551,14 @@ fn handleMsrWrite(regs: *GuestRegs) void {
 fn handleIoExit(regs: *GuestRegs) void {
     const qualification = vmread(VMCS_EXIT_QUALIFICATION) orelse 0;
     const port = @as(u16, @truncate(qualification >> 16));
+    const size = ioAccessSize(qualification);
     const is_in = (qualification & 8) != 0;
     const serial_dlab = (serial_lcr & 0x80) != 0;
+
+    if (handlePciConfigIo(port, is_in, size, regs)) {
+        advanceGuestRip();
+        return;
+    }
 
     if (port == 0x20 or port == 0x21 or port == 0xA0 or port == 0xA1) {
         handlePicIo(port, is_in, regs);
@@ -1434,8 +1629,7 @@ fn handleIoExit(regs: *GuestRegs) void {
             serial_scr = @as(u8, @truncate(regs.rax));
         }
     } else if (is_in) {
-        // Default 0 for unhandled IN
-        regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00);
+        writeGuestIoValue(regs, size, 0);
     }
 
     advanceGuestRip();
