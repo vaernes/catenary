@@ -1,27 +1,12 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
-}
 
-fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-}
 
 const SYS_REGISTER = 2;
 const SYS_ALLOC_DMA = 5;
 const SYS_SEND_PAGE = 6;
-const SYS_GET_KEY = 8; // Custom syscall to pop a scancode
+const SYS_GET_KEY = 8; // Custom lib.syscall to pop a scancode
 
 const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -30,17 +15,7 @@ const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 
-fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
-}
 
-fn serialWrite(s: []const u8) void {
-    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
-}
 
 // Map scancodes to simple ASCII
 fn scancodeToAscii(scancode: u8) ?u8 {
@@ -96,29 +71,29 @@ const InputEventPayload = extern struct {
 };
 
 pub export fn umain() noreturn {
-    const bs: *const BootstrapDescriptor = ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
 
-    serialWrite("inputd: starting\n");
-    _ = syscall(SYS_REGISTER, 0, 8, token); // Register at endpoint 8 for inputd
-    serialWrite("inputd: registered at endpoint 8\n");
+    lib.serialWrite("inputd: starting\n");
+    _ = lib.syscall(SYS_REGISTER, 0, 8, token); // Register at endpoint 8 for inputd
+    lib.serialWrite("inputd: registered at endpoint 8\n");
 
-    const dipc_phys = syscall(SYS_ALLOC_DMA, 1, 0, token);
+    const dipc_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, token);
     if (dipc_phys == 0) {
-        serialWrite("inputd: DMA alloc failed\n");
+        lib.serialWrite("inputd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
 
     // Input loop: poll the kernel buffer via SYS_GET_KEY, then broadcast via DIPC
-    serialWrite("inputd: entering event loop\n");
+    lib.serialWrite("inputd: entering event loop\n");
     while (true) {
-        const scancode_val = syscall(SYS_GET_KEY, 0, 0, token);
+        const scancode_val = lib.syscall(SYS_GET_KEY, 0, 0, token);
         if (scancode_val != 0xFFFFFFFF) {
             const scancode: u8 = @truncate(scancode_val);
             if ((scancode & 0x80) == 0) { // Only Make codes for now
                 if (scancodeToAscii(scancode)) |c| {
                     // Send to dashd as a simple raw DIPC payload.
-                    const scratch: [*]u8 = ptrFrom([*]u8, DMA_BASE_VA);
+                    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA);
                     const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
                     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
                     header.* = .{
@@ -138,7 +113,7 @@ pub export fn umain() noreturn {
                         .scancode = scancode,
                     };
 
-                    _ = syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
+                    _ = lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
                 }
             }
         } else {

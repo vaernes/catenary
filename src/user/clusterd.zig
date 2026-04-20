@@ -1,22 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
-}
 
-fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-}
 
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
@@ -31,36 +16,26 @@ const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 
-fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
-}
 
-fn serialWrite(s: []const u8) void {
-    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
-}
 
 pub export fn umain() noreturn {
-    const bs: *const BootstrapDescriptor = ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
 
-    serialWrite("clusterd: starting\n");
+    lib.serialWrite("clusterd: starting\n");
     // Register clusterd on endpoint 7 (assume we map it to 7 in identity.zig)
-    _ = syscall(SYS_REGISTER, 0, 7, token);
-    serialWrite("clusterd: registered at endpoint 7\n");
+    _ = lib.syscall(SYS_REGISTER, 0, 7, token);
+    lib.serialWrite("clusterd: registered at endpoint 7\n");
 
-    const dipc_phys = syscall(SYS_ALLOC_DMA, 1, 0, token);
+    const dipc_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, token);
     if (dipc_phys == 0) {
-        serialWrite("clusterd: DMA alloc failed\n");
+        lib.serialWrite("clusterd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
 
-    serialWrite("clusterd: requesting local MicroVM launch...\n");
+    lib.serialWrite("clusterd: requesting local MicroVM launch...\n");
 
-    const scratch: [*]u8 = ptrFrom([*]u8, DMA_BASE_VA);
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA);
 
     const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
@@ -90,13 +65,13 @@ pub export fn umain() noreturn {
         .initramfs_size = bs.initramfs_size,
     };
 
-    _ = syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
+    _ = lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
 
-    serialWrite("clusterd: entering event loop\n");
+    lib.serialWrite("clusterd: entering event loop\n");
     while (true) {
-        const page_phys = syscall(SYS_RECV, 0, 0, token);
+        const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
         if (page_phys != 0) {
-            _ = syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
         }
         asm volatile ("pause");
     }

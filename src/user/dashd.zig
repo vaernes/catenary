@@ -1,41 +1,16 @@
 /// dashd — system observability daemon.
 ///
 /// Receives TelemetryUpdate DIPC messages from the VMM (microvm_bridge) and
-/// renders per-VM stats onto the framebuffer via the SYS_FB_DRAW syscall.
+/// renders per-VM stats onto the framebuffer via the SYS_FB_DRAW lib.syscall.
 const std = @import("std");
 const lib = @import("lib.zig");
 
-fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
-}
 
 // ---------------------------------------------------------------------------
 // Syscall + serial helpers
 // ---------------------------------------------------------------------------
 
-fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
-}
-fn serialWrite(s: []const u8) void {
-    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
-}
 
-fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-}
 
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
@@ -104,7 +79,7 @@ fn appendHex16(buf: [*]u8, pos: *usize, v: u64, digits: u8) void {
 // ---------------------------------------------------------------------------
 
 fn renderDashboard(text_phys: u64, token: u64) void {
-    const text_buf: [*]u8 = ptrFrom([*]u8, DMA_BASE_VA); // slot 0 VA
+    const text_buf: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA); // slot 0 VA
     var row: u32 = 0;
 
     // Header row (row 0)
@@ -112,7 +87,7 @@ fn renderDashboard(text_phys: u64, token: u64) void {
         var pos: usize = 0;
         appendStr(text_buf, &pos, "VM    CPU CYCLES         EXIT COUNT");
         appendByte(text_buf, &pos, 0); // null terminate
-        _ = syscall(SYS_FB_DRAW, text_phys, @as(u64, 0) << 32, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, @as(u64, 0) << 32, token);
         row = 1;
     }
 
@@ -127,7 +102,7 @@ fn renderDashboard(text_phys: u64, token: u64) void {
         appendByte(text_buf, &pos, ' ');
         appendHex16(text_buf, &pos, s.exit_count, 16);
         appendByte(text_buf, &pos, 0);
-        _ = syscall(SYS_FB_DRAW, text_phys, @as(u64, row) << 32, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, @as(u64, row) << 32, token);
         row += 1;
     }
 }
@@ -137,18 +112,18 @@ fn renderDashboard(text_phys: u64, token: u64) void {
 // ---------------------------------------------------------------------------
 
 pub export fn umain() noreturn {
-    const bs: *const BootstrapDescriptor = ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     if (bs.magic != 0x53565442) while (true) asm volatile ("hlt");
     const token = bs.capability_token;
 
-    serialWrite("dashd: starting\n");
-    _ = syscall(SYS_REGISTER, 0, bs.reserved_dashd_endpoint, token);
-    serialWrite("dashd: registered\n");
+    lib.serialWrite("dashd: starting\n");
+    _ = lib.syscall(SYS_REGISTER, 0, bs.reserved_dashd_endpoint, token);
+    lib.serialWrite("dashd: registered\n");
 
     // Allocate one DMA page as a text scratch buffer.
-    const text_phys = syscall(SYS_ALLOC_DMA, 1, 0, token);
+    const text_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, token);
     if (text_phys == 0) {
-        serialWrite("dashd: DMA alloc failed\n");
+        lib.serialWrite("dashd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
 
@@ -157,15 +132,15 @@ pub export fn umain() noreturn {
 
     // Main event loop.
     while (true) {
-        const page_phys = syscall(SYS_RECV, 0, 0, token);
+        const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
         if (page_phys == 0) {
             asm volatile ("pause");
             continue;
         }
 
-        const recv_va = syscall(SYS_MAP_RECV, page_phys, 0, token);
+        const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
         if (recv_va == 0) {
-            _ = syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             continue;
         }
 
@@ -200,6 +175,6 @@ pub export fn umain() noreturn {
         renderDashboard(text_phys, token);
 
         // Free the received DIPC page.
-        _ = syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
+        _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
     }
 }

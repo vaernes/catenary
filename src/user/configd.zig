@@ -19,22 +19,7 @@ const lib = @import("lib.zig");
 // Syscall shim
 // ---------------------------------------------------------------------------
 
-fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-}
 
-fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
-}
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
@@ -101,17 +86,7 @@ var next_vmid: u32 = 1;
 // Serial helpers (for debug output before windowd is ready)
 // ---------------------------------------------------------------------------
 
-fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
-}
 
-fn serialWrite(s: []const u8) void {
-    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
-}
 
 // ---------------------------------------------------------------------------
 // Text helpers (write into DMA text slot)
@@ -161,7 +136,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
         var pos: usize = 0;
         writeLine(buf, &pos, "=== Catenary OS  Configuration Console ===");
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, 0) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, 0) << 32) | 0, token);
     }
 
     // --- Row 1: local node ---
@@ -170,7 +145,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
         writeLine(buf, &pos, "Node: ");
         writeHexNode(buf, &pos, local_node);
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, 1) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, 1) << 32) | 0, token);
     }
 
     // --- Row 2: separator ---
@@ -178,7 +153,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
         var pos: usize = 0;
         writeLine(buf, &pos, "------------------------------------------");
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, 2) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, 2) << 32) | 0, token);
     }
 
     // --- Row 3: cluster header ---
@@ -186,7 +161,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
         var pos: usize = 0;
         writeLine(buf, &pos, "Cluster Nodes:");
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, 3) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, 3) << 32) | 0, token);
     }
 
     // --- Rows 4..(4+MAX_CLUSTER_NODES): node list ---
@@ -203,7 +178,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
             writeLine(buf, &pos, "  [ ] ---");
         }
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
         row += 1;
     }
 
@@ -212,7 +187,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
         var pos: usize = 0;
         writeLine(buf, &pos, "MicroVMs:");
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
         row += 1;
     }
 
@@ -229,7 +204,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
             writeLine(buf, &pos, "  ---");
         }
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
         row += 1;
     }
 
@@ -238,14 +213,14 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
         var pos: usize = 0;
         writeLine(buf, &pos, "------------------------------------------");
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
         row += 1;
     }
     {
         var pos: usize = 0;
         writeLine(buf, &pos, "Keys: [L] Launch VM   [R] Refresh   [Q] Quit");
         buf[pos] = 0;
-        _ = syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
+        _ = lib.syscall(SYS_FB_DRAW, text_phys, (@as(u64, row) << 32) | 0, token);
     }
 }
 
@@ -255,7 +230,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
 // ---------------------------------------------------------------------------
 
 fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u64) void {
-    const scratch: [*]u8 = ptrFrom([*]u8, DMA_DIPC_SLOT);
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_DIPC_SLOT);
     const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
 
     // mem_pages = 256 (1 GiB / 4 KiB = 256 pages for a 1 MiB VM)
@@ -325,7 +300,7 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
     };
 
     // The kernel's SYS_SEND_PAGE copies from the DMA phys page, re-signs, and routes.
-    _ = syscall(SYS_SEND_PAGE, dipc_phys_slot1, 0, token);
+    _ = lib.syscall(SYS_SEND_PAGE, dipc_phys_slot1, 0, token);
 
     // Record in local VM table
     for (&vms) |*v| {
@@ -338,7 +313,7 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
         }
     }
 
-    serialWrite("configd: create_microvm request sent\n");
+    lib.serialWrite("configd: create_microvm request sent\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -391,19 +366,19 @@ fn handleRegistrySync(page_va: u64) void {
 // ---------------------------------------------------------------------------
 
 pub export fn umain() noreturn {
-    const bs: *const BootstrapDescriptor = ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
 
-    serialWrite("configd: starting OS Configuration App\n");
+    lib.serialWrite("configd: starting OS Configuration App\n");
 
     // Register at endpoint 10
-    _ = syscall(SYS_REGISTER, 0, EP_CONFIGD, token);
-    serialWrite("configd: registered at endpoint 10\n");
+    _ = lib.syscall(SYS_REGISTER, 0, EP_CONFIGD, token);
+    lib.serialWrite("configd: registered at endpoint 10\n");
 
-    // Allocate two DMA pages: text scratch (slot 0) + DIPC outbox (slot 1)
-    const text_phys = syscall(SYS_ALLOC_DMA, 2, 0, token);
+    // Allocate two DMA pages: text scratch (slot 0) + DIPC lib.outbox (slot 1)
+    const text_phys = lib.syscall(SYS_ALLOC_DMA, 2, 0, token);
     if (text_phys == 0) {
-        serialWrite("configd: DMA alloc failed\n");
+        lib.serialWrite("configd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
     // Slot 1 physical = slot 0 + PAGE_SIZE
@@ -411,14 +386,14 @@ pub export fn umain() noreturn {
 
     // Draw initial UI
     drawUi(text_phys, token, bs.local_node);
-    serialWrite("configd: initial UI rendered\n");
+    lib.serialWrite("configd: initial UI rendered\n");
 
     var refresh_counter: u32 = 0;
 
     // Main event loop
     while (true) {
         // --- Poll keyboard via inputd's SYS_GET_KEY ---
-        const key = syscall(SYS_GET_KEY, 0, 0, token);
+        const key = lib.syscall(SYS_GET_KEY, 0, 0, token);
         if (key != 0xFFFFFFFF) {
             const scancode: u8 = @truncate(key);
             if ((scancode & 0x80) == 0) { // make code only
@@ -434,24 +409,24 @@ pub export fn umain() noreturn {
                 } else if (ascii == 'r') {
                     drawUi(text_phys, token, bs.local_node);
                 } else if (ascii == 'q') {
-                    serialWrite("configd: shutdown requested\n");
+                    lib.serialWrite("configd: shutdown requested\n");
                 }
             }
         }
 
         // --- Poll DIPC inbox for registry_sync messages ---
-        const page_phys = syscall(SYS_RECV, 0, 0, token);
+        const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
         if (page_phys != 0) {
-            const recv_va = syscall(SYS_MAP_RECV, page_phys, 0, token);
+            const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (recv_va != 0) {
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
                 if (control.op == .registry_sync) {
                     handleRegistrySync(recv_va);
                     drawUi(text_phys, token, bs.local_node);
                 }
-                _ = syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
+                _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
             } else {
-                _ = syscall(SYS_FREE_PAGE, page_phys, 0, token);
+                _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
         }
 

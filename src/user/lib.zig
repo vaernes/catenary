@@ -1,20 +1,40 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
+    switch (builtin.cpu.arch) {
+        .x86_64, .aarch64 => {
+            return @ptrFromInt(asm volatile (""
+                : [ret] "={rax}" (-> u64),
+                : [val] "{rax}" (addr),
+            ));
+        },
+        else => @compileError("Unsupported architecture"),
+    }
 }
 
 pub fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            return asm volatile ("int $0x80"
+                : [ret] "={rax}" (-> u64),
+                : [op] "{rax}" (op),
+                  [arg0] "{rbx}" (arg0),
+                  [arg1] "{rdx}" (arg1),
+                  [token] "{r8}" (token),
+                : .{ .rcx = true, .r11 = true, .memory = true });
+        },
+        .aarch64 => {
+            return asm volatile ("svc #0"
+                : [ret] "={x0}" (-> u64),
+                : [op] "{x8}" (op),
+                  [arg0] "{x0}" (arg0),
+                  [arg1] "{x1}" (arg1),
+                  [token] "{x2}" (token),
+                : .{ .memory = true });
+        },
+        else => @compileError("Unsupported architecture"),
+    }
 }
 
 pub const SYS_REGISTER = 2;
@@ -70,11 +90,19 @@ pub const BootstrapDescriptor = extern struct {
 };
 
 pub fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile ("outb %[val], %[port]"
+                :
+                : [val] "{al}" (val),
+                  [port] "{dx}" (port),
+                : .{ .memory = true });
+        },
+        .aarch64 => {
+            // Memory mapped IO on AArch64 or ignore
+        },
+        else => @compileError("Unsupported architecture"),
+    }
 }
 
 pub fn serialWrite(s: []const u8) void {
@@ -192,3 +220,26 @@ pub const VirtioBlkResponsePayload = extern struct {
     status: u8,
     _pad: u8 = 0,
 };
+
+pub extern fn umain() noreturn;
+
+pub fn _user_start() callconv(.naked) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\andq $-16, %%rsp
+            \\call %[umain]
+            \\1: pause
+            \\jmp 1b
+            :
+            : [umain] "X" (&umain),
+        ),
+        .aarch64 => asm volatile (
+            \\bl %[umain]
+            \\1: wfi
+            \\b 1b
+            :
+            : [umain] "X" (&umain),
+        ),
+        else => @compileError("Unsupported architecture"),
+    }
+}

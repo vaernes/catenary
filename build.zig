@@ -86,8 +86,7 @@ pub fn build(b: *std.Build) void {
         user_exe.pie = false;
         if (arch == .x86_64) {
             user_exe.entry = .{ .symbol_name = "_user_start" };
-            user_exe.root_module.addAssemblyFile(b.path(b.fmt("src/user/{s}.S", .{name})));
-        }
+                    }
 
         b.installArtifact(user_exe);
     }

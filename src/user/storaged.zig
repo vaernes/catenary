@@ -4,47 +4,22 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
-}
 
 // ---------------------------------------------------------------------------
-// Low-level serial + syscall interface (same convention as netd.zig)
+// Low-level serial + lib.syscall interface (same convention as netd.zig)
 // ---------------------------------------------------------------------------
 
-fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
-}
-fn serialWrite(s: []const u8) void {
-    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
-}
 fn printHex(n: u64) void {
     const hex = "0123456789ABCDEF";
     var shift: u6 = 60;
     while (true) {
         const nibble: usize = @intCast((n >> shift) & 0xF);
-        outb(0x3F8, hex[nibble]);
+        lib.outb(0x3F8, hex[nibble]);
         if (shift == 0) break;
         shift -= 4;
     }
 }
 
-fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-}
 
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
@@ -60,14 +35,14 @@ const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 const IO_WINDOW_VA: u64 = 0x0000_7E00_0000_0000;
 const PAGE_SIZE: u64 = 4096;
 
-// PCI config read/write via kernel syscalls
+// PCI config read/write via kernel lib.syscalls
 fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
     const addr = (@as(u64, bus) << 24) | (@as(u64, dev) << 16) | (@as(u64, func) << 8) | @as(u64, off);
-    return syscall(13, addr, @as(u64, size) << 32, token);
+    return lib.syscall(13, addr, @as(u64, size) << 32, token);
 }
 fn pciWrite(bus: u8, dev: u8, func: u8, off: u8, size: u8, val: u32, token: u64) void {
     const addr = (@as(u64, bus) << 24) | (@as(u64, dev) << 16) | (@as(u64, func) << 8) | @as(u64, off);
-    _ = syscall(14, addr, (@as(u64, size) << 32) | val, token);
+    _ = lib.syscall(14, addr, (@as(u64, size) << 32) | val, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -187,16 +162,16 @@ var g_ns_lba_size: u32 = SECTOR_SIZE;
 // ---------------------------------------------------------------------------
 
 fn nvmeR32(off: u64) u32 {
-    return ptrFrom(*volatile u32, IO_WINDOW_VA + off).*;
+    return lib.ptrFrom(*volatile u32, IO_WINDOW_VA + off).*;
 }
 fn nvmeW32(off: u64, val: u32) void {
-    ptrFrom(*volatile u32, IO_WINDOW_VA + off).* = val;
+    lib.ptrFrom(*volatile u32, IO_WINDOW_VA + off).* = val;
 }
 fn nvmeR64(off: u64) u64 {
-    return ptrFrom(*volatile u64, IO_WINDOW_VA + off).*;
+    return lib.ptrFrom(*volatile u64, IO_WINDOW_VA + off).*;
 }
 fn nvmeW64(off: u64, val: u64) void {
-    ptrFrom(*volatile u64, IO_WINDOW_VA + off).* = val;
+    lib.ptrFrom(*volatile u64, IO_WINDOW_VA + off).* = val;
 }
 
 // Doorbell register addresses (DSTRD=0 assumed for QEMU):
@@ -224,13 +199,13 @@ fn ioCqDoorbell(head: u32) void {
 
 fn submitAdmin(sqe: NvmeSqe) u16 {
     // Write SQE to admin queue at tail position.
-    const sq: [*]NvmeSqe = ptrFrom([*]NvmeSqe, ADM_SQ_VA);
+    const sq: [*]NvmeSqe = lib.ptrFrom([*]NvmeSqe, ADM_SQ_VA);
     sq[@as(usize, g_adm_sq_tail % ADM_Q_DEPTH)] = sqe;
     g_adm_sq_tail +%= 1;
     adminSqDoorbell(g_adm_sq_tail);
 
     // Poll CQ until we see a completion with the correct phase bit.
-    const cq: [*]volatile NvmeCqe = ptrFrom([*]volatile NvmeCqe, ADM_CQ_VA);
+    const cq: [*]volatile NvmeCqe = lib.ptrFrom([*]volatile NvmeCqe, ADM_CQ_VA);
     var timeout: u64 = 20_000_000;
     while (timeout > 0) : (timeout -= 1) {
         const entry = &cq[@as(usize, g_adm_cq_head % ADM_Q_DEPTH)];
@@ -248,12 +223,12 @@ fn submitAdmin(sqe: NvmeSqe) u16 {
 }
 
 fn submitIO(sqe: NvmeSqe) u16 {
-    const sq: [*]NvmeSqe = ptrFrom([*]NvmeSqe, IO_SQ_VA);
+    const sq: [*]NvmeSqe = lib.ptrFrom([*]NvmeSqe, IO_SQ_VA);
     sq[@as(usize, g_io_sq_tail % IO_Q_DEPTH)] = sqe;
     g_io_sq_tail +%= 1;
     ioSqDoorbell(g_io_sq_tail);
 
-    const cq: [*]volatile NvmeCqe = ptrFrom([*]volatile NvmeCqe, IO_CQ_VA);
+    const cq: [*]volatile NvmeCqe = lib.ptrFrom([*]volatile NvmeCqe, IO_CQ_VA);
     var timeout: u32 = 10_000_000;
     while (timeout > 0) : (timeout -= 1) {
         const entry = &cq[@as(usize, g_io_cq_head % IO_Q_DEPTH)];
@@ -438,13 +413,13 @@ fn doWrite(slba: u64, nlb: u32, prp1: u64) u16 {
 // ---------------------------------------------------------------------------
 
 pub export fn umain() noreturn {
-    const bs_desc: *const BootstrapDescriptor = ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    const bs_desc: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     if (bs_desc.magic != 0x53565442) while (true) asm volatile ("hlt");
     g_token = bs_desc.capability_token;
 
-    serialWrite("storaged: starting\n");
-    _ = syscall(SYS_REGISTER, 0, bs_desc.reserved_storaged_endpoint, g_token);
-    serialWrite("storaged: registered\n");
+    lib.serialWrite("storaged: starting\n");
+    _ = lib.syscall(SYS_REGISTER, 0, bs_desc.reserved_storaged_endpoint, g_token);
+    lib.serialWrite("storaged: registered\n");
 
     // ----- PCI scan for NVMe (class=0x01, subclass=0x08, prog_if=0x02) -----
     var nvme_bus: u8 = 0;
@@ -479,12 +454,12 @@ pub export fn umain() noreturn {
     }
 
     if (!found) {
-        serialWrite("storaged: no NVMe found; idle\n");
+        lib.serialWrite("storaged: no NVMe found; idle\n");
         while (true) asm volatile ("pause");
     }
-    serialWrite("storaged: NVMe at dev=");
+    lib.serialWrite("storaged: NVMe at dev=");
     printHex(nvme_dev);
-    serialWrite("\n");
+    lib.serialWrite("\n");
 
     // ----- Enable PCI bus-mastering for DMA -----
     const cmd = @as(u16, @truncate(pciRead(nvme_bus, nvme_dev, nvme_func, 0x04, 2, g_token)));
@@ -499,27 +474,27 @@ pub export fn umain() noreturn {
         (@as(u64, bar0_hi) << 32) | (@as(u64, bar0_lo) & ~@as(u64, 0xF))
     else
         @as(u64, bar0_lo) & ~@as(u64, 0xF);
-    serialWrite("storaged: NVMe BAR0=");
+    lib.serialWrite("storaged: NVMe BAR0=");
     printHex(bar0_phys);
-    serialWrite("\n");
+    lib.serialWrite("\n");
 
     // Map BAR0 (2 pages = 8 KB covers registers + doorbells for 2 queues).
-    if (syscall(SYS_MAP_IO, bar0_phys, 2, g_token) == 0) {
-        serialWrite("storaged: MAP_IO failed\n");
+    if (lib.syscall(SYS_MAP_IO, bar0_phys, 2, g_token) == 0) {
+        lib.serialWrite("storaged: MAP_IO failed\n");
         while (true) asm volatile ("pause");
     }
 
     // ----- Allocate DMA for queue memory -----
-    g_adm_sq_phys = syscall(SYS_ALLOC_DMA, 1, 0, g_token);
-    g_adm_cq_phys = syscall(SYS_ALLOC_DMA, 1, 1, g_token);
-    g_io_sq_phys = syscall(SYS_ALLOC_DMA, 1, 2, g_token);
-    g_io_cq_phys = syscall(SYS_ALLOC_DMA, 1, 3, g_token);
-    g_data_buf_phys = syscall(SYS_ALLOC_DMA, 1, 4, g_token);
-    g_dipc_scratch_phys = syscall(SYS_ALLOC_DMA, 1, 5, g_token);
+    g_adm_sq_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, g_token);
+    g_adm_cq_phys = lib.syscall(SYS_ALLOC_DMA, 1, 1, g_token);
+    g_io_sq_phys = lib.syscall(SYS_ALLOC_DMA, 1, 2, g_token);
+    g_io_cq_phys = lib.syscall(SYS_ALLOC_DMA, 1, 3, g_token);
+    g_data_buf_phys = lib.syscall(SYS_ALLOC_DMA, 1, 4, g_token);
+    g_dipc_scratch_phys = lib.syscall(SYS_ALLOC_DMA, 1, 5, g_token);
     if (g_adm_sq_phys == 0 or g_adm_cq_phys == 0 or g_io_sq_phys == 0 or
         g_io_cq_phys == 0 or g_data_buf_phys == 0 or g_dipc_scratch_phys == 0)
     {
-        serialWrite("storaged: DMA alloc failed\n");
+        lib.serialWrite("storaged: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
 
@@ -544,57 +519,57 @@ pub export fn umain() noreturn {
         while (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY == 0 and t > 0) t -= 1;
     }
     if (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY == 0) {
-        serialWrite("storaged: controller did not become ready\n");
+        lib.serialWrite("storaged: controller did not become ready\n");
         while (true) asm volatile ("pause");
     }
-    serialWrite("storaged: controller ready\n");
+    lib.serialWrite("storaged: controller ready\n");
 
     // ----- Identify Controller -----
     const sts_ctrl = cmdIdentifyController();
     if (sts_ctrl != 0) {
-        serialWrite("storaged: Identify Controller failed\n");
+        lib.serialWrite("storaged: Identify Controller failed\n");
     } else {
-        serialWrite("storaged: Identify Controller OK\n");
+        lib.serialWrite("storaged: Identify Controller OK\n");
     }
 
     // ----- Identify Namespace 1 -----
     const sts_ns = cmdIdentifyNamespace();
     if (sts_ns == 0) {
         // NSZE is at offset 0 of identify namespace data (8 bytes, LE)
-        const buf: [*]const u8 = ptrFrom([*]const u8, DATA_BUF_VA);
+        const buf: [*]const u8 = lib.ptrFrom([*]const u8, DATA_BUF_VA);
         g_ns_lba_count = @as(u64, buf[0]) | (@as(u64, buf[1]) << 8) | (@as(u64, buf[2]) << 16) |
             (@as(u64, buf[3]) << 24) | (@as(u64, buf[4]) << 32) | (@as(u64, buf[5]) << 40) |
             (@as(u64, buf[6]) << 48) | (@as(u64, buf[7]) << 56);
-        serialWrite("storaged: NS LBA count=");
+        lib.serialWrite("storaged: NS LBA count=");
         printHex(g_ns_lba_count);
-        serialWrite("\n");
+        lib.serialWrite("\n");
     }
 
     // ----- Create IO Completion Queue 1 -----
     if (cmdCreateIOCQ() != 0) {
-        serialWrite("storaged: create IOCQ failed\n");
+        lib.serialWrite("storaged: create IOCQ failed\n");
         while (true) asm volatile ("pause");
     }
 
     // ----- Create IO Submission Queue 1 -----
     if (cmdCreateIOSQ() != 0) {
-        serialWrite("storaged: create IOSQ failed\n");
+        lib.serialWrite("storaged: create IOSQ failed\n");
         while (true) asm volatile ("pause");
     }
-    serialWrite("storaged: IO queues ready\n");
+    lib.serialWrite("storaged: IO queues ready\n");
 
     // ----- Main event loop -----
     while (true) {
         // Receive a DIPC block IO request.
-        const page_phys = syscall(SYS_RECV, 0, 0, g_token);
+        const page_phys = lib.syscall(SYS_RECV, 0, 0, g_token);
         if (page_phys == 0) {
             asm volatile ("pause");
             continue;
         }
 
-        const recv_va = syscall(SYS_MAP_RECV, page_phys, 0, g_token);
+        const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, g_token);
         if (recv_va == 0) {
-            _ = syscall(SYS_FREE_PAGE, page_phys, 0, g_token);
+            _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, g_token);
             continue;
         }
 
@@ -623,7 +598,7 @@ pub export fn umain() noreturn {
             io_status = 0;
         }
 
-        const scratch: [*]u8 = ptrFrom([*]u8, DIPC_SCRATCH_VA);
+        const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
         const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
         const local_node = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
 
@@ -651,9 +626,9 @@ pub export fn umain() noreturn {
             .status = io_status,
         };
 
-        _ = syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, g_token);
+        _ = lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, g_token);
 
         // Free the received DIPC page.
-        _ = syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
+        _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
     }
 }

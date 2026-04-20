@@ -1,28 +1,15 @@
 /// netd — physical NIC driver (legacy virtio-net PCI) + minimal IPv6 stack.
 ///
 /// Syscall ABI used here: rax=op, rbx=arg0, rdx=arg1, r8=token.
-/// This matches the kernel's syscallIsr bridge exactly.
+/// This matches the kernel's lib.syscallIsr bridge exactly.
 const std = @import("std");
 const lib = @import("lib.zig");
 
-fn ptrFrom(comptime T: type, addr: u64) T {
-    return @ptrFromInt(asm volatile (""
-        : [ret] "={rax}" (-> u64),
-        : [val] "{rax}" (addr),
-    ));
-}
 
 // ---------------------------------------------------------------------------
 // Low-level I/O helpers
 // ---------------------------------------------------------------------------
 
-fn outb(port: u16, val: u8) void {
-    asm volatile ("outb %[val], %[port]"
-        :
-        : [val] "{al}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
-}
 fn outw(port: u16, val: u16) void {
     asm volatile ("outw %[val], %[port]"
         :
@@ -57,24 +44,21 @@ fn inl(port: u16) u32 {
 }
 
 fn serialByte(c: u8) void {
-    outb(0x3F8, c);
-}
-fn serialWrite(s: []const u8) void {
-    _ = syscall(9, @intFromPtr(s.ptr), s.len, 0);
+    lib.outb(0x3F8, c);
 }
 fn printHex(n: u64) void {
     const hex = "0123456789ABCDEF";
     var shift: u6 = 60;
     while (true) {
         const nibble: usize = @intCast((n >> shift) & 0xF);
-        outb(0x3F8, hex[nibble]);
+        lib.outb(0x3F8, hex[nibble]);
         if (shift == 0) break;
         shift -= 4;
     }
 }
 fn printDec(n: u64) void {
     if (n == 0) {
-        outb(0x3F8, '0');
+        lib.outb(0x3F8, '0');
         return;
     }
     var buf: [20]u8 = undefined;
@@ -87,7 +71,7 @@ fn printDec(n: u64) void {
     var i: usize = len;
     while (i > 0) {
         i -= 1;
-        outb(0x3F8, buf[i]);
+        lib.outb(0x3F8, buf[i]);
     }
 }
 
@@ -95,15 +79,6 @@ fn printDec(n: u64) void {
 // Syscall interface
 // ---------------------------------------------------------------------------
 
-fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
-    return asm volatile ("int $0x80"
-        : [ret] "={rax}" (-> u64),
-        : [op] "{rax}" (op),
-          [arg0] "{rbx}" (arg0),
-          [arg1] "{rdx}" (arg1),
-          [token] "{r8}" (token),
-        : .{ .rcx = true, .r11 = true, .memory = true });
-}
 
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
@@ -119,10 +94,10 @@ const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 const PAGE_SIZE: u64 = 4096;
 
-// PCI config read via kernel syscall 13
+// PCI config read via kernel lib.syscall 13
 fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
     const addr = (@as(u64, bus) << 24) | (@as(u64, dev) << 16) | (@as(u64, func) << 8) | @as(u64, off);
-    return syscall(13, addr, (@as(u64, size) << 32), token);
+    return lib.syscall(13, addr, (@as(u64, size) << 32), token);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,11 +264,11 @@ fn txFrame(frame: []const u8) void {
     if (used.idx != g_tx_last_used) g_tx_last_used = used.idx;
 
     // Write virtio-net header + frame into TX buffer VA.
-    const hdr: *VirtioNetHdr = ptrFrom(*VirtioNetHdr, TXBUF_VA);
+    const hdr: *VirtioNetHdr = lib.ptrFrom(*VirtioNetHdr, TXBUF_VA);
     hdr.* = VirtioNetHdr{};
     const total = VIRTIO_NET_HDR_SIZE + frame.len;
     if (total > PAGE_SIZE) return; // frame too large
-    @memcpy(ptrFrom([*]u8, TXBUF_VA + VIRTIO_NET_HDR_SIZE)[0..frame.len], frame);
+    @memcpy(lib.ptrFrom([*]u8, TXBUF_VA + VIRTIO_NET_HDR_SIZE)[0..frame.len], frame);
 
     // Descriptor 0 of TX ring.
     txDesc()[0] = VirtqDesc{
@@ -453,7 +428,7 @@ fn deriveLinkLocal(mac: *const [6]u8) [16]u8 {
 
 fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
     if (frame_len < 14) return;
-    const f: [*]const u8 = ptrFrom([*]const u8, frame_va);
+    const f: [*]const u8 = lib.ptrFrom([*]const u8, frame_va);
     const ethertype = be16(f[12..14]);
 
     if (ethertype == 0x86DD) {
@@ -515,10 +490,10 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
                         // Copy DIPC header+payload into scratch page and route.
                         const copy_len = @min(@as(usize, udp_payload_len), PAGE_SIZE);
                         @memcpy(
-                            ptrFrom([*]u8, DIPC_SCRATCH_VA)[0..copy_len],
+                            lib.ptrFrom([*]u8, DIPC_SCRATCH_VA)[0..copy_len],
                             udp_payload[0..copy_len],
                         );
-                        _ = syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, token);
+                        _ = lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, token);
                     }
                 }
             }
@@ -545,18 +520,18 @@ fn pollRx(token: u64) void {
     }
 }
 
-// Poll the DIPC mailbox for outbound messages to send over the wire.
+// Poll the DIPC mailbox for lib.outbound messages to send over the wire.
 fn pollDipc(token: u64) void {
-    const page_phys = syscall(SYS_RECV, 0, 0, token);
+    const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
     if (page_phys == 0) return;
     // Map the page into our receive window.
-    const recv_va = syscall(SYS_MAP_RECV, page_phys, 0, token);
+    const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
     if (recv_va == 0) {
-        _ = syscall(SYS_FREE_PAGE, page_phys, 0, token);
+        _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
         return;
     }
     // Read DIPC destination: if remote, encapsulate into IPv6 UDP and TX.
-    const hdr: [*]const u8 = ptrFrom([*]const u8, recv_va);
+    const hdr: [*]const u8 = lib.ptrFrom([*]const u8, recv_va);
     // Magic check (bytes 0-3, little-endian in memory)
     const magic: u32 = @as(u32, hdr[0]) | (@as(u32, hdr[1]) << 8) | (@as(u32, hdr[2]) << 16) | (@as(u32, hdr[3]) << 24);
     if (magic == DIPC_WIRE_MAGIC) {
@@ -598,12 +573,12 @@ fn pollDipc(token: u64) void {
                 put_be16(frame[58..60], @as(u16, @intCast(8 + dipc_total)));
                 // checksum = 0 (optional for IPv6 UDP, acceptable here)
                 // DIPC payload
-                @memcpy(frame[62 .. 62 + dipc_total], ptrFrom([*]const u8, recv_va)[0..dipc_total]);
+                @memcpy(frame[62 .. 62 + dipc_total], lib.ptrFrom([*]const u8, recv_va)[0..dipc_total]);
                 txFrame(frame[0..frame_len]);
             }
         }
     }
-    _ = syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
+    _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,14 +586,14 @@ fn pollDipc(token: u64) void {
 // ---------------------------------------------------------------------------
 
 pub export fn main() void {
-    const bs: *const BootstrapDescriptor = ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
 
-    serialWrite("netd: starting\n");
+    lib.serialWrite("netd: starting\n");
 
     // Register with kernel.
-    _ = syscall(SYS_REGISTER, 0, 0, token);
-    serialWrite("netd: registered\n");
+    _ = lib.syscall(SYS_REGISTER, 0, 0, token);
+    lib.serialWrite("netd: registered\n");
 
     // Scan PCI for legacy virtio-net (VID=1AF4, DID=1000).
     var found_bus: u8 = 0;
@@ -649,48 +624,48 @@ pub export fn main() void {
     }
 
     if (!found) {
-        serialWrite("netd: no virtio-net found; entering idle loop\n");
+        lib.serialWrite("netd: no virtio-net found; entering idle loop\n");
         while (true) {
-            _ = syscall(SYS_RECV, 0, 0, token);
+            _ = lib.syscall(SYS_RECV, 0, 0, token);
             asm volatile ("pause");
         }
     }
 
-    serialWrite("netd: virtio-net at ");
+    lib.serialWrite("netd: virtio-net at ");
     printHex(found_dev);
-    serialWrite("\n");
+    lib.serialWrite("\n");
 
     // Read BAR0 (IO BAR for legacy virtio).
     const bar0_raw: u32 = @truncate(pciRead(found_bus, found_dev, found_func, 0x10, 4, token));
     if ((bar0_raw & 1) != 1) {
-        serialWrite("netd: BAR0 is MMIO, not IO — not legacy virtio, giving up\n");
+        lib.serialWrite("netd: BAR0 is MMIO, not IO — not legacy virtio, giving up\n");
         while (true) asm volatile ("pause");
     }
     g_io_base = @truncate(bar0_raw & 0xFFFC);
-    serialWrite("netd: IO base=");
+    lib.serialWrite("netd: IO base=");
     printHex(g_io_base);
-    serialWrite("\n");
+    lib.serialWrite("\n");
 
     // Reset device.
-    outb(g_io_base + VIRTIO_PCI_STATUS, 0);
-    outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE);
-    outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    lib.outb(g_io_base + VIRTIO_PCI_STATUS, 0);
+    lib.outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE);
+    lib.outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
     // Negotiate features (accept none beyond basic).
     _ = inl(g_io_base + VIRTIO_PCI_HOST_FEATURES);
     outl(g_io_base + VIRTIO_PCI_GUEST_FEATURES, 0);
 
     // Allocate DMA memory for rings.
-    g_rx_ring_phys = syscall(SYS_ALLOC_DMA, 2, 0, token);
-    g_tx_ring_phys = syscall(SYS_ALLOC_DMA, 2, 2, token);
-    g_rxbuf_phys = syscall(SYS_ALLOC_DMA, 2, 4, token);
-    g_txbuf_phys = syscall(SYS_ALLOC_DMA, 1, 6, token);
-    g_dipc_scratch_phys = syscall(SYS_ALLOC_DMA, 1, 7, token);
+    g_rx_ring_phys = lib.syscall(SYS_ALLOC_DMA, 2, 0, token);
+    g_tx_ring_phys = lib.syscall(SYS_ALLOC_DMA, 2, 2, token);
+    g_rxbuf_phys = lib.syscall(SYS_ALLOC_DMA, 2, 4, token);
+    g_txbuf_phys = lib.syscall(SYS_ALLOC_DMA, 1, 6, token);
+    g_dipc_scratch_phys = lib.syscall(SYS_ALLOC_DMA, 1, 7, token);
 
     if (g_rx_ring_phys == 0 or g_tx_ring_phys == 0 or
         g_rxbuf_phys == 0 or g_txbuf_phys == 0 or g_dipc_scratch_phys == 0)
     {
-        serialWrite("netd: DMA alloc failed\n");
+        lib.serialWrite("netd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
 
@@ -707,13 +682,13 @@ pub export fn main() void {
     outl(g_io_base + VIRTIO_PCI_QUEUE_ADDR, @truncate(g_tx_ring_phys >> 12));
 
     // Enable device.
-    outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
+    lib.outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
 
     // Read MAC address from config space.
     for (0..6) |i| {
         g_our_mac[i] = inb(g_io_base + VIRTIO_NET_MAC_OFFSET + @as(u16, @intCast(i)));
     }
-    serialWrite("netd: MAC=");
+    lib.serialWrite("netd: MAC=");
     for (g_our_mac) |b| {
         printHex(b);
         serialByte(':');
@@ -722,12 +697,12 @@ pub export fn main() void {
 
     // Derive link-local IPv6 address from MAC (EUI-64 per RFC 4291).
     g_our_ipv6 = deriveLinkLocal(&g_our_mac);
-    serialWrite("netd: link-local IPv6 assigned\n");
+    lib.serialWrite("netd: link-local IPv6 assigned\n");
 
     // Pre-fill RX descriptors.
     fillRxQueue();
 
-    serialWrite("netd: NIC ready, entering DIPC/NIC event loop\n");
+    lib.serialWrite("netd: NIC ready, entering DIPC/NIC event loop\n");
 
     // Main event loop.
     var isr_poll: u32 = 0;
