@@ -10,7 +10,7 @@ TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
 SMOKE_PROFILE=${SMOKE_PROFILE:-default}
 
-DEFAULT_ZIG_BUILD_ARGS=""
+DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true"
 DEFAULT_CORE_PATTERNS=""
 DEFAULT_VMX_EPT_PATTERNS=""
 DEFAULT_VMX_LINUX_PATTERNS=""
@@ -20,12 +20,12 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
         ;;
     vmx-linux)
-        DEFAULT_ZIG_BUILD_ARGS="-Dvmm_active=true -Dvmm_launch_linux=true -Dservices_active=false"
+        DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true -Dvmm_active=true -Dvmm_launch_linux=true -Dservices_active=false"
         DEFAULT_CORE_PATTERNS="booting...;selftest: done;Timer initialized."
         DEFAULT_VMX_LINUX_PATTERNS="Linux version;Catenary OS Guest Init: SUCCESS"
         ;;
     vmx-linux-services)
-        DEFAULT_ZIG_BUILD_ARGS="-Dvmm_active=true -Dvmm_launch_linux=true"
+        DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true -Dvmm_active=true -Dvmm_launch_linux=true"
         DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
         DEFAULT_VMX_LINUX_PATTERNS="kernel_control: staged MicroVM launched via DIPC;VMX: entering guest via vmlaunch;Linux version;Catenary OS Guest Init: SUCCESS;guest_rootfs: init started"
         ;;

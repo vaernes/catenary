@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const gdt = @import("gdt.zig");
 const host_paging = @import("paging.zig");
 const idt = @import("idt.zig");
@@ -217,7 +218,9 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
     // Emit one byte per syscall to keep the QEMU serial-file backend
     // flushing.  Without continuous UART activity the `-serial file:`
     // backend may buffer indefinitely and services 03-08 appear silent.
-    serialByte('.');
+    if (build_options.serial_syscall_keepalive) {
+        serialByte('.');
+    }
 
     switch (op) {
         0x1000...0x1004 => {

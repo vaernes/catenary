@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "vmm_active", b.option(bool, "vmm_active", "Enable VMX/HVM hypervisor subsystem") orelse false);
     const vmm_launch_val = b.option(bool, "vmm_launch_linux", "Launch Linux guest on boot") orelse false;
     opts.addOption(bool, "vmm_launch_linux", vmm_launch_val);
+    opts.addOption(bool, "serial_syscall_keepalive", b.option(bool, "serial_syscall_keepalive", "Emit per-syscall UART keepalive for QEMU serial-file backends") orelse false);
 
     const exe = b.addExecutable(.{
         .name = "kernel.elf",
@@ -86,7 +87,7 @@ pub fn build(b: *std.Build) void {
         user_exe.pie = false;
         if (arch == .x86_64) {
             user_exe.entry = .{ .symbol_name = "_user_start" };
-                    }
+        }
 
         b.installArtifact(user_exe);
     }
