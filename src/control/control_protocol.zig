@@ -26,6 +26,8 @@ pub const ControlOp = enum(u16) {
     phys_free = 16,
     virtio_blk_response = 17,
     registry_sync = 18,
+    list_microvms = 19,
+    get_node_status = 20,
 };
 
 pub const ControlHeader = extern struct {
@@ -99,6 +101,7 @@ pub const CreateMicrovmPayload = extern struct {
     kernel_size: u64,
     initramfs_phys: u64,
     initramfs_size: u64,
+    name: [32]u8,
 };
 
 /// Request the kernel to transition instance_id to running and initiate VMX launch.
@@ -117,6 +120,27 @@ pub const StopMicrovmPayload = extern struct {
 pub const DeleteMicrovmPayload = extern struct {
     instance_id: u32,
     _reserved: u32 = 0,
+};
+
+pub const MicrovmInfo = extern struct {
+    instance_id: u32,
+    state: u32, // 0=empty, 1=created, 2=running, 3=stopped
+    mem_pages: u32,
+    vcpus: u32,
+    name: [32]u8,
+};
+
+pub const ListMicrovmsResult = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    vms: [64]MicrovmInfo,
+};
+
+pub const NodeStatusResult = extern struct {
+    total_mem_pages: u32,
+    free_mem_pages: u32,
+    active_vms: u32,
+    _pad: u32 = 0,
 };
 
 pub const RegisterStoragedServicePayload = extern struct {

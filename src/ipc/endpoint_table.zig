@@ -86,6 +86,31 @@ pub const EndpointTable = struct {
         self.reserved_netd_service = service_id;
     }
 
+    pub fn registerReservedContainerdService(self: *EndpointTable, service_id: u32) void {
+        self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.containerd));
+        _ = self.insert(@intFromEnum(identity.ReservedEndpoint.containerd), .{ .service = service_id });
+    }
+
+    pub fn registerReservedClusterdService(self: *EndpointTable, service_id: u32) void {
+        self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.clusterd));
+        _ = self.insert(@intFromEnum(identity.ReservedEndpoint.clusterd), .{ .service = service_id });
+    }
+
+    pub fn registerReservedInputdService(self: *EndpointTable, service_id: u32) void {
+        self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.inputd));
+        _ = self.insert(@intFromEnum(identity.ReservedEndpoint.inputd), .{ .service = service_id });
+    }
+
+    pub fn registerReservedWindowdService(self: *EndpointTable, service_id: u32) void {
+        self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.windowd));
+        _ = self.insert(@intFromEnum(identity.ReservedEndpoint.windowd), .{ .service = service_id });
+    }
+
+    pub fn registerReservedConfigdService(self: *EndpointTable, service_id: u32) void {
+        self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.configd));
+        _ = self.insert(@intFromEnum(identity.ReservedEndpoint.configd), .{ .service = service_id });
+    }
+
     pub fn clearReservedNetdService(self: *EndpointTable, service_id: u32) bool {
         const endpoint = @intFromEnum(identity.ReservedEndpoint.netd);
         for (0..MAX_ENDPOINTS) |i| {

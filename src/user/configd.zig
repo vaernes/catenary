@@ -19,7 +19,6 @@ const lib = @import("lib.zig");
 // Syscall shim
 // ---------------------------------------------------------------------------
 
-
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
@@ -85,8 +84,6 @@ var next_vmid: u32 = 1;
 // ---------------------------------------------------------------------------
 // Serial helpers (for debug output before windowd is ready)
 // ---------------------------------------------------------------------------
-
-
 
 // ---------------------------------------------------------------------------
 // Text helpers (write into DMA text slot)
@@ -297,7 +294,9 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
         .kernel_size = bs.linux_bzimage_size,
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
+        .name = [_]u8{0} ** 32,
     };
+    @memcpy(payload.name[0..7], "default");
 
     // The kernel's SYS_SEND_PAGE copies from the DMA phys page, re-signs, and routes.
     _ = lib.syscall(SYS_SEND_PAGE, dipc_phys_slot1, 0, token);
@@ -383,37 +382,14 @@ pub export fn umain() noreturn {
     }
     // Slot 1 physical = slot 0 + PAGE_SIZE
     const dipc_phys: u64 = text_phys + PAGE_SIZE;
+    _ = &dipc_phys;
 
     // Draw initial UI
-    drawUi(text_phys, token, bs.local_node);
-    lib.serialWrite("configd: initial UI rendered\n");
+    // (windowd owns the framebuffer — configd is now a headless data backend)
+    lib.serialWrite("configd: started (headless mode, windowd owns UI)\n");
 
-    var refresh_counter: u32 = 0;
-
-    // Main event loop
+    // Main event loop — receive DIPC messages only; UI is handled by windowd
     while (true) {
-        // --- Poll keyboard via inputd's SYS_GET_KEY ---
-        const key = lib.syscall(SYS_GET_KEY, 0, 0, token);
-        if (key != 0xFFFFFFFF) {
-            const scancode: u8 = @truncate(key);
-            if ((scancode & 0x80) == 0) { // make code only
-                const ascii: u8 = switch (scancode) {
-                    0x26 => 'l', // L — launch VM
-                    0x13 => 'r', // R — refresh
-                    0x10 => 'q', // Q — quit
-                    else => 0,
-                };
-                if (ascii == 'l') {
-                    launchMicroVm(bs, token, dipc_phys);
-                    drawUi(text_phys, token, bs.local_node);
-                } else if (ascii == 'r') {
-                    drawUi(text_phys, token, bs.local_node);
-                } else if (ascii == 'q') {
-                    lib.serialWrite("configd: shutdown requested\n");
-                }
-            }
-        }
-
         // --- Poll DIPC inbox for registry_sync messages ---
         const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
         if (page_phys != 0) {
@@ -422,19 +398,11 @@ pub export fn umain() noreturn {
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
                 if (control.op == .registry_sync) {
                     handleRegistrySync(recv_va);
-                    drawUi(text_phys, token, bs.local_node);
                 }
                 _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
             } else {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
-        }
-
-        // --- Periodic refresh (every ~500k polling cycles) ---
-        refresh_counter += 1;
-        if (refresh_counter >= 500_000) {
-            refresh_counter = 0;
-            drawUi(text_phys, token, bs.local_node);
         }
 
         asm volatile ("pause");

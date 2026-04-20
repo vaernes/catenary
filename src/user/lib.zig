@@ -46,6 +46,9 @@ pub const SYS_GET_KEY = 8;
 pub const SYS_SERIAL_WRITE = 9;
 pub const SYS_FB_DRAW = 16;
 pub const SYS_MAP_RECV = 17;
+pub const SYS_FB_DRAW_COLORED = 18;
+pub const SYS_FB_FILL_RECT = 19;
+pub const SYS_TRY_RECV = 20;
 
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -69,6 +72,7 @@ pub const BootstrapDescriptor = extern struct {
     persistent_stop_op: u16,
     _r2: u16,
     local_node: [16]u8,
+
     dipc_wire_magic: u32,
     dipc_wire_version: u16,
     dipc_header_len: u16,
@@ -170,7 +174,8 @@ pub const ControlOp = enum(u16) {
     phys_free = 16,
     virtio_blk_response = 17,
     registry_sync = 18,
-    query_dashboard = 19,
+    list_microvms = 19,
+    get_node_status = 20,
 };
 
 pub const ControlHeader = extern struct {
@@ -188,6 +193,43 @@ pub const CreateMicrovmPayload = extern struct {
     kernel_size: u64,
     initramfs_phys: u64,
     initramfs_size: u64,
+    name: [32]u8,
+};
+
+pub const StartMicrovmPayload = extern struct {
+    instance_id: u32,
+    _reserved: u32 = 0,
+};
+
+pub const StopMicrovmPayload = extern struct {
+    instance_id: u32,
+    _reserved: u32 = 0,
+};
+
+pub const DeleteMicrovmPayload = extern struct {
+    instance_id: u32,
+    _reserved: u32 = 0,
+};
+
+pub const MicrovmInfo = extern struct {
+    instance_id: u32,
+    state: u32, // 0=empty, 1=created, 2=running, 3=stopped
+    mem_pages: u32,
+    vcpus: u32,
+    name: [32]u8,
+};
+
+pub const ListMicrovmsResult = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    vms: [64]MicrovmInfo,
+};
+
+pub const NodeStatusResult = extern struct {
+    total_mem_pages: u32,
+    free_mem_pages: u32,
+    active_vms: u32,
+    _pad: u32 = 0,
 };
 
 pub const TelemetryUpdatePayload = extern struct {
@@ -219,6 +261,47 @@ pub const VirtioBlkResponsePayload = extern struct {
     head_idx: u16,
     status: u8,
     _pad: u8 = 0,
+};
+
+// --- Interactive GUI protocol (mirrors control_protocol.zig) ---
+
+pub const ListVmsRequest = extern struct {
+    flags: u32 = 0,
+    _pad: u32 = 0,
+};
+
+pub const VmSnapshotEntry = extern struct {
+    instance_id: u32,
+    state: u8,
+    _pad: [3]u8 = [_]u8{0} ** 3,
+    mem_pages: u32,
+    vcpus: u32,
+    cpu_cycles: u64,
+    exit_count: u64,
+    name: [32]u8,
+};
+
+pub const MAX_VM_SNAPSHOT_ENTRIES: usize = 32;
+
+pub const VmSnapshotListPayload = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    entries: [MAX_VM_SNAPSHOT_ENTRIES]VmSnapshotEntry =
+        [_]VmSnapshotEntry{.{
+            .instance_id = 0,
+            .state = 0,
+            .mem_pages = 0,
+            .vcpus = 0,
+            .cpu_cycles = 0,
+            .exit_count = 0,
+            .name = [_]u8{0} ** 32,
+        }} ** MAX_VM_SNAPSHOT_ENTRIES,
+};
+
+pub const UpdateMicrovmNamePayload = extern struct {
+    instance_id: u32,
+    _pad: u32 = 0,
+    name: [32]u8,
 };
 
 pub extern fn umain() noreturn;

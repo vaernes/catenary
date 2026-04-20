@@ -5,7 +5,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-
 // ---------------------------------------------------------------------------
 // Low-level I/O helpers
 // ---------------------------------------------------------------------------
@@ -78,7 +77,6 @@ fn printDec(n: u64) void {
 // ---------------------------------------------------------------------------
 // Syscall interface
 // ---------------------------------------------------------------------------
-
 
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
@@ -585,7 +583,7 @@ fn pollDipc(token: u64) void {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub export fn main() void {
+pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
 

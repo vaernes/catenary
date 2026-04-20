@@ -1,3 +1,37 @@
+pub const HISTORY_SIZE = 4000;
+pub var history_buf: [HISTORY_SIZE]u8 = [_]u8{0} ** HISTORY_SIZE;
+pub var history_pos: usize = 0;
+
+pub fn putHistory(b: u8) void {
+    if (b == '\r') return; // ignore carriage returns for the UI buffer
+    if (b == 0x08 or b == 127) {
+        if (history_pos > 0 and history_buf[history_pos - 1] != '\n') {
+            history_pos -= 1;
+            history_buf[history_pos] = 0;
+        }
+        return;
+    }
+    if (history_pos >= HISTORY_SIZE) {
+        // Find first newline to get a clean line boundary for the shift.
+        var cut: usize = 0;
+        while (cut < history_pos) : (cut += 1) {
+            if (history_buf[cut] == '\n') {
+                cut += 1; // include the newline in the discarded portion
+                break;
+            }
+        }
+        if (cut == 0 or cut >= history_pos) cut = 80; // fallback
+        const remaining = history_pos - cut;
+        var i: usize = 0;
+        while (i < remaining) : (i += 1) {
+            history_buf[i] = history_buf[i + cut];
+        }
+        history_pos = remaining;
+    }
+    history_buf[history_pos] = b;
+    history_pos += 1;
+}
+
 /// Ring-0 serial shell for the Catenary OS operator surface.
 ///
 /// This module provides a minimal interactive shell over COM2 (0x2F8) that
@@ -20,8 +54,6 @@ const cpu = @import("../arch/x86_64/cpu.zig");
 const service_registry = @import("../services/service_registry.zig");
 const pmm = @import("pmm.zig");
 const microvm_registry = @import("../vmm/microvm_registry.zig");
-const fb = @import("fb.zig");
-const kbd = @import("../arch/x86_64/keyboard.zig");
 const main = @import("../main.zig");
 
 const COM2_DATA: u16 = 0x2F8;
@@ -58,7 +90,7 @@ inline fn txReady() bool {
 fn writeByte(b: u8) void {
     while (!txReady()) {}
     cpu.outb(COM2_DATA, b);
-    fb.printChar(b);
+    putHistory(b);
 }
 
 fn write(s: []const u8) void {
@@ -287,10 +319,6 @@ pub fn poll() void {
 
     while (rxReady()) {
         const c = cpu.inb(COM2_DATA);
-        handleChar(c);
-    }
-
-    while (kbd.getChar()) |c| {
         handleChar(c);
     }
 }

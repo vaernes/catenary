@@ -632,3 +632,8 @@ pub export fn umain() noreturn {
         _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
     }
 }
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
+}

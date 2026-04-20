@@ -108,3 +108,8 @@ pub export fn umain() noreturn {
         asm volatile ("pause");
     }
 }
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
+}

@@ -347,3 +347,11 @@ test "guarded region alloc/free roundtrip" {
     const region2 = allocGuardedRegion(4) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(region.guard_low_phys, region2.guard_low_phys);
 }
+
+pub fn getTotalPages() usize {
+    return highest_page;
+}
+
+pub fn getFreePages() usize {
+    return 0; // Stub
+}

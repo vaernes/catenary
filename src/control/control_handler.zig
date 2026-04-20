@@ -225,7 +225,7 @@ pub fn handleKernelControlPage(
             }
 
             const microvm_registry = @import("../vmm/microvm_registry.zig");
-            if (microvm_registry.create(p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
+            if (microvm_registry.create(p.name, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
                 serialWrite("configd: MicroVM created via DIPC\n");
                 _ = id;
             } else {
@@ -239,5 +239,50 @@ pub fn handleKernelControlPage(
             if (!microvm_registry.start(p.instance_id)) return error.BadPayload;
         },
         .stop_microvm, .delete_microvm => return error.BadPayload,
+        .list_microvms => {
+            const microvm_registry = @import("../vmm/microvm_registry.zig");
+            const instances = microvm_registry.getInstances();
+
+            var res = control_protocol.ListMicrovmsResult{
+                .count = 0,
+                .vms = [_]control_protocol.MicrovmInfo{.{ .instance_id = 0, .state = 0, .mem_pages = 0, .vcpus = 0, .name = [_]u8{0} ** 32 }} ** 64,
+            };
+
+            for (instances) |inst| {
+                if (inst.in_use) {
+                    if (res.count < 64) {
+                        res.vms[res.count] = .{
+                            .instance_id = inst.instance_id,
+                            .state = @intFromEnum(inst.state),
+                            .mem_pages = inst.mem_pages,
+                            .vcpus = inst.vcpus,
+                            .name = inst.name,
+                        };
+                        res.count += 1;
+                    }
+                }
+            }
+
+            const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            const table_const: *const endpoint_table.EndpointTable = table;
+            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
+        },
+        .get_node_status => {
+            var res = control_protocol.NodeStatusResult{
+                .total_mem_pages = @intCast(pmm.getTotalPages()),
+                .free_mem_pages = @intCast(pmm.getFreePages()),
+                .active_vms = 0,
+            };
+
+            const microvm_registry = @import("../vmm/microvm_registry.zig");
+            const instances = microvm_registry.getInstances();
+            for (instances) |inst| {
+                if (inst.in_use) res.active_vms += 1;
+            }
+
+            const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            const table_const: *const endpoint_table.EndpointTable = table;
+            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
+        },
     }
 }

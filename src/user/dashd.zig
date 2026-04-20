@@ -5,12 +5,9 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-
 // ---------------------------------------------------------------------------
 // Syscall + serial helpers
 // ---------------------------------------------------------------------------
-
-
 
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
@@ -128,7 +125,8 @@ pub export fn umain() noreturn {
     }
 
     // Draw empty dashboard once at startup.
-    renderDashboard(text_phys, token);
+    // (windowd owns the framebuffer — dashd only tracks stats in memory)
+    _ = &text_phys; // DMA page allocated but rendering delegated to windowd
 
     // Main event loop.
     while (true) {
@@ -171,10 +169,15 @@ pub export fn umain() noreturn {
             s.exit_count = telem.exit_count;
         }
 
-        // Re-render the dashboard.
-        renderDashboard(text_phys, token);
+        // Stats updated — windowd will query via list_vms.
+        // (renderDashboard removed; windowd owns the framebuffer)
 
         // Free the received DIPC page.
         _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
     }
+}
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
 }

@@ -1,8 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-
-
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
 const SYS_FREE_PAGE = 4;
@@ -15,8 +13,6 @@ const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
-
-
 
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
@@ -63,7 +59,9 @@ pub export fn umain() noreturn {
         .kernel_size = bs.linux_bzimage_size,
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
+        .name = [_]u8{0} ** 32,
     };
+    @memcpy(payload.name[0..7], "default");
 
     _ = lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
 
@@ -75,4 +73,9 @@ pub export fn umain() noreturn {
         }
         asm volatile ("pause");
     }
+}
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
 }

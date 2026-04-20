@@ -262,6 +262,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 },
                 .storaged => table.registerReservedStoragedService(sid),
                 .dashd => table.registerReservedDashdService(sid),
+                .containerd => table.registerReservedContainerdService(sid),
+                .clusterd => table.registerReservedClusterdService(sid),
+                .inputd => table.registerReservedInputdService(sid),
+                .windowd => table.registerReservedWindowdService(sid),
+                .configd => table.registerReservedConfigdService(sid),
                 else => return 0xFFFFFFFF,
             }
             _ = service_registry.updateServiceState(sid, .registered);
@@ -440,10 +445,22 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             }
             return IO_VA;
         },
-        // op=16: render a text buffer (from a DMA page) to the kernel framebuffer.
-        // arg0 = phys_base of page holding the text (null-terminated or up to 256 chars).
-        // arg1 = (row << 32) | col — position in character cells.
-        // Returns 0.
+        // op=21: read varde shell history into a caller-supplied DMA page.
+        // arg0 = phys address of destination page.
+        // Returns number of bytes copied (clamped to page size).
+        // Restricted to windowd.
+        21 => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0;
+            const kind = service_registry.getServiceKind(sid) orelse return 0;
+            if (kind != .windowd) return 0;
+            const vsh = @import("../../kernel/varde_shell.zig");
+            const page = arg0;
+            if (page == 0) return 0;
+            const len = @min(vsh.history_pos, 4096);
+            const dest: [*]u8 = @ptrFromInt(page + hhdm_offset);
+            @memcpy(dest[0..len], vsh.history_buf[0..len]);
+            return len;
+        },
         16 => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0;
             const kind = service_registry.getServiceKind(sid) orelse return 0;

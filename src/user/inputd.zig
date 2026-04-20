@@ -1,8 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-
-
 const SYS_REGISTER = 2;
 const SYS_ALLOC_DMA = 5;
 const SYS_SEND_PAGE = 6;
@@ -14,8 +12,6 @@ const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
-
-
 
 // Map scancodes to simple ASCII
 fn scancodeToAscii(scancode: u8) ?u8 {
@@ -102,8 +98,8 @@ pub export fn umain() noreturn {
                         .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
                         .payload_len = @as(u32, @intCast(@sizeOf(InputEventPayload))),
                         .auth_tag = 0,
-                        .src = .{ .node = local_node, .endpoint = 8 },
-                        .dst = .{ .node = local_node, .endpoint = bs.reserved_dashd_endpoint },
+                        .src = .{ .node = local_node, .endpoint = 8 }, // inputd
+                        .dst = .{ .node = local_node, .endpoint = 9 }, // windowd
                     };
 
                     const payload: *align(1) InputEventPayload = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
@@ -121,4 +117,9 @@ pub export fn umain() noreturn {
             for (0..100000) |_| asm volatile ("pause");
         }
     }
+}
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
 }
