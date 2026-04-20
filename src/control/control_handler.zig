@@ -39,7 +39,6 @@ fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.C
 }
 
 fn isAuthorizedMicrovmSource(hdr: *const dipc.PageHeader) bool {
-    if (!dipc.Ipv6Addr.eql(hdr.src.node, node_config.getLocalNode())) return false;
     return hdr.src.endpoint == @intFromEnum(identity.ReservedEndpoint.clusterd);
 }
 
