@@ -1142,16 +1142,10 @@ fn copyIntoGuest(gpa_base: u64, data: []const u8) VmxError!void {
 }
 
 fn stageLinuxGuest() VmxError!void {
-    serialWrite("VMX: stage S0\n");
+    serialWrite("VMX: staging guest payload\n");
     const image = guest_image_blob.get();
-    serialWrite("VMX: stage S1\n");
-    serialWrite("VMX: image ptr=0x");
-    printHex(@intFromPtr(image.ptr));
-    serialWrite(" len=0x");
-    printHex(image.len);
-    serialWrite("\n");
     linux_boot.parseBzImageInto(&staged_parsed_image, image) catch {
-        serialWrite("VMX: stage S2 fallback guest payload\n");
+        serialWrite("VMX: bzImage parse failed; using fallback guest payload\n");
 
         const fallback_layout: linux_boot.LaunchLayout = .{
             .boot_params_gpa = linux_boot.default_boot_params_gpa,
@@ -1166,14 +1160,14 @@ fn stageLinuxGuest() VmxError!void {
         return stageFallbackGuest(fallback_layout);
     };
 
-    serialWrite("VMX: stage S2 parsed bzImage\n");
+    serialWrite("VMX: bzImage parsed successfully\n");
     const layout = linux_boot.defaultLayout(&staged_parsed_image);
 
     return stageParsedGuest(&staged_parsed_image, layout);
 }
 
 fn stageFallbackGuest(layout: linux_boot.LaunchLayout) VmxError!void {
-    serialWrite("VMX: stage S3\n");
+    serialWrite("VMX: staging fallback guest image\n");
 
     // Required pages for boot params, cmdline, stack, and guest paging roots.
     try seedGuestLowMemoryPage();
@@ -1184,21 +1178,17 @@ fn stageFallbackGuest(layout: linux_boot.LaunchLayout) VmxError!void {
     _ = try ensureGuestPage(layout.guest_pml4_gpa);
     _ = try ensureGuestPage(layout.guest_pdpt_gpa);
     _ = try ensureGuestPage(layout.guest_pd_gpa);
-    serialWrite("VMX: stage S4\n");
 
     const boot_params_page: [linux_boot.zero_page_size]u8 = [_]u8{0} ** linux_boot.zero_page_size;
     const guest_stub: [8]u8 = .{ 0xB8, 0x45, 0x54, 0x41, 0x43, 0x0F, 0xA2, 0xF4 }; // mov eax,'CATE'; cpuid; hlt
     try copyIntoGuest(layout.boot_params_gpa, boot_params_page[0..]);
     try copyIntoGuest(layout.cmdline_gpa, DEFAULT_CMDLINE ++ "\x00");
     try copyIntoGuest(layout.kernel_load_gpa, guest_stub[0..]);
-    serialWrite("VMX: stage S5\n");
     const entry_gpa = layout.kernel_load_gpa;
     return finalizeLaunchState(layout, entry_gpa, false, 8, DEFAULT_CMDLINE.len + 1);
 }
 
 fn stageParsedGuest(parsed: *const linux_boot.ParsedBzImage, layout: linux_boot.LaunchLayout) VmxError!void {
-    serialWrite("VMX: stage S3\n");
-
     try seedGuestLowMemoryPage();
     try buildGuestBootGdt();
     _ = try ensureGuestPage(layout.boot_params_gpa);
@@ -1207,7 +1197,6 @@ fn stageParsedGuest(parsed: *const linux_boot.ParsedBzImage, layout: linux_boot.
     _ = try ensureGuestPage(layout.guest_pml4_gpa);
     _ = try ensureGuestPage(layout.guest_pdpt_gpa);
     _ = try ensureGuestPage(layout.guest_pd_gpa);
-    serialWrite("VMX: stage S4\n");
 
     const protected = linux_boot.protectedModeImage(parsed);
     const cmdline = DEFAULT_CMDLINE ++ "\x00";
@@ -1238,11 +1227,11 @@ fn stageParsedGuest(parsed: *const linux_boot.ParsedBzImage, layout: linux_boot.
     if (use_linux_entry) {
         const entry_off = linux_boot.kernelEntryOffset64(parsed);
         entry_gpa = layout.kernel_load_gpa + entry_off;
-        serialWrite("VMX: stage S5 using linux entry gpa=0x");
+        serialWrite("VMX: guest entry mode=linux gpa=0x");
         printHex(entry_gpa);
         serialWrite("\n");
     } else {
-        serialWrite("VMX: stage S5 using demo entry gpa=0x");
+        serialWrite("VMX: guest entry mode=demo gpa=0x");
         printHex(entry_gpa);
         serialWrite("\n");
     }
@@ -1255,8 +1244,6 @@ fn stageParsedGuest(parsed: *const linux_boot.ParsedBzImage, layout: linux_boot.
 }
 
 fn finalizeLaunchState(layout: linux_boot.LaunchLayout, entry_gpa: u64, use_linux_entry: bool, kernel_span: usize, cmdline_len: usize) VmxError!void {
-    serialWrite("VMX: stage S5\n");
-
     try validateIdentityMapWindow(layout, @as(u64, @intCast(kernel_span)), entry_gpa, cmdline_len);
 
     // Reserve additional PD tables to widen identity mapping for Linux handoff.
@@ -1301,8 +1288,6 @@ fn finalizeLaunchState(layout: linux_boot.LaunchLayout, entry_gpa: u64, use_linu
         }
     }
 
-    serialWrite("VMX: stage S6\n");
-
     const boot_params_hpa = findGuestPageHpa(layout.boot_params_gpa) orelse return error.GuestImageInvalid;
     const entry_hpa = findGuestPageHpa(entry_gpa) orelse return error.GuestImageInvalid;
     const stack_hpa = findGuestPageHpa(layout.guest_stack_top_gpa - pmm.PAGE_SIZE) orelse return error.GuestImageInvalid;
@@ -1326,10 +1311,15 @@ fn finalizeLaunchState(layout: linux_boot.LaunchLayout, entry_gpa: u64, use_linu
         .guest_rsi = if (use_linux_entry) boot_params_entry else 0,
     };
     guest_linux_entry_active = use_linux_entry;
+
+    serialWrite("VMX: guest launch state ready entry=0x");
+    printHex(entry);
+    serialWrite(" cr3=0x");
+    printHex(guest_cr3);
+    serialWrite("\n");
 }
 
 fn loadControlFields(vmx_basic: u64) VmxError!void {
-    serialWrite("VMX: ctrl C0\n");
     const use_true = usesTrueControlMsrs(vmx_basic);
     const pin_msr = if (use_true) IA32_VMX_TRUE_PINBASED_CTLS else IA32_VMX_PINBASED_CTLS;
     const proc_msr = if (use_true) IA32_VMX_TRUE_PROCBASED_CTLS else IA32_VMX_PROCBASED_CTLS;

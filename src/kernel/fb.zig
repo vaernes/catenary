@@ -7,14 +7,12 @@ pub fn init(request: *limine.FramebufferRequest, serialWrite: fn ([]const u8) vo
     if (request.response) |resp| {
         if (resp.framebuffer_count > 0) {
             framebuffer = resp.framebuffers[0];
-            serialWrite("Framebuffer initialized: ");
-            // We can't use format easily here yet, so just verify presence
-            serialWrite("OK\n");
+            serialWrite("Display: framebuffer ready\n");
         } else {
-            serialWrite("Framebuffer response: No framebuffers found\n");
+            serialWrite("Display: no framebuffer available\n");
         }
     } else {
-        serialWrite("Framebuffer request: No response\n");
+        serialWrite("Display: framebuffer request unavailable\n");
     }
 }
 

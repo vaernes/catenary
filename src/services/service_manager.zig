@@ -20,14 +20,27 @@ pub const ManagerError = error{
 };
 
 fn bootLog(s: []const u8) void {
+    main.serialWrite(s);
     fb.printString(s);
+}
+
+fn serviceName(kind: service_bootstrap.ServiceKind) []const u8 {
+    return switch (kind) {
+        .netd => "netd",
+        .storaged => "storaged",
+        .dashd => "dashd",
+        .containerd => "containerd",
+        .clusterd => "clusterd",
+        .inputd => "inputd",
+        .windowd => "windowd",
+        .configd => "configd",
+        else => "service",
+    };
 }
 
 /// Scans Limine modules and boots all recognized services.
 pub fn bootAll(hhdm_offset: u64, local_node: dipc.Ipv6Addr) ManagerError!void {
-    // fb.printString("service_manager: scanning modules...\n");
     const response = main.limine_module_request.response orelse {
-        // fb.printString("service_manager: no module response\n");
         return error.ModuleNotFound;
     };
     for (0..response.module_count) |i| {
@@ -37,13 +50,10 @@ pub fn bootAll(hhdm_offset: u64, local_node: dipc.Ipv6Addr) ManagerError!void {
 
         // Match modules by filename.
         if (std.mem.endsWith(u8, name, "netd.elf")) {
-            // bootLog("service_manager: launching netd.elf\n");
             try launchService(hhdm_offset, local_node, .netd, module.address[0..module.size]);
         } else if (std.mem.endsWith(u8, name, "storaged.elf")) {
-            // bootLog("service_manager: launching storaged.elf\n");
             try launchService(hhdm_offset, local_node, .storaged, module.address[0..module.size]);
         } else if (std.mem.endsWith(u8, name, "dashd.elf")) {
-            // bootLog("service_manager: launching dashd.elf\n");
             try launchService(hhdm_offset, local_node, .dashd, module.address[0..module.size]);
         } else if (std.mem.endsWith(u8, name, "containerd.elf")) {
             try launchService(hhdm_offset, local_node, .containerd, module.address[0..module.size]);
@@ -129,4 +139,8 @@ fn launchService(
         .configd => table.registerReservedConfigdThread(tid),
         else => {},
     }
+
+    bootLog("service_manager: launched ");
+    bootLog(serviceName(kind));
+    bootLog("\n");
 }

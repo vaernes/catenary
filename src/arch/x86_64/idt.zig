@@ -72,22 +72,19 @@ fn serialHex(v: u64) void {
 }
 
 pub export fn catenary_fatalTrap(vector: u8, err: u64, rip: u64, cr2: u64) callconv(.c) noreturn {
-    serialByte('\n');
-    serialByte('!');
-    serialByte('X');
+    serialWriteLiteral("\nFATAL_TRAP vector=0x");
     serialHex(vector);
-    serialByte(':');
+    serialWriteLiteral(" err=0x");
     serialHex(err);
-    serialHex(cr2);
-    serialByte(':');
+    serialWriteLiteral(" rip=0x");
     serialHex(rip);
+    serialWriteLiteral(" cr2=0x");
+    serialHex(cr2);
     if (vector == 14) {
-        serialByte(':');
-        serialHex(cr2);
         // Page fault with P=0 is a not-present fault, which includes intentional
         // guard pages used by scheduler stack hardening.
         if ((err & 1) == 0) {
-            serialWriteLiteral(":GUARD_OR_NOT_PRESENT");
+            serialWriteLiteral(" cause=guard_or_not_present");
         }
     }
     serialByte('\n');

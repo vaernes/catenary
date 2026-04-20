@@ -161,16 +161,6 @@ fn initUartCom1() void {
     outb(0x3FC, 0x03);
 }
 
-inline fn traceByte(c: u8) void {
-    if (comptime builtin.cpu.arch == .x86_64) {
-        if (uart_com1_present) {
-            outb(0x3F8, c);
-        } else {
-            outb(0xE9, c);
-        }
-    }
-}
-
 var thread_a_id: u32 = undefined;
 var timer_initialized_early: bool = false;
 
@@ -251,7 +241,6 @@ export fn memcpy(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
 
 fn threadA() void {
     arch.cpu.sti();
-    bootLog("Thread A started.\n");
     while (true) {
         if (scheduler.receive() != null) {}
         arch.cpu.pause();
@@ -260,7 +249,6 @@ fn threadA() void {
 
 fn threadB() void {
     arch.cpu.sti();
-    bootLog("Thread B started.\n");
     while (true) {
         arch.cpu.pause();
     }
@@ -282,6 +270,13 @@ pub export fn _kernel_main() callconv(.c) noreturn {
     bootLog(") (rev ");
     bootLog(BUILD_COMMIT);
     bootLog(") booting...\n");
+    bootLog("Boot config: services=");
+    bootLog(if (build_options.services_active) "on" else "off");
+    bootLog(" vmm=");
+    bootLog(if (build_options.vmm_active) "on" else "off");
+    bootLog(" linux_guest=");
+    bootLog(if (build_options.vmm_launch_linux) "on" else "off");
+    bootLog("\n");
 
     gdt.init();
     bootLog("GDT initialized.\n");
@@ -317,15 +312,11 @@ pub export fn _kernel_main() callconv(.c) noreturn {
             bootLog("Scheduler initialized.\n");
 
             const ent = arch.cpu.rdtsc();
-            // serialWrite("Entropy: OK\n");
-
-            // serialWrite("Step 1\n");
             // Define the manifest outside the loop.
             var virtual_base: u64 = 0xFFFFFFFF80000000;
             var physical_base: u64 = 0x1000000;
             var kernel_size: u64 = 0x50000;
 
-            // serialWrite("Step 2\n");
             if (limine_kernel_file_request.response) |kfile_resp| {
                 if (kfile_resp.kernel_file) |kfile| {
                     physical_base = @intFromPtr(kfile.address);
@@ -334,7 +325,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 }
             }
 
-            // serialWrite("Step 3\n");
             if (limine_kernel_address_request.response) |kaddr_resp| {
                 virtual_base = kaddr_resp.virtual_base;
                 physical_base = kaddr_resp.physical_base;
@@ -344,8 +334,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 bootLog("Kernel address identified.\n");
             }
 
-            // serialWrite("Step 4\n");
-            traceByte('a');
             const manifest = trust.KernelManifest{
                 .kernel_base_physical = physical_base,
                 .kernel_size = kernel_size,
@@ -365,7 +353,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                     bootLog("\n");
                 };
             }
-            traceByte('b');
             if (build_options.services_active) {
                 service_manager.bootAll(hhdm.offset, node_config.getLocalNode()) catch |err| {
                     bootLog("Service Manager bootAll failed: ");
@@ -376,7 +363,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
             bootLog("Service Manager finished.\n");
             bootLog("Manifest stored.\n");
 
-            // serialWrite("Step 6\n");
             // Verify kernel mappings canonicality
             if (arch.paging.isCanonical(virtual_base)) {
                 // bootLog("Kernel address is canonical.\n");
@@ -393,8 +379,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 bootLog("\n");
                 while (true) arch.cpu.halt();
             }
-            // serialWrite("Step 7\n");
-            traceByte('n');
 
             if (!selftest.run(bootLog)) {
                 bootLog("selftest: fatal\n");
@@ -410,7 +394,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                     hvm.init(memmap, hhdm.offset, manager.endpointTable());
                 }
             }
-            traceByte('o');
         } else {
             bootLog("HHDM request failed.\n");
         }
@@ -418,9 +401,8 @@ pub export fn _kernel_main() callconv(.c) noreturn {
         bootLog("Memmap request failed.\n");
     }
 
-    bootLog("Spawning threads...\n");
-    traceByte('p');
     if (!build_options.vmm_active) {
+        bootLog("Scheduler: starting demo worker threads.\n");
         thread_a_id = scheduler.spawn(threadA) catch |err| {
             bootLog("Spawn A failed: ");
             bootLog(@errorName(err));
@@ -438,11 +420,8 @@ pub export fn _kernel_main() callconv(.c) noreturn {
         timer.init();
         bootLog("Timer initialized.\n");
     }
-    traceByte('q');
 
     bootLog("Catenary OS checks complete. Starting scheduler...\n");
-    // serialWrite("Serial shell active. Type 'help' for commands.\n");
-    traceByte('r');
 
     // Idle loop: enable interrupts, poll serial shell for operator input.
     // The shell is polled on every iteration; CPU halts between polls to
@@ -463,7 +442,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
         vmm_bridge.broadcastTelemetry(hhdm_offset_global, manager.endpointTable());
         if (build_options.services_active) {
             _ = @import("services/service_registry.zig");
-            // Peek at service registry/scheduler for debug if needed
         }
         arch.cpu.pause();
     }

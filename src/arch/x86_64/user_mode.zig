@@ -66,7 +66,9 @@ pub fn service_trampoline_bridge() callconv(.c) void {
     const thread = scheduler.get_current_thread();
     const sid = thread.sid;
     const launch = service_registry.getLaunchDescriptor(sid) orelse {
-        serialWrite("trampoline: no launch desc for sid\n");
+        serialWrite("service_trampoline: missing launch descriptor sid=0x");
+        printHex(sid);
+        serialWrite("\n");
         while (true) {
             cpu.cli();
             cpu.hlt();
@@ -78,7 +80,9 @@ pub fn service_trampoline_bridge() callconv(.c) void {
     // rather than a shared one.  Also record both addresses in the Thread so
     // schedule() can restore them on every context switch.
     const region = pmm.allocGuardedRegion(16) orelse {
-        serialWrite("trampoline: no memory for int stack\n");
+        serialWrite("service_trampoline: interrupt stack allocation failed sid=0x");
+        printHex(sid);
+        serialWrite("\n");
         while (true) {
             cpu.cli();
             cpu.hlt();
@@ -92,24 +96,6 @@ pub fn service_trampoline_bridge() callconv(.c) void {
     }
     thread.kernel_int_stack_top = stack_top_virt;
     gdt.setKernelRsp0(stack_top_virt);
-
-    serialWrite("trampoline: sid=");
-    {
-        const hex = "0123456789ABCDEF";
-        serialByte(hex[(sid >> 4) & 0xF]);
-        serialByte(hex[sid & 0xF]);
-    }
-    serialWrite(" rip=");
-    {
-        var shift: u6 = 60;
-        const hex = "0123456789ABCDEF";
-        while (true) {
-            serialByte(hex[@intCast((launch.entry_rip >> shift) & 0xF)]);
-            if (shift == 0) break;
-            shift -= 4;
-        }
-    }
-    serialByte('\n');
 
     enterUserMode(launch.entry_rip, launch.stack_top, launch.bootstrap_page_phys, 0x18, 0x20);
 }
@@ -152,38 +138,32 @@ pub export fn userModeBreakpointBridge(status: u64, arg0: u64, rip: u64) void {
 
 pub export fn userModeGpBridge(error_code: u64, rip: u64, cs: u64, flags: u64, rsp: u64, ss: u64) void {
     clearSmapAccessIfActive();
-    serialWrite("\n[GPF] err=");
+    const user_fault = (cs & 0x3) != 0;
+    serialWrite("\n[GPF]");
+    if (user_fault) {
+        serialWrite(" sid=0x");
+        printHex(scheduler.get_current_thread().sid);
+    }
+    serialWrite(" err=0x");
     printHex(error_code);
-    serialWrite(" rip=");
+    serialWrite(" rip=0x");
     printHex(rip);
-    serialWrite(" cs=");
+    serialWrite(" cs=0x");
     printHex(cs);
-    serialWrite(" ss=");
+    serialWrite(" ss=0x");
     printHex(ss);
-    serialWrite(" flags=");
+    serialWrite(" flags=0x");
     printHex(flags);
-    serialWrite(" rsp=");
+    serialWrite(" rsp=0x");
     printHex(rsp);
+    if (user_fault) {
+        serialWrite(" cr3=0x");
+        printHex(cpu.readCr3());
+    }
     serialWrite("\n");
 
-    if (cs == 0x1B) {
-        serialWrite("Ring 3 GPF. PML4=");
-        printHex(cpu.readCr3());
-        serialWrite("\n");
-        const sr = @import("../../services/service_registry.zig");
-        for (0..20) |i| {
-            if (sr.getTaskBoundAddressSpace(@as(u32, @truncate(i)))) |pml4| {
-                serialWrite("  Service ");
-                printHex(i);
-                serialWrite(" PML4=");
-                printHex(pml4);
-                serialWrite("\n");
-            }
-        }
-    }
-
     if ((cs & 0x3) == 0) {
-        serialWrite("!! KERNEL GPF !!\n");
+        serialWrite("FATAL: kernel general protection fault\n");
         while (true) {
             cpu.cli();
             cpu.hlt();
@@ -205,27 +185,26 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
     _ = flags;
     _ = rsp;
     _ = ss;
-    serialByte('\n');
-    serialByte('!');
-    serialByte('P');
-    printHex(cr2);
-    serialByte(':');
-    printHex(rip);
-    serialByte('\n');
     current_user_state.demo_status = .page_fault;
     current_user_state.demo_error_code = error_code;
     current_user_state.demo_cr2 = cr2;
     current_user_state.demo_fault_rip = rip;
-    serialWrite("\n[PF] addr=");
+    const user_fault = (cs & 0x3) != 0;
+    serialWrite("\n[PF]");
+    if (user_fault) {
+        serialWrite(" sid=0x");
+        printHex(scheduler.get_current_thread().sid);
+    }
+    serialWrite(" addr=0x");
     printHex(cr2);
-    serialWrite(" err=");
+    serialWrite(" err=0x");
     printHex(error_code);
-    serialWrite(" rip=");
+    serialWrite(" rip=0x");
     printHex(rip);
     serialWrite("\n");
 
     // If Ring-3 fault, park the thread to prevent an infinite fault loop.
-    if ((cs & 0x3) != 0) {
+    if (user_fault) {
         const t_pf = scheduler.get_current_thread();
         t_pf.state = .Waiting;
         scheduler.schedule();
@@ -242,13 +221,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
 
     switch (op) {
         0x1000...0x1004 => {
-            serialWrite("VERIFIED_MILESTONE\n");
             return 0;
         },
         1 => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             _ = service_registry.updateServiceState(sid, .active);
-            serialWrite("H");
             return 0;
         },
         2 => {
@@ -258,7 +235,6 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             switch (kind) {
                 .netd => {
                     table.registerReservedNetdService(sid);
-                    serialWrite("phase13: netd service registered\n");
                 },
                 .storaged => table.registerReservedStoragedService(sid),
                 .dashd => table.registerReservedDashdService(sid),
@@ -347,21 +323,21 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // Returns physical base address of the allocation, or 0 on failure.
         5 => {
             const sid5 = service_registry.serviceIdForCapability(token) orelse {
-                serialWrite("DMA cap fail\n");
+                serialWrite("dma_alloc: invalid capability token\n");
                 return 0;
             };
             const pml4_5 = service_registry.getTaskBoundAddressSpace(sid5) orelse {
-                serialWrite("DMA pml4 fail\n");
+                serialWrite("dma_alloc: service has no address space\n");
                 return 0;
             };
             const num5 = @as(u32, @truncate(arg0));
             const slot5 = @as(u32, @truncate(arg1));
             if (num5 == 0 or num5 > 16 or slot5 + num5 > 16) {
-                serialWrite("DMA fail1\n");
+                serialWrite("dma_alloc: invalid page count or DMA window slot\n");
                 return 0;
             }
             const phys5 = pmm.allocContiguousAligned(num5, 1) orelse {
-                serialWrite("DMA fail2\n");
+                serialWrite("dma_alloc: contiguous physical allocation failed\n");
                 return 0;
             };
             // Zero the allocation.
@@ -370,8 +346,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             while (idx5 < num5) : (idx5 += 1) {
                 const dma_va: u64 = 0x0000_7D00_0000_0000 + (@as(u64, slot5 + idx5)) * pmm.PAGE_SIZE;
                 task_loader.mapPageInAddressSpace(pml4_5, hhdm_offset, dma_va, phys5 + @as(u64, idx5) * pmm.PAGE_SIZE, task_loader.USER_PAGE_FLAGS) catch {
-                    serialWrite("DMA fail3\n");
-                    serialWrite("DMA fail3\n");
+                    serialWrite("dma_alloc: failed to map DMA window\n");
                     return 0;
                 };
             }
