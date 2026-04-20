@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/language-Zig-F7A41D?style=flat-square" alt="Zig"/>
   <img src="https://img.shields.io/badge/arch-x86__64-36454F?style=flat-square" alt="x86_64"/>
   <img src="https://img.shields.io/badge/bootloader-Limine-CD7F32?style=flat-square" alt="Limine"/>
-  <img src="https://img.shields.io/badge/status-Phase%204-B87333?style=flat-square" alt="Phase 4"/>
+  <img src="https://img.shields.io/badge/status-Phase%205-2E8B57?style=flat-square" alt="Phase 5"/>
 </p>
 
 ---
@@ -76,14 +76,14 @@ Catenary OS acts as a **Type-1 hypervisor**, booting stripped-down Linux kernels
 - [x] **Phase 1: Bare-Metal Foundation** — Bootloading, build system, and basic output.
 - [x] **Phase 2: Core Abstractions** — CPU descriptors and physical memory management.
 - [x] **Phase 3: Scheduling & IPC** — Task switching and local message passing.
-- [ ] **Phase 4: Hypervisor & MicroVMs** (*Current*) — Intel VT-x integration and booting isolated Linux guest kernels.
-- [ ] **Phase 5: Networking & Orchestration** — IPv6 networking, distributed IPC, and multi-node cluster orchestration.
+- [x] **Phase 4: Hypervisor & MicroVMs** — Intel VT-x integration and booting isolated Linux guest kernels.
+- [ ] **Phase 5: Networking & Orchestration** (*Current*) — IPv6 networking, distributed IPC, and multi-node cluster orchestration.
 
 ---
 
 ## Building & Running
 
-**Prerequisites:** Zig toolchain, QEMU with x86_64 support, and the Limine bootloader (included in `limine/`).
+**Prerequisites:** Zig, QEMU with x86_64 support, `xorriso`, and the checked-in Limine bootloader files under `limine/`. Rebuilding the embedded guest initramfs also requires `cc`, `fakeroot`, `cpio`, and `gzip`.
 
 ```sh
 # Build the kernel
@@ -92,14 +92,37 @@ zig build
 # Run in QEMU (serial output to stdout)
 ./run_qemu.sh
 
-# Phase 4 smoke test (headless QEMU + serial milestone)
+# Default smoke test (core boot + Ring 3 service milestones)
 ./test_qemu.sh
+
+# Direct VMX/Linux validation
+SMOKE_PROFILE=vmx-linux ./test_qemu.sh
+
+# Integrated services-owned Linux MicroVM validation
+SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh
 ```
 
 Additional build/run notes and bring-up options are documented in [docs/SETUP.md](docs/SETUP.md).
 
-The smoke test looks for an early Linux guest serial line (by default it waits for `Linux version`).
-If your environment cannot expose nested VMX to the Catenary OS guest, the smoke test will fail early.
+By default, the smoke test checks core boot and service milestones.
+For VMX/Linux bring-up, use the named `SMOKE_PROFILE`s shown above, or override `ZIG_BUILD_ARGS`, `CORE_PATTERNS`, and `VMX_LINUX_PATTERNS` directly when you need a custom milestone set.
+If your environment cannot expose nested VMX to the Catenary OS guest, the VMX/Linux smoke test will fail early.
+
+## Guest Assets
+
+VMX/Linux validation expects a guest kernel image at `assets/guest/linux-bzImage`.
+
+```sh
+# Fetch a known-good Alpine bzImage
+./dev/download_linux.sh
+
+# Rebuild the embedded initramfs after guest init or rootfs changes
+./dev/rebuild_guest_initramfs.sh
+```
+
+The embedded initramfs carries the current guest handoff path and a small OCI-style demo rootfs under `/mnt/container`.
+Rebuild it after editing `guest_init.c` or `assets/guest/rootfs_init.c`.
+See [assets/guest/README.md](assets/guest/README.md) for the guest-kernel and rootfs details.
 
 ---
 

@@ -3,6 +3,7 @@
 /// Receives TelemetryUpdate DIPC messages from the VMM (microvm_bridge) and
 /// renders per-VM stats onto the framebuffer via the SYS_FB_DRAW syscall.
 const std = @import("std");
+const lib = @import("lib.zig");
 
 fn ptrFrom(comptime T: type, addr: u64) T {
     return @ptrFromInt(asm volatile (""
@@ -52,36 +53,7 @@ const PAGE_SIZE: u64 = 4096;
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-const BootstrapDescriptor = extern struct {
-    magic: u32,
-    version: u16,
-    descriptor_len: u16,
-    class: u16,
-    service_kind: u16,
-    runtime_mode: u16,
-    _r0: u16,
-    service_id: u32,
-    flags: u32,
-    persistent_trap_vector: u8,
-    _r1: u8,
-    persistent_heartbeat_op: u16,
-    persistent_stop_op: u16,
-    _r2: u16,
-    local_node: [16]u8,
-    dipc_wire_magic: u32,
-    dipc_wire_version: u16,
-    dipc_header_len: u16,
-    dipc_max_payload: u32,
-    reserved_netd_endpoint: u64,
-    reserved_kernel_control_endpoint: u64,
-    reserved_router_endpoint: u64,
-    reserved_storaged_endpoint: u64,
-    reserved_dashd_endpoint: u64,
-    microvm_ingress_magic: u32,
-    microvm_ingress_version: u16,
-    microvm_ingress_len: u16,
-    capability_token: u64,
-};
+const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 
@@ -89,15 +61,7 @@ const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 // Telemetry message layout (mirrors microvm_bridge TelemetryUpdatePayload)
 // ---------------------------------------------------------------------------
 
-const DIPC_HEADER_SIZE: usize = 64; // DIPC header is 64 bytes
-const CTRL_HEADER_SIZE: usize = 8; // ControlHeader (op + flags) is 8 bytes
-
-const TelemetryPayload = extern struct {
-    instance_id: u32,
-    _reserved: u32,
-    cpu_cycles: u64,
-    exit_count: u64,
-};
+const TelemetryPayload = lib.TelemetryUpdatePayload;
 
 // Per-VM stats kept in a small table (max 8 VMs).
 const MAX_VMS: u32 = 8;
@@ -205,9 +169,8 @@ pub export fn umain() noreturn {
             continue;
         }
 
-        // Decode telemetry payload (skip DIPC header + control header).
-        const payload_ptr: [*]const u8 = ptrFrom([*]const u8, recv_va + DIPC_HEADER_SIZE + CTRL_HEADER_SIZE);
-        const telem = @as(*const TelemetryPayload, @ptrCast(@alignCast(payload_ptr)));
+        // Telemetry is sent as a raw DIPC payload by microvm_bridge.
+        const telem: *align(1) const TelemetryPayload = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
 
         // Update VM stats table.
         const vid = telem.instance_id;

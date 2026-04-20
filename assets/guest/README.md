@@ -35,9 +35,15 @@ file /path/to/nornir/assets/guest/linux-bzImage
 
 Notes:
 - Use an x86_64 kernel image.
-- Keep the image reasonably small while phase 4 is still in flux.
-- An initramfs is not used yet.
-- Catenary OS currently validates and stages the image, but does not fully boot Linux yet.
+- Keep the image reasonably small so bring-up and smoke runs stay fast.
+- The VMX guest currently boots with the embedded initramfs at [initramfs.cpio.gz](initramfs.cpio.gz).
+- Rebuild that initramfs with `./dev/rebuild_guest_initramfs.sh` after changing [guest_init.c](../../guest_init.c) or [rootfs_init.c](rootfs_init.c).
+- That rebuild script expects a working `cc`, `fakeroot`, `cpio`, and `gzip` on the host.
+- The rebuilt initramfs includes a minimal embedded OCI-style rootfs at `/mnt/container` with `/sbin/init`, `/bin/sh`, and `/usr/bin/env` provided by [rootfs_init.c](rootfs_init.c).
+- The embedded rootfs also ships a small `/etc/os-release` and standard top-level directories so guest handoff exercises a more realistic filesystem layout.
+- Catenary OS currently validates and stages the image, then boots Linux with the embedded guest init path and demo rootfs workload.
+- Validate the direct guest path with `SMOKE_PROFILE=vmx-linux ./test_qemu.sh`.
+- Validate the services-owned launch path with `SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh`.
 
 After placing the file here:
 ```sh

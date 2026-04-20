@@ -229,10 +229,18 @@ const PIN_BASED_PREEMPTION_TIMER: u32 = 1 << 6;
 const PRIMARY_CTL_INTERRUPT_WINDOW: u32 = 1 << 2;
 const VMCS_VMX_PREEMPTION_TIMER_VALUE: u64 = 0x482E;
 const VMCS_VM_ENTRY_INTR_INFO: u64 = 0x4016;
+const VM_ENTRY_INTR_TYPE_EXTERNAL: u64 = 0;
+const VM_ENTRY_INTR_TYPE_NMI: u64 = 2;
 const VMEXIT_REASON_INTERRUPT_WINDOW: u64 = 7;
 const VMEXIT_REASON_PREEMPTION_TIMER: u64 = 52;
 const VMEXIT_REASON_CR_ACCESS: u64 = 28;
 const DEMO_EXIT_CPUID_LEAF: u32 = 0x4341_5445; // 'CATE'
+const X86_NMI_VECTOR: u8 = 2;
+const APIC_DEST_MODE_LOGICAL: u32 = 1 << 11;
+const APIC_DELIVERY_MODE_NMI: u32 = 4;
+const APIC_DEST_SHORTHAND_SELF: u32 = 1;
+const APIC_DEST_SHORTHAND_ALL_INC_SELF: u32 = 2;
+const APIC_DEST_SHORTHAND_ALL_EX_SELF: u32 = 3;
 const LINUX_DEBUG_EXCEPTION_BITMAP: u32 =
     (@as(u32, 1) << 0) | // #DE
     (@as(u32, 1) << 6) | // #UD
@@ -273,6 +281,7 @@ var pit_configured: bool = false;
 
 // -- Interrupt injection state --
 var timer_irq_pending: bool = false;
+var lapic_nmi_pending: bool = false;
 var preemption_timer_active: bool = false;
 var guest_apic_base: u64 = 0x0000_0000_FEE0_0900;
 var lapic_regs: [LAPIC_REG_WORDS]u32 = [_]u32{0} ** LAPIC_REG_WORDS;
@@ -475,6 +484,41 @@ fn lapicRead(offset: u64) u32 {
     return lapic_regs[idx];
 }
 
+fn lapicLocalPhysicalId() u8 {
+    return @as(u8, @truncate(lapicRead(APIC_ID_REG) >> 24));
+}
+
+fn lapicLocalLogicalId() u8 {
+    return @as(u8, @truncate(lapicRead(APIC_LDR_REG) >> 24));
+}
+
+fn lapicIcrTargetsLocal(icr_low: u32) bool {
+    const shorthand = @as(u2, @truncate((icr_low >> 18) & 0x3));
+    switch (shorthand) {
+        APIC_DEST_SHORTHAND_SELF, APIC_DEST_SHORTHAND_ALL_INC_SELF => return true,
+        APIC_DEST_SHORTHAND_ALL_EX_SELF => return false,
+        else => {},
+    }
+
+    const destination = @as(u8, @truncate(lapicRead(APIC_ICR2_REG) >> 24));
+    if ((icr_low & APIC_DEST_MODE_LOGICAL) != 0) {
+        const local_logical = lapicLocalLogicalId();
+        if (local_logical != 0) {
+            return (destination & local_logical) != 0;
+        }
+        return destination == 0x01;
+    }
+
+    return destination == lapicLocalPhysicalId();
+}
+
+fn queueLapicIcrDelivery(icr_low: u32) void {
+    const delivery_mode = (icr_low >> 8) & 0x7;
+    if (delivery_mode == APIC_DELIVERY_MODE_NMI and lapicIcrTargetsLocal(icr_low)) {
+        lapic_nmi_pending = true;
+    }
+}
+
 fn lapicWrite(offset: u64, value: u32) void {
     const reg = @as(u32, @intCast(offset));
     switch (reg) {
@@ -487,7 +531,10 @@ fn lapicWrite(offset: u64, value: u32) void {
         APIC_SPIV_REG => lapicWriteRaw(APIC_SPIV_REG, value & 0x3FF),
         APIC_ESR_REG => lapicWriteRaw(APIC_ESR_REG, 0),
         APIC_ICR2_REG => lapicWriteRaw(APIC_ICR2_REG, value & 0xFF00_0000),
-        APIC_ICR_REG => lapicWriteRaw(APIC_ICR_REG, value),
+        APIC_ICR_REG => {
+            lapicWriteRaw(APIC_ICR_REG, value);
+            queueLapicIcrDelivery(value);
+        },
         APIC_LVTCMCI_REG, APIC_LVTT_REG, APIC_LVTTHMR_REG, APIC_LVTPC_REG, APIC_LVT0_REG, APIC_LVT1_REG, APIC_LVTERR_REG => lapicWriteRaw(reg, value),
         APIC_TMICT_REG => {
             lapicWriteRaw(APIC_TMICT_REG, value);
@@ -518,6 +565,7 @@ fn resetGuestDeviceState() void {
     pit_configured = false;
 
     timer_irq_pending = false;
+    lapic_nmi_pending = false;
     preemption_timer_active = false;
     guest_apic_base = 0x0000_0000_FEE0_0900;
     resetLapicState();
@@ -1756,26 +1804,6 @@ fn handleEptViolation(regs: *GuestRegs) bool {
         } else {
             regs.rax = lapicRead(offset);
         }
-        if (offset == APIC_ICR_REG or offset == APIC_ICR2_REG) {
-            if (is_write) {
-                serialWrite("VMX: LAPIC ICR write val=0x");
-                printHex(val);
-
-                const delivery_mode = (val >> 8) & 7;
-                const vector = val & 0xFF;
-                if (delivery_mode == 5) {
-                    serialWrite(" INIT APIC\n");
-                } else if (delivery_mode == 6) {
-                    serialWrite(" SIPI APIC target vCPU: 0x");
-                    printHex(vector);
-                    serialWrite("\n");
-                } else {
-                    serialWrite("\n");
-                }
-            } else {
-                serialWrite("VMX: LAPIC ICR read\n");
-            }
-        }
         advanceGuestRip();
         return true;
     }
@@ -2152,8 +2180,20 @@ fn handlePort61(is_in: bool, regs: *GuestRegs) void {
 }
 
 fn tryInjectTimerIrq() void {
-    const rflags = vmread(VMCS_GUEST_RFLAGS) orelse return;
     const interruptibility = vmread(VMCS_GUEST_INTERRUPTIBILITY) orelse return;
+    if (lapic_nmi_pending) {
+        if ((interruptibility & (@as(u64, 1) << 3)) == 0) {
+            const entry_info: u64 = @as(u64, X86_NMI_VECTOR) |
+                (VM_ENTRY_INTR_TYPE_NMI << 8) |
+                (@as(u64, 1) << 31);
+            _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, entry_info);
+            lapic_nmi_pending = false;
+            return;
+        }
+        return;
+    }
+
+    const rflags = vmread(VMCS_GUEST_RFLAGS) orelse return;
     const guest_interruptible = (rflags & (1 << 9)) != 0 and (interruptibility & 0x3) == 0;
 
     // Inject COM1 THRE interrupt (IRQ4) when the ttyS0 driver has THRI enabled.
@@ -2161,7 +2201,7 @@ fn tryInjectTimerIrq() void {
     if (serial_irq4_pending) {
         if (guest_interruptible) {
             const vector: u64 = @as(u64, pic_master_vector_base) + 4;
-            _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, vector | (1 << 31));
+            _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, vector | (VM_ENTRY_INTR_TYPE_EXTERNAL << 8) | (1 << 31));
             serial_irq4_pending = false;
             return; // one interrupt per VMENTRY
         }
@@ -2190,7 +2230,7 @@ fn tryInjectTimerIrq() void {
 
     // Inject timer interrupt: IRQ 0 → vector = pic_master_vector_base
     const vector: u64 = pic_master_vector_base;
-    const entry_info: u64 = vector | (1 << 31); // Valid, type 0 = external interrupt
+    const entry_info: u64 = vector | (VM_ENTRY_INTR_TYPE_EXTERNAL << 8) | (1 << 31);
     _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, entry_info);
     timer_irq_pending = false;
     timer_inject_count += 1;
@@ -2558,7 +2598,7 @@ pub fn findGuestPageHpaPublic(gpa: u64) ?u64 {
 
 pub fn injectGuestInterrupt(vmid: u32, vector: u8) void {
     _ = vmid; // Multi-VM support would require mapping vmid to VMCS
-    const entry_info: u64 = @as(u64, vector) | (1 << 31); // Valid, type 0 = external interrupt
+    const entry_info: u64 = @as(u64, vector) | (VM_ENTRY_INTR_TYPE_EXTERNAL << 8) | (1 << 31);
     _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, entry_info);
 }
 
@@ -2624,10 +2664,28 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
         return;
     };
 
+    if (build_options.services_active) {
+        serialWrite("VMX: staged guest ready; waiting for service launch\n");
+        return;
+    }
+
     const scheduler = @import("../../kernel/scheduler.zig");
     _ = scheduler.spawnWithVmx(null, true, current_instance_id.?, 0) catch {
         serialWrite("VMX: failed to spawn vmx thread\n");
     };
+}
+
+pub fn launchStagedInstance() !u32 {
+    const id = current_instance_id orelse return error.Unsupported;
+    const inst = microvm_registry.findMutable(id) orelse return error.Unsupported;
+
+    if (inst.state == .running) return id;
+    if (inst.state != .created) return error.Unsupported;
+    if (!microvm_registry.start(id)) return error.Unsupported;
+
+    const scheduler = @import("../../kernel/scheduler.zig");
+    _ = try scheduler.spawnWithVmx(null, true, id, 0);
+    return id;
 }
 
 pub fn setupVmcs(instance: *microvm_registry.Instance) !void {

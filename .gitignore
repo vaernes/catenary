@@ -1,31 +1,36 @@
 # Zig build artifacts
-zig-out/
 .zig-cache/
+zig-out/
 
-# ISO build artifacts
+# Python / local tooling
+.venv/
+tmp/
+*.tmp
+
+# ISO staging and images
 *.iso
 iso_root/
 
-# Bootloader (if not tracked or custom built)
+# Local Limine vendor / bootloader artifacts
 limine/
 
-# Temporary files
-tmp/
-*.tmp
-.venv/
-# Editor/OS specific
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
-Thumbs.db
+# Guest image inputs that are expected to stay local
 assets/guest/linux-bzImage
-# QEMU logs and output
+
+# QEMU and smoke-test output
 qemu_*.log
-qemu_output.txt
-kernel.elf
 qemu.log
+qemu_output.txt
+qemu.pid
+*.pid
+test_disk.img
+
+# Local build byproducts and scratch output
+kernel.elf
+kernel.asm
+*.orig
+
+# One-off local helper scripts / scratch files
 patch_*.py
 patch_*.patch
 parse_*.py
@@ -33,7 +38,11 @@ parse_*.patch
 patch_*.sh
 fix_*.py
 generate_*.py
-*.orig
-qemu.pid
-kernel.asm
-test_disk.img
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

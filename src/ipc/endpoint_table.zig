@@ -5,6 +5,9 @@ pub const EndpointTable = struct {
 
     slots: [MAX_ENDPOINTS]Slot = undefined,
     next_dynamic: identity.EndpointId = identity.FIRST_DYNAMIC_ENDPOINT,
+    reserved_netd_service: u32 = 0,
+    reserved_storaged_service: u32 = 0,
+    reserved_dashd_service: u32 = 0,
 
     pub const Slot = struct {
         in_use: bool = false,
@@ -17,6 +20,9 @@ pub const EndpointTable = struct {
             self.slots[i] = .{};
         }
         self.next_dynamic = identity.FIRST_DYNAMIC_ENDPOINT;
+        self.reserved_netd_service = 0;
+        self.reserved_storaged_service = 0;
+        self.reserved_dashd_service = 0;
     }
 
     pub fn registerReservedNetdThread(self: *EndpointTable, thread_id: identity.ThreadId) void {
@@ -28,11 +34,13 @@ pub const EndpointTable = struct {
     pub fn registerReservedStoragedThread(self: *EndpointTable, thread_id: identity.ThreadId) void {
         self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.storaged));
         _ = self.insert(@intFromEnum(identity.ReservedEndpoint.storaged), .{ .thread = thread_id });
+        self.reserved_storaged_service = 0;
     }
 
     pub fn registerReservedDashdThread(self: *EndpointTable, thread_id: identity.ThreadId) void {
         self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.dashd));
         _ = self.insert(@intFromEnum(identity.ReservedEndpoint.dashd), .{ .thread = thread_id });
+        self.reserved_dashd_service = 0;
     }
 
     pub fn registerReservedContainerdThread(self: *EndpointTable, thread_id: identity.ThreadId) void {
@@ -63,16 +71,19 @@ pub const EndpointTable = struct {
     pub fn registerReservedStoragedService(self: *EndpointTable, service_id: u32) void {
         self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.storaged));
         _ = self.insert(@intFromEnum(identity.ReservedEndpoint.storaged), .{ .service = service_id });
+        self.reserved_storaged_service = service_id;
     }
 
     pub fn registerReservedDashdService(self: *EndpointTable, service_id: u32) void {
         self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.dashd));
         _ = self.insert(@intFromEnum(identity.ReservedEndpoint.dashd), .{ .service = service_id });
+        self.reserved_dashd_service = service_id;
     }
 
     pub fn registerReservedNetdService(self: *EndpointTable, service_id: u32) void {
         self.unregisterEndpoint(@intFromEnum(identity.ReservedEndpoint.netd));
         _ = self.insert(@intFromEnum(identity.ReservedEndpoint.netd), .{ .service = service_id });
+        self.reserved_netd_service = service_id;
     }
 
     pub fn clearReservedNetdService(self: *EndpointTable, service_id: u32) bool {
@@ -83,6 +94,7 @@ pub const EndpointTable = struct {
                 .service => |existing_service_id| {
                     if (existing_service_id == service_id) {
                         self.slots[i] = .{};
+                        self.reserved_netd_service = 0;
                         return true;
                     }
                 },

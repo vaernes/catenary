@@ -27,7 +27,6 @@ pub const SYS_SERIAL_WRITE = 9;
 pub const SYS_FB_DRAW = 16;
 pub const SYS_MAP_RECV = 17;
 
-pub const DIPC_HEADER_SIZE: usize = 64;
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 pub const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
@@ -122,6 +121,8 @@ pub const PageHeader = extern struct {
     dst: Address,
 };
 
+pub const DIPC_HEADER_SIZE: usize = @sizeOf(PageHeader);
+
 pub const ControlOp = enum(u16) {
     register_netd = 1,
     set_node_addr = 2,
@@ -150,6 +151,8 @@ pub const ControlHeader = extern struct {
     payload_len: u32,
 };
 
+pub const CONTROL_HEADER_SIZE: usize = @sizeOf(ControlHeader);
+
 pub const CreateMicrovmPayload = extern struct {
     mem_pages: u32,
     vcpus: u32,
@@ -157,6 +160,20 @@ pub const CreateMicrovmPayload = extern struct {
     kernel_size: u64,
     initramfs_phys: u64,
     initramfs_size: u64,
+};
+
+pub const TelemetryUpdatePayload = extern struct {
+    instance_id: u32,
+    _reserved: u32 = 0,
+    cpu_cycles: u64,
+    exit_count: u64,
+};
+
+pub const RegistrySyncPayload = extern struct {
+    service_id: u32,
+    service_kind: u16,
+    state: u8,
+    _pad: u8 = 0,
 };
 
 pub const BlkRequest = extern struct {

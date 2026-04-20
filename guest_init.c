@@ -10,6 +10,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sched.h>
+#include <dirent.h>
 
 /* -----------------------------------------------------------------------
  * Helper: write a string to a file (best-effort).
@@ -17,8 +18,73 @@
 static void write_file(const char *path, const char *val) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror(path); return; }
-    write(fd, val, strlen(val));
+    size_t len = strlen(val);
+    ssize_t written = write(fd, val, len);
+    if (written < 0 || (size_t)written != len)
+        perror(path);
     close(fd);
+}
+
+static int dir_has_entries(const char *path) {
+    DIR *dir = opendir(path);
+    if (!dir)
+        return 0;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+            closedir(dir);
+            return 1;
+        }
+    }
+
+    closedir(dir);
+    return 0;
+}
+
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int has_oci_entrypoint(const char *root) {
+    char path[256];
+    const char *candidates[] = {
+        "/sbin/init",
+        "/usr/sbin/init",
+        "/init",
+        "/bin/sh",
+        "/bin/bash",
+        NULL,
+    };
+
+    for (int i = 0; candidates[i]; i++) {
+        snprintf(path, sizeof(path), "%s%s", root, candidates[i]);
+        if (file_exists(path))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int chroot_into_oci(const char *new_root) {
+    if (chdir(new_root) != 0) {
+        perror("chdir new_root");
+        return -1;
+    }
+
+    if (chroot(".") != 0) {
+        perror("chroot new_root");
+        return -1;
+    }
+
+    if (chdir("/") != 0) {
+        perror("chdir / after chroot");
+        return -1;
+    }
+
+    printf("guest_init: chroot fallback into OCI rootfs\n");
+    return 0;
 }
 
 /* -----------------------------------------------------------------------
@@ -107,12 +173,14 @@ static int pivot_into_oci(void) {
     const char *old_root = "/mnt/container/.old_root";
 
     mkdir("/mnt", 0755);
-    mkdir(new_root, 0755);
+    if (mkdir(new_root, 0755) != 0 && errno != EEXIST) {
+        perror("mkdir /mnt/container");
+        return -1;
+    }
 
-    /* If storaged has not written anything yet, bail gracefully. */
+    /* An empty mountpoint is not a usable OCI rootfs. */
     struct stat st;
-    if (stat(new_root, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        printf("guest_init: OCI rootfs not present at %s, skipping pivot_root\n", new_root);
+    if (stat(new_root, &st) != 0 || !S_ISDIR(st.st_mode) || !dir_has_entries(new_root) || !has_oci_entrypoint(new_root)) {
         return -1;
     }
 
@@ -126,6 +194,10 @@ static int pivot_into_oci(void) {
 
     /* pivot_root is not in glibc – call it directly. */
     if (syscall(SYS_pivot_root, new_root, old_root) != 0) {
+        if (errno == EINVAL) {
+            rmdir(old_root);
+            return chroot_into_oci(new_root);
+        }
         perror("pivot_root");
         return -1;
     }
@@ -192,6 +264,7 @@ int main(void) {
     if (pivot_into_oci() == 0) {
         /* Re-mount /proc and /sys inside the new root. */
         mount_basics();
+        printf("Catenary OS Guest Init: SUCCESS\n");
         run_entrypoint();
     } else {
         /* No OCI rootfs yet – report success and idle. */

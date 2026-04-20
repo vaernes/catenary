@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const dipc = @import("../ipc/dipc.zig");
 const endpoint_table = @import("../ipc/endpoint_table.zig");
 const identity = @import("../ipc/identity.zig");
@@ -8,13 +9,23 @@ const pmm = @import("../kernel/pmm.zig");
 const router = @import("../ipc/router.zig");
 const arch_cpu = @import("../arch/x86_64/cpu.zig");
 
-pub const HandleError = error{
+pub const HandleError = (error{
     BadHeader,
     BadPayload,
     NotForKernel,
     Unauthorized,
     NodeLocked,
-};
+} || dipc.AllocError || router.RouteError);
+
+fn serialWrite(s: []const u8) void {
+    for (s) |c| {
+        asm volatile ("outb %al, %dx"
+            :
+            : [al] "{al}" (c),
+              [dx] "{dx}" (@as(u16, 0x3F8)),
+        );
+    }
+}
 
 fn payloadBase(hhdm_offset: u64, page_phys: u64) [*]const u8 {
     return @ptrFromInt(page_phys + hhdm_offset + dipc.HEADER_SIZE);
@@ -25,6 +36,11 @@ fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.C
 
     if (!dipc.Ipv6Addr.eql(hdr.src.node, node_config.getLocalNode())) return false;
     return hdr.src.endpoint == @intFromEnum(identity.ReservedEndpoint.netd);
+}
+
+fn isAuthorizedMicrovmSource(hdr: *const dipc.PageHeader) bool {
+    if (!dipc.Ipv6Addr.eql(hdr.src.node, node_config.getLocalNode())) return false;
+    return hdr.src.endpoint == @intFromEnum(identity.ReservedEndpoint.clusterd);
 }
 
 pub fn handleKernelControlPage(
@@ -104,8 +120,8 @@ pub fn handleKernelControlPage(
 
             var value: u32 = 0;
             switch (p.size) {
-                1 => value = @as(u32, arch_cpu.inb(0xcfc + (p.offset & 3))),
-                2 => value = @as(u32, arch_cpu.inw(0xcfc + (p.offset & 2))),
+                1 => value = @as(u32, arch_cpu.inb(@as(u16, 0x0cfc) + @as(u16, p.offset & 3))),
+                2 => value = @as(u32, arch_cpu.inw(@as(u16, 0x0cfc) + @as(u16, p.offset & 2))),
                 4 => value = arch_cpu.inl(0xcfc),
                 else => return error.BadPayload,
             }
@@ -127,8 +143,8 @@ pub fn handleKernelControlPage(
             arch_cpu.outl(0xcf8, addr);
 
             switch (p.size) {
-                1 => arch_cpu.outb(0xcfc + (p.offset & 3), @as(u8, @truncate(p.value))),
-                2 => arch_cpu.outw(0xcfc + (p.offset & 2), @as(u16, @truncate(p.value))),
+                1 => arch_cpu.outb(@as(u16, 0x0cfc) + @as(u16, p.offset & 3), @as(u8, @truncate(p.value))),
+                2 => arch_cpu.outw(@as(u16, 0x0cfc) + @as(u16, p.offset & 2), @as(u16, @truncate(p.value))),
                 4 => arch_cpu.outl(0xcfc, p.value),
                 else => return error.BadPayload,
             }
@@ -141,8 +157,9 @@ pub fn handleKernelControlPage(
 
             if (remaining != @sizeOf(control_protocol.PhysAllocPayload)) return error.BadPayload;
             const p: *const control_protocol.PhysAllocPayload = @ptrCast(@alignCast(payload_ptr));
+            if (p.alignment_order >= 64) return error.BadPayload;
 
-            const alignment_pages = @as(u64, 1) << p.alignment_order;
+            const alignment_pages = @as(u64, 1) << @as(u6, @intCast(p.alignment_order));
             const phys = pmm.allocContiguousAligned(p.num_pages, alignment_pages) orelse 0;
 
             const res = control_protocol.PhysAllocResult{
@@ -194,15 +211,21 @@ pub fn handleKernelControlPage(
         // control handler treats them as unrecognised and returns an error to the caller.
         .poll_netd_inbox, .assign_node_addr => return error.BadPayload,
         .create_microvm => {
-            const sr = @import("../services/service_registry.zig");
-            _ = sr.serviceIdForCapability(hdr.auth_tag) orelse return error.Unauthorized;
-            // Only clusterd should create MicroVMs. Wait, clusterd isn't in reserved endpoint table yet...
-            // We'll allow it for now.
+            if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
             if (remaining != @sizeOf(control_protocol.CreateMicrovmPayload)) return error.BadPayload;
             const p: *const control_protocol.CreateMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
+
+            if (build_options.vmm_active and build_options.services_active) {
+                const vmx = @import("../arch/x86_64/vmx.zig");
+                if (vmx.launchStagedInstance()) |id| {
+                    serialWrite("kernel_control: staged MicroVM launched via DIPC\n");
+                    _ = id;
+                    return;
+                } else |_| {}
+            }
+
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             if (microvm_registry.create(p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
-                const serialWrite = @import("../kernel/fb.zig").serialWrite;
                 serialWrite("configd: MicroVM created via DIPC\n");
                 _ = id;
             } else {

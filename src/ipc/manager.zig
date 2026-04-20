@@ -6,6 +6,16 @@ const scheduler = @import("../kernel/scheduler.zig");
 const router = @import("router.zig");
 const node_config = @import("node_config.zig");
 
+fn serialWrite(s: []const u8) void {
+    for (s) |c| {
+        asm volatile ("outb %al, %dx"
+            :
+            : [al] "{al}" (c),
+              [dx] "{dx}" (@as(u16, 0x3F8)),
+        );
+    }
+}
+
 // Global IPC state
 var table: endpoint_table.EndpointTable align(16) linksection(".data") = undefined;
 var initialized: bool = false;
@@ -15,6 +25,13 @@ pub fn init(offset: u64) void {
     if (initialized) return;
     hhdm_offset = offset;
     table.init();
+
+    const control_tid = scheduler.spawn(controlLoop) catch {
+        serialWrite("MANAGER: failed to spawn control loop\n");
+        return;
+    };
+    table.registerReservedKernelControlThread(control_tid);
+
     initialized = true;
 }
 
@@ -27,13 +44,12 @@ pub fn endpointTable() *endpoint_table.EndpointTable {
 pub fn controlLoop() void {
     while (true) {
         if (scheduler.receive()) |msg| {
-            const page_phys = msg.value;
+            const page_phys = msg;
             const hdr = dipc.headerFromPage(hhdm_offset, page_phys);
 
             // Kernel-control: consume + free.
             if (hdr.magic == dipc.WireMagic and hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control)) {
                 control_handler.handleKernelControlPage(hhdm_offset, &table, page_phys) catch {
-                    const serialWrite = @import("../kernel/fb.zig").serialWrite;
                     serialWrite("MANAGER: control_handler error!\n");
                 };
                 dipc.freePageMessage(page_phys);

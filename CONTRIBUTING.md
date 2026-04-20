@@ -21,6 +21,12 @@ Quick start:
 zig build          # build the kernel
 ./run_qemu.sh      # run with serial output to stdout
 ./test_qemu.sh     # headless smoke test
+
+# direct VMX/Linux validation
+SMOKE_PROFILE=vmx-linux ./test_qemu.sh
+
+# integrated services-owned VMX/Linux validation
+SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh
 ```
 
 ## Reporting Bugs
@@ -37,6 +43,8 @@ Open a GitHub issue and include:
 - Keep changes small and focused. One pull request, one concern.
 - Run `zig build` before submitting.
 - For boot-path or VMX changes, include serial output confirming the expected milestone is still reached.
+- For guest-handoff or service-owned MicroVM changes, prefer the matching `SMOKE_PROFILE` run and mention which profile you validated.
+- Update the relevant markdown when build flags, smoke profiles, guest-rootfs workflow, or generated artifacts change.
 - Document any hardware behaviour, calling convention, or boot-time assumption that is not obvious from the code.
 - Do not add features, abstractions, or refactors beyond the stated scope of the change.
 
@@ -48,4 +56,6 @@ Open a GitHub issue and include:
 
 ## Security Vulnerabilities
 
-See [SECURITY.md](SECURITY.md) for the responsible disclosure process.
+This repo does not currently publish a separate `SECURITY.md` process document.
+If the issue is not sensitive, open a normal GitHub issue with reproduction details.
+If private coordination is needed, use GitHub's private reporting flow if it is enabled for the repository.

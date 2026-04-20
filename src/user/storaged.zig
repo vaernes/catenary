@@ -2,6 +2,7 @@
 ///
 /// Syscall ABI: rax=op, rbx=arg0, rdx=arg1, r8=token.
 const std = @import("std");
+const lib = @import("lib.zig");
 
 fn ptrFrom(comptime T: type, addr: u64) T {
     return @ptrFromInt(asm volatile (""
@@ -73,36 +74,7 @@ fn pciWrite(bus: u8, dev: u8, func: u8, off: u8, size: u8, val: u32, token: u64)
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-const BootstrapDescriptor = extern struct {
-    magic: u32,
-    version: u16,
-    descriptor_len: u16,
-    class: u16,
-    service_kind: u16,
-    runtime_mode: u16,
-    _r0: u16,
-    service_id: u32,
-    flags: u32,
-    persistent_trap_vector: u8,
-    _r1: u8,
-    persistent_heartbeat_op: u16,
-    persistent_stop_op: u16,
-    _r2: u16,
-    local_node: [16]u8,
-    dipc_wire_magic: u32,
-    dipc_wire_version: u16,
-    dipc_header_len: u16,
-    dipc_max_payload: u32,
-    reserved_netd_endpoint: u64,
-    reserved_kernel_control_endpoint: u64,
-    reserved_router_endpoint: u64,
-    reserved_storaged_endpoint: u64,
-    reserved_dashd_endpoint: u64,
-    microvm_ingress_magic: u32,
-    microvm_ingress_version: u16,
-    microvm_ingress_len: u16,
-    capability_token: u64,
-};
+const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 
@@ -171,14 +143,7 @@ comptime {
 }
 
 // DIPC block request mirror of virtio_blk.RequestHeader (from kernel microvm_bridge).
-const BlkRequest = extern struct {
-    req_type: u32, // 0=read, 1=write, 4=flush
-    _reserved: u32,
-    sector: u64,
-    vmid: u32,
-    chain_head: u16,
-    _pad: u16 = 0,
-};
+const BlkRequest = lib.BlkRequest;
 
 // Lba size (LBA = logical block address, a 512-byte sector).
 const SECTOR_SIZE: u32 = 512;
@@ -633,24 +598,13 @@ pub export fn umain() noreturn {
             continue;
         }
 
-        // The DIPC payload starts after the DIPC header (64 bytes).
-        const DIPC_HEADER_SIZE: u64 = 64;
-        const payload: [*]const u8 = ptrFrom([*]const u8, recv_va + DIPC_HEADER_SIZE);
-
-        // Decode BlkRequest (32 bytes at start of DIPC payload).
-        const req_type: u32 = @as(u32, payload[0]) | (@as(u32, payload[1]) << 8) | (@as(u32, payload[2]) << 16) | (@as(u32, payload[3]) << 24);
-        const sector: u64 = @as(u64, payload[8]) | (@as(u64, payload[9]) << 8) |
-            (@as(u64, payload[10]) << 16) | (@as(u64, payload[11]) << 24) |
-            (@as(u64, payload[12]) << 32) | (@as(u64, payload[13]) << 40) |
-            (@as(u64, payload[14]) << 48) | (@as(u64, payload[15]) << 56);
-
-        // Read metadata from payload:
-        // payload[32..36] vmid, [36..38] chain_head, [38..40] data_len, [40..48] data_hpa
-        const vmid: u32 = @as(u32, payload[32]) | (@as(u32, payload[33]) << 8) | (@as(u32, payload[34]) << 16) | (@as(u32, payload[35]) << 24);
-        const chain_head: u16 = @as(u16, payload[36]) | (@as(u16, payload[37]) << 8);
-        const data_len: u16 = @as(u16, payload[38]) | (@as(u16, payload[39]) << 8);
-        const data_hpa: u64 = @as(u64, payload[40]) | (@as(u64, payload[41]) << 8) | (@as(u64, payload[42]) << 16) | (@as(u64, payload[43]) << 24) |
-            (@as(u64, payload[44]) << 32) | (@as(u64, payload[45]) << 40) | (@as(u64, payload[46]) << 48) | (@as(u64, payload[47]) << 56);
+        const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+        const req_type = request.req_type;
+        const sector = request.sector;
+        const vmid = request.vmid;
+        const chain_head = request.chain_head;
+        const data_len = request.data_len;
+        const data_hpa = request.data_hpa;
 
         var io_status: u8 = 1; // 1 = error by default
         const nlb: u32 = if (data_len >= 512) @as(u32, data_len) / 512 else 1;
@@ -669,85 +623,33 @@ pub export fn umain() noreturn {
             io_status = 0;
         }
 
-        // Send DIPC response page
         const scratch: [*]u8 = ptrFrom([*]u8, DIPC_SCRATCH_VA);
+        const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+        const local_node = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
 
-        // Setup ControlHeader
-        scratch[0] = 17; // virtio_blk_response
-        scratch[1] = 0;
-        scratch[2] = 0;
-        scratch[3] = 0;
+        const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+        header.* = .{
+            .magic = lib.WireMagic,
+            .version = lib.WireVersion,
+            .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
+            .payload_len = @as(u32, @intCast(@sizeOf(lib.ControlHeader) + @sizeOf(lib.VirtioBlkResponsePayload))),
+            .auth_tag = 0,
+            .src = .{ .node = local_node, .endpoint = bs_desc.reserved_storaged_endpoint },
+            .dst = incoming_hdr.src,
+        };
 
-        scratch[4] = 8; // payload_len (VirtioBlkResponsePayload is 8 bytes)
-        scratch[5] = 0;
-        scratch[6] = 0;
-        scratch[7] = 0;
+        const control: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+        control.* = .{
+            .op = .virtio_blk_response,
+            .payload_len = @as(u32, @intCast(@sizeOf(lib.VirtioBlkResponsePayload))),
+        };
 
-        // Setup VirtioBlkResponsePayload
-        scratch[8] = @truncate(vmid);
-        scratch[9] = @truncate(vmid >> 8);
-        scratch[10] = @truncate(vmid >> 16);
-        scratch[11] = @truncate(vmid >> 24);
-
-        scratch[12] = @truncate(chain_head);
-        scratch[13] = @truncate(chain_head >> 8);
-
-        scratch[14] = io_status;
-        scratch[15] = 0; // pad
-
-        // Format DIPC PageHeader in the received page we are about to free...
-        // Wait, it's easier to just construct the DIPC header in DIPC_SCRATCH_VA
-        // and send it using SYS_SEND_PAGE
-        // DIPC_HEADER_SIZE = 64. Our payload starts at offset 64.
-        // Let's shift our scratch data to offset 64.
-        var i: usize = 15;
-        while (true) {
-            scratch[64 + i] = scratch[i];
-            if (i == 0) break;
-            i -= 1;
-        }
-
-        // Fill DIPC header
-        // magic
-        scratch[0] = 0x43; // 'C'
-        scratch[1] = 0x50; // 'P'
-        scratch[2] = 0x49; // 'I'
-        scratch[3] = 0x44; // 'D'
-        // version
-        scratch[4] = 1;
-        scratch[5] = 0;
-        // header_len = 64
-        scratch[6] = 64;
-        scratch[7] = 0;
-        // payload_len = 16 (8 byte control header + 8 byte payload)
-        scratch[8] = 16;
-        scratch[9] = 0;
-        scratch[10] = 0;
-        scratch[11] = 0;
-        // auth_tag (needs proper MAC, but kernel SYS_SEND_PAGE will re-sign it anyway!)
-        scratch[12] = 0;
-        scratch[13] = 0;
-        scratch[14] = 0;
-        scratch[15] = 0;
-        scratch[16] = 0;
-        scratch[17] = 0;
-        scratch[18] = 0;
-        scratch[19] = 0;
-        // src Address (local node + storaged endpoint)
-
-        @memcpy(scratch[20..36], &bs_desc.local_node);
-        scratch[36] = @truncate(bs_desc.reserved_storaged_endpoint);
-        scratch[37] = @truncate(bs_desc.reserved_storaged_endpoint >> 8);
-        scratch[38] = @truncate(bs_desc.reserved_storaged_endpoint >> 16);
-        scratch[39] = @truncate(bs_desc.reserved_storaged_endpoint >> 24);
-        scratch[40] = @truncate(bs_desc.reserved_storaged_endpoint >> 32);
-        scratch[41] = @truncate(bs_desc.reserved_storaged_endpoint >> 40);
-        scratch[42] = @truncate(bs_desc.reserved_storaged_endpoint >> 48);
-        scratch[43] = @truncate(bs_desc.reserved_storaged_endpoint >> 56);
-        // dst Address (echo the src address from the incoming request)
-        const incoming_hdr: [*]const u8 = ptrFrom([*]const u8, recv_va);
-        @memcpy(scratch[44..60], incoming_hdr[20..36]); // dst_node = incoming src_node
-        @memcpy(scratch[60..68], incoming_hdr[36..44]); // dst_ep = incoming src_ep
+        const response: *align(1) lib.VirtioBlkResponsePayload = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
+        response.* = .{
+            .vmid = vmid,
+            .head_idx = chain_head,
+            .status = io_status,
+        };
 
         _ = syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, g_token);
 

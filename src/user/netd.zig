@@ -3,6 +3,7 @@
 /// Syscall ABI used here: rax=op, rbx=arg0, rdx=arg1, r8=token.
 /// This matches the kernel's syscallIsr bridge exactly.
 const std = @import("std");
+const lib = @import("lib.zig");
 
 fn ptrFrom(comptime T: type, addr: u64) T {
     return @ptrFromInt(asm volatile (""
@@ -128,36 +129,7 @@ fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
 // Bootstrap descriptor (matches kernel's service_bootstrap.Descriptor)
 // ---------------------------------------------------------------------------
 
-const BootstrapDescriptor = extern struct {
-    magic: u32,
-    version: u16,
-    descriptor_len: u16,
-    class: u16,
-    service_kind: u16,
-    runtime_mode: u16,
-    _r0: u16,
-    service_id: u32,
-    flags: u32,
-    persistent_trap_vector: u8,
-    _r1: u8,
-    persistent_heartbeat_op: u16,
-    persistent_stop_op: u16,
-    _r2: u16,
-    local_node: [16]u8,
-    dipc_wire_magic: u32,
-    dipc_wire_version: u16,
-    dipc_header_len: u16,
-    dipc_max_payload: u32,
-    reserved_netd_endpoint: u64,
-    reserved_kernel_control_endpoint: u64,
-    reserved_router_endpoint: u64,
-    reserved_storaged_endpoint: u64,
-    reserved_dashd_endpoint: u64,
-    microvm_ingress_magic: u32,
-    microvm_ingress_version: u16,
-    microvm_ingress_len: u16,
-    capability_token: u64,
-};
+const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 
@@ -237,9 +209,9 @@ const RX_BUF_SIZE: u32 = 1024; // per RX descriptor buffer
 const NUM_RX_BUFS: u16 = 8; // pre-populated RX descriptors
 
 // DIPC wire magic (must match kernel dipc.zig)
-const DIPC_WIRE_MAGIC: u32 = 0x44495043; // 'DIPC'
-const DIPC_WIRE_VERSION: u16 = 1;
-const DIPC_HEADER_SIZE: usize = 64; // @sizeOf(PageHeader)
+const DIPC_WIRE_MAGIC: u32 = lib.WireMagic;
+const DIPC_WIRE_VERSION: u16 = lib.WireVersion;
+const DIPC_HEADER_SIZE: usize = lib.DIPC_HEADER_SIZE;
 const DIPC_UDP_PORT: u16 = 0x4450; // 'DP' – custom port for DIPC-over-UDP
 
 // State globals

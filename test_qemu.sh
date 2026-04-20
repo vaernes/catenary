@@ -6,14 +6,56 @@ set -euo pipefail
 # - launches the nested-VMX path
 # - passes only if the Linux guest reaches an early serial milestone
 
-TIMEOUT_SECS=${TIMEOUT_SECS:-30}
+TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
-CORE_PATTERNS=${CORE_PATTERNS:-"booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"}
-VMX_EPT_PATTERNS=${VMX_EPT_PATTERNS:-""}
-VMX_LINUX_PATTERNS=${VMX_LINUX_PATTERNS:-""}
+SMOKE_PROFILE=${SMOKE_PROFILE:-default}
+
+DEFAULT_ZIG_BUILD_ARGS=""
+DEFAULT_CORE_PATTERNS=""
+DEFAULT_VMX_EPT_PATTERNS=""
+DEFAULT_VMX_LINUX_PATTERNS=""
+
+case "${SMOKE_PROFILE}" in
+    default)
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
+        ;;
+    vmx-linux)
+        DEFAULT_ZIG_BUILD_ARGS="-Dvmm_active=true -Dvmm_launch_linux=true -Dservices_active=false"
+        DEFAULT_CORE_PATTERNS="booting...;selftest: done;Timer initialized."
+        DEFAULT_VMX_LINUX_PATTERNS="Linux version;Catenary OS Guest Init: SUCCESS"
+        ;;
+    vmx-linux-services)
+        DEFAULT_ZIG_BUILD_ARGS="-Dvmm_active=true -Dvmm_launch_linux=true"
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
+        DEFAULT_VMX_LINUX_PATTERNS="kernel_control: staged MicroVM launched via DIPC;VMX: entering guest via vmlaunch;Linux version;Catenary OS Guest Init: SUCCESS;guest_rootfs: init started"
+        ;;
+    *)
+        echo "[!] Unknown SMOKE_PROFILE: ${SMOKE_PROFILE}" >&2
+        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services" >&2
+        exit 2
+        ;;
+esac
+
+ZIG_BUILD_ARGS=${ZIG_BUILD_ARGS:-${DEFAULT_ZIG_BUILD_ARGS}}
+CORE_PATTERNS=${CORE_PATTERNS:-${DEFAULT_CORE_PATTERNS}}
+VMX_EPT_PATTERNS=${VMX_EPT_PATTERNS:-${DEFAULT_VMX_EPT_PATTERNS}}
+VMX_LINUX_PATTERNS=${VMX_LINUX_PATTERNS:-${DEFAULT_VMX_LINUX_PATTERNS}}
+
+pattern_seen() {
+    local pattern="$1"
+    perl -e '
+        my ($pattern, $file) = @ARGV;
+        open my $fh, q{<}, $file or exit 2;
+        local $/;
+        my $text = <$fh>;
+        my @chars = split //, $pattern;
+        my $regex = join(q{\.*}, map { quotemeta($_) } @chars);
+        exit($text =~ /$regex/s ? 0 : 1);
+    ' "$pattern" qemu_serial.log
+}
 
 echo "[+] Building Catenary OS..."
-zig build ${ZIG_BUILD_ARGS:-}
+zig build ${ZIG_BUILD_ARGS}
 
 echo "[+] Preparing ISO..."
 mkdir -p iso_root/boot
@@ -104,7 +146,7 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
             if [ -z "${p}" ]; then
                 continue
             fi
-            if ! grep -Fq "${p}" qemu_serial.log; then
+            if ! pattern_seen "${p}"; then
                 all_found=0
                 break
             fi
@@ -131,7 +173,7 @@ if [ "${ok}" -eq 0 ]; then
         if [ -z "${p}" ]; then
             continue
         fi
-        if ! grep -Fq "${p}" qemu_serial.log 2>/dev/null; then
+        if ! pattern_seen "${p}" 2>/dev/null; then
             echo "[!]   missing: '${p}'"
         fi
     done

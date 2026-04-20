@@ -1,3 +1,5 @@
+const lib = @import("lib.zig");
+
 /// configd — OS Configuration Application
 ///
 /// Provides a text-mode UI rendered via windowd onto the kernel framebuffer.
@@ -62,50 +64,12 @@ const DMA_DIPC_SLOT: u64 = DMA_BASE_VA + PAGE_SIZE;
 // Bootstrap descriptor (mirrors service_bootstrap.Descriptor)
 // ---------------------------------------------------------------------------
 
-const BootstrapDescriptor = extern struct {
-    magic: u32,
-    version: u16,
-    descriptor_len: u16,
-    class: u16,
-    service_kind: u16,
-    runtime_mode: u16,
-    _r0: u16,
-    service_id: u32,
-    flags: u32,
-    persistent_trap_vector: u8,
-    _r1: u8,
-    persistent_heartbeat_op: u16,
-    persistent_stop_op: u16,
-    _r2: u16,
-    local_node: [16]u8,
-    dipc_wire_magic: u32,
-    dipc_wire_version: u16,
-    dipc_header_len: u16,
-    dipc_max_payload: u32,
-    reserved_netd_endpoint: u64,
-    reserved_kernel_control_endpoint: u64,
-    reserved_router_endpoint: u64,
-    reserved_storaged_endpoint: u64,
-    reserved_dashd_endpoint: u64,
-    microvm_ingress_magic: u32,
-    microvm_ingress_version: u16,
-    microvm_ingress_len: u16,
-    capability_token: u64,
-};
+const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 // ---------------------------------------------------------------------------
 // Shared DIPC / control protocol constants
 // ---------------------------------------------------------------------------
 
-const DIPC_MAGIC: u32 = 0x44495043; // 'DIPC'
-const DIPC_VERSION: u16 = 1;
-const DIPC_HDR_LEN: u16 = 64;
-
-const CTRL_OP_CREATE_MICROVM: u16 = 6;
-const CTRL_OP_REGISTRY_SYNC: u16 = 18;
-
-// Endpoint IDs (must match identity.zig ReservedEndpoint)
-const EP_KERNEL_CONTROL: u64 = 2;
 const EP_CLUSTERD: u64 = 7;
 const EP_WINDOWD: u64 = 9;
 const EP_CONFIGD: u64 = 10;
@@ -291,47 +255,9 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
 // ---------------------------------------------------------------------------
 
 fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u64) void {
-    const dipc_buf: [*]u8 = ptrFrom([*]u8, DMA_DIPC_SLOT);
-    // Format DIPC header at DMA slot 1
-    // magic
-    dipc_buf[0] = 0x43;
-    dipc_buf[1] = 0x50;
-    dipc_buf[2] = 0x49;
-    dipc_buf[3] = 0x44;
-    // version
-    dipc_buf[4] = 1;
-    dipc_buf[5] = 0;
-    // header_len
-    dipc_buf[6] = 64;
-    dipc_buf[7] = 0;
-    // payload_len = ControlHeader(8) + CreateMicrovmPayload(40) = 48
-    dipc_buf[8] = 48;
-    dipc_buf[9] = 0;
-    dipc_buf[10] = 0;
-    dipc_buf[11] = 0;
-    // auth_tag (will be re-signed by kernel in SYS_SEND_PAGE)
-    @memset(dipc_buf[12..20], 0);
-    // src: local_node + configd endpoint (10)
-    @memcpy(dipc_buf[20..36], &bs.local_node);
-    dipc_buf[36] = @truncate(EP_CONFIGD);
-    @memset(dipc_buf[37..44], 0);
-    // dst: local_node + kernel_control endpoint (2)
-    @memcpy(dipc_buf[44..60], &bs.local_node);
-    dipc_buf[60] = @truncate(EP_KERNEL_CONTROL);
-    @memset(dipc_buf[61..68], 0);
+    const scratch: [*]u8 = ptrFrom([*]u8, DMA_DIPC_SLOT);
+    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
 
-    // ControlHeader at offset 64
-    // op = create_microvm (6), _reserved=0, payload_len=8
-    dipc_buf[64] = @truncate(CTRL_OP_CREATE_MICROVM);
-    dipc_buf[65] = 0;
-    dipc_buf[66] = 0;
-    dipc_buf[67] = 0;
-    dipc_buf[68] = 8;
-    dipc_buf[69] = 0;
-    dipc_buf[70] = 0;
-    dipc_buf[71] = 0;
-
-    // CreateMicrovmPayload at offset 72
     // mem_pages = 256 (1 GiB / 4 KiB = 256 pages for a 1 MiB VM)
     const mem_pages: u32 = 256;
 
@@ -371,46 +297,32 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
         }
     }
 
-    dipc_buf[72] = @truncate(mem_pages & 0xFF);
-    dipc_buf[73] = @truncate((mem_pages >> 8) & 0xFF);
-    dipc_buf[74] = @truncate((mem_pages >> 16) & 0xFF);
-    dipc_buf[75] = @truncate((mem_pages >> 24) & 0xFF);
-    dipc_buf[76] = @truncate(vcpus & 0xFF);
-    dipc_buf[77] = @truncate((vcpus >> 8) & 0xFF);
-    dipc_buf[78] = @truncate((vcpus >> 16) & 0xFF);
-    dipc_buf[79] = @truncate((vcpus >> 24) & 0xFF);
-    dipc_buf[80] = 0;
-    dipc_buf[81] = 0;
-    dipc_buf[82] = 0;
-    dipc_buf[83] = 0;
-    dipc_buf[84] = 0;
-    dipc_buf[85] = 0;
-    dipc_buf[86] = 0;
-    dipc_buf[87] = 0;
-    dipc_buf[88] = 0;
-    dipc_buf[89] = 0;
-    dipc_buf[90] = 0;
-    dipc_buf[91] = 0;
-    dipc_buf[92] = 0;
-    dipc_buf[93] = 0;
-    dipc_buf[94] = 0;
-    dipc_buf[95] = 0;
-    dipc_buf[96] = 0;
-    dipc_buf[97] = 0;
-    dipc_buf[98] = 0;
-    dipc_buf[99] = 0;
-    dipc_buf[100] = 0;
-    dipc_buf[101] = 0;
-    dipc_buf[102] = 0;
-    dipc_buf[103] = 0;
-    dipc_buf[104] = 0;
-    dipc_buf[105] = 0;
-    dipc_buf[106] = 0;
-    dipc_buf[107] = 0;
-    dipc_buf[108] = 0;
-    dipc_buf[109] = 0;
-    dipc_buf[110] = 0;
-    dipc_buf[111] = 0;
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
+        .payload_len = @as(u32, @intCast(@sizeOf(lib.ControlHeader) + @sizeOf(lib.CreateMicrovmPayload))),
+        .auth_tag = 0,
+        .src = .{ .node = local_node, .endpoint = EP_CONFIGD },
+        .dst = .{ .node = local_node, .endpoint = bs.reserved_kernel_control_endpoint },
+    };
+
+    const control: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    control.* = .{
+        .op = .create_microvm,
+        .payload_len = @as(u32, @intCast(@sizeOf(lib.CreateMicrovmPayload))),
+    };
+
+    const payload: *align(1) lib.CreateMicrovmPayload = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
+    payload.* = .{
+        .mem_pages = mem_pages,
+        .vcpus = vcpus,
+        .kernel_phys = bs.linux_bzimage_phys,
+        .kernel_size = bs.linux_bzimage_size,
+        .initramfs_phys = bs.initramfs_phys,
+        .initramfs_size = bs.initramfs_size,
+    };
 
     // The kernel's SYS_SEND_PAGE copies from the DMA phys page, re-signs, and routes.
     _ = syscall(SYS_SEND_PAGE, dipc_phys_slot1, 0, token);
@@ -433,25 +345,12 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
 // Handle an incoming DIPC registry_sync message (updates cluster_nodes table)
 // ---------------------------------------------------------------------------
 
-const RegistrySyncPayload = extern struct {
-    service_id: u32,
-    service_kind: u16,
-    state: u8,
-    _pad: u8,
-};
+const RegistrySyncPayload = lib.RegistrySyncPayload;
 
 fn handleRegistrySync(page_va: u64) void {
-    const DIPC_HDR: usize = 64;
-    const CTRL_HDR: usize = 8;
-    const src_node_off: usize = 20; // src.node within DIPC header
-
-    const page: [*]const u8 = ptrFrom([*]const u8, page_va);
-
-    // Extract source node address from DIPC header
-    var src_node: [16]u8 = undefined;
-    @memcpy(&src_node, page[src_node_off .. src_node_off + 16]);
-
-    const payload: *const RegistrySyncPayload = @ptrCast(@alignCast(&page[DIPC_HDR + CTRL_HDR]));
+    const header: *align(1) const lib.PageHeader = @ptrFromInt(page_va);
+    const payload: *align(1) const RegistrySyncPayload = @ptrFromInt(page_va + lib.DIPC_HEADER_SIZE + lib.CONTROL_HEADER_SIZE);
+    const src_node = header.src.node.bytes;
 
     // Find existing or new slot for this node
     var slot: ?*NodeEntry = null;
@@ -545,10 +444,8 @@ pub export fn umain() noreturn {
         if (page_phys != 0) {
             const recv_va = syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (recv_va != 0) {
-                // Peek at ControlHeader op field (offset 64 = DIPC header size)
-                const page: [*]const u8 = ptrFrom([*]const u8, recv_va);
-                const op: u16 = @as(u16, page[64]) | (@as(u16, page[65]) << 8);
-                if (op == CTRL_OP_REGISTRY_SYNC) {
+                const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+                if (control.op == .registry_sync) {
                     handleRegistrySync(recv_va);
                     drawUi(text_phys, token, bs.local_node);
                 }

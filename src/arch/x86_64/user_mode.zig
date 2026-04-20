@@ -307,10 +307,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             _ = service_registry.serviceIdForCapability(token) orelse return 0;
             const msg = scheduler.receive();
             if (msg) |m| return m;
-            // No message — yield to scheduler so other threads can run.
-            // The INT 0x80 gate cleared IF; re-enable and halt until the
-            // next timer tick triggers schedule().
-            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+            // No message yet. Park the service thread until a sender wakes it
+            // through scheduler.send/sendToService rather than sleeping inside
+            // the syscall handler on the kernel stack.
+            scheduler.get_current_thread().state = .Waiting;
+            scheduler.schedule();
             return 0;
         },
         4 => {
@@ -394,6 +395,21 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const payload6: [*]const u8 = @ptrFromInt(dst_virt + dipc.HEADER_SIZE);
             dst_hdr.auth_tag = dipc.computeAuthTag(dst_hdr.src, dst_hdr.dst, payload6[0..payload_len6]);
             const table6 = @import("../../ipc/manager.zig").endpointTable();
+
+            const identity = @import("../../ipc/identity.zig");
+            const node_config = @import("../../ipc/node_config.zig");
+            if (dipc.Ipv6Addr.eql(dst_hdr.dst.node, node_config.getLocalNode()) and
+                dst_hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control))
+            {
+                const control_handler = @import("../../control/control_handler.zig");
+                control_handler.handleKernelControlPage(hhdm_offset, table6, dst_phys) catch {
+                    pmm.freePage(dst_phys);
+                    return 1;
+                };
+                pmm.freePage(dst_phys);
+                return 0;
+            }
+
             _ = router.routePageWithLocalNode(hhdm_offset, table6, dst_phys) catch {
                 pmm.freePage(dst_phys);
                 return 1;
@@ -508,8 +524,9 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             if (kbd.getRawScancode()) |scancode| {
                 return scancode;
             }
-            // No key — yield so other threads can run.
-            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+            // No key buffered. Yield cooperatively, but return to user mode so
+            // we do not sleep from inside the syscall trap context.
+            scheduler.schedule();
             return 0xFFFFFFFF;
         },
         // op=9: SYS_SERIAL_WRITE — atomically write a user-space buffer to
