@@ -164,6 +164,16 @@ fn pfIsr() callconv(.naked) void {
     );
 }
 
+fn dfIsr() callconv(.naked) void {
+    asm volatile (
+        \\movq 8(%rsp), %rdx
+        \\movq 0(%rsp), %rsi
+        \\movq %cr2, %rcx
+        \\movb $8, %dil
+        \\callq catenary_fatalTrap
+    );
+}
+
 pub fn init() void {
     // Populate IDT and load IDTR *before* remapping the PIC.
     // If PIC remapping were done first, a spurious interrupt arriving before
@@ -177,7 +187,7 @@ pub fn init() void {
         setGate(@as(u8, @intCast(i)), ignoreIsr, 0x8E);
     }
 
-    setGateWithIst(8, genericIsr, 0x8E, 1); // Double Fault — IST1 for dedicated stack
+    setGateWithIst(8, dfIsr, 0x8E, 1); // Double Fault — IST1 for dedicated stack
     setGate(0, deIsr, 0x8E);
     setGate(1, dbIsr, 0x8E);
     setGate(3, user_mode.breakpointIsr, 0xEE);
