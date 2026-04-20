@@ -22,6 +22,7 @@ pub const Thread = struct {
     /// Physical address of this thread's user PML4.
     /// 0 = kernel thread, leave CR3 unchanged.
     user_pml4: u64 = 0,
+    total_tsc: u64 = 0,
 
     pub const State = enum {
         Empty,
@@ -38,10 +39,11 @@ pub const Mailbox = struct {
 };
 
 var threads_pool: [THREAD_TARGET_COUNT]Thread align(16) linksection(".data") = undefined;
-var threads: []Thread = threads_pool[0..THREAD_TARGET_COUNT];
-var current_thread_idx: usize = 0;
+pub var threads: []Thread = threads_pool[0..THREAD_TARGET_COUNT];
+pub var current_thread_idx: usize = 0;
 var next_thread_id: u32 = 1;
 var hhdm_offset: u64 = 0;
+pub var last_tsc_stamp: u64 = 0;
 
 pub fn init(offset: u64) void {
     hhdm_offset = offset;
@@ -53,6 +55,7 @@ pub fn init(offset: u64) void {
     threads[0].state = .Running;
     threads[0].id = 0;
     current_thread_idx = 0;
+    last_tsc_stamp = arch.cpu.rdtsc();
 }
 
 pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootstrap.zig").ServiceKind) !u32 {
@@ -244,20 +247,41 @@ fn vmx_thread_bridge() void {
 
 extern fn switchContext(old_rsp: *u64, new_rsp: u64) void;
 
+var schedule_lock: bool = false;
+
 pub fn schedule() void {
+    if (schedule_lock) return;
+    schedule_lock = true;
+
     const old_idx = current_thread_idx;
+    const old_state = threads[old_idx].state;
     var next_idx = (old_idx + 1) % THREAD_TARGET_COUNT;
     while (threads[next_idx].state != .Ready and next_idx != old_idx) {
         next_idx = (next_idx + 1) % THREAD_TARGET_COUNT;
     }
     if (next_idx == old_idx and threads[old_idx].state != .Ready and threads[old_idx].state != .Running) {
+        schedule_lock = false;
         return; // No one to run
     }
-    if (next_idx == old_idx) return;
+    if (next_idx == old_idx) {
+        schedule_lock = false;
+        return;
+    }
+
+    const now = arch.cpu.rdtsc();
+    threads[old_idx].total_tsc += now -% last_tsc_stamp;
+    last_tsc_stamp = now;
 
     current_thread_idx = next_idx;
-    threads[old_idx].state = .Ready;
+    if (old_state == .Running) {
+        threads[old_idx].state = .Ready;
+    }
     threads[next_idx].state = .Running;
+
+    // Release the reentrancy guard before switchContext because the switch
+    // suspends this call frame — the lock would stay held across the entire
+    // time this thread is not running, blocking all timer-driven scheduling.
+    schedule_lock = false;
 
     switchContext(&threads[old_idx].rsp, threads[next_idx].rsp);
 

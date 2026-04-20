@@ -52,8 +52,10 @@ const type_of_loader_offset: usize = 0x210;
 const cmd_line_ptr_offset: usize = 0x228;
 const ramdisk_image_offset: usize = 0x218;
 const ramdisk_size_offset: usize = 0x21C;
+const heap_end_ptr_offset: usize = 0x224;
 
 pub const default_initrd_gpa: u64 = 0x0800_0000;
+const default_setup_heap_end: u16 = 0xE000;
 const vid_mode_offset: usize = 0x1FA;
 const alt_mem_k_offset: usize = 0x1E0;
 const e820_entries_offset: usize = 0x1E8;
@@ -186,6 +188,7 @@ pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, c
     page[loadflags_offset] |= 1 << 7; // CAN_USE_HEAP
     writeLe32(page[0..], code32_start_offset, @as(u32, @truncate(layout.kernel_load_gpa)));
     writeLe32(page[0..], cmd_line_ptr_offset, @as(u32, @truncate(layout.cmdline_gpa)));
+    writeLe16(page[0..], heap_end_ptr_offset, default_setup_heap_end - 0x0200);
     writeLe16(page[0..], boot_flag_offset, 0xAA55);
     writeLe16(page[0..], vid_mode_offset, 0xFFFF);
     writeLe32(page[0..], alt_mem_k_offset, @as(u32, @truncate((guest_ram_bytes - 0x100000) / 1024)));

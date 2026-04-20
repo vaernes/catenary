@@ -32,6 +32,7 @@ const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48F;
 const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48B;
 const IA32_VMX_TRUE_PROCBASED_CTLS2: u32 = 0x48B;
+const IA32_APIC_BASE: u32 = 0x1B;
 const IA32_FS_BASE: u32 = 0xC0000100;
 const IA32_GS_BASE: u32 = 0xC0000101;
 const IA32_EFER: u32 = 0xC0000080;
@@ -162,6 +163,33 @@ const VMCS_HOST_RIP: u64 = 0x6C16;
 const VMCS_HOST_IA32_PAT: u64 = 0x2C00;
 const VMCS_HOST_IA32_EFER: u64 = 0x2C02;
 
+const LAPIC_MMIO_BASE: u64 = 0xFEE00000;
+const LAPIC_MMIO_SIZE: u64 = 0x1000;
+const LAPIC_REG_WORDS: usize = 0x1000 / 4;
+const APIC_ID_REG: u32 = 0x020;
+const APIC_LVR_REG: u32 = 0x030;
+const APIC_TASKPRI_REG: u32 = 0x080;
+const APIC_EOI_REG: u32 = 0x0B0;
+const APIC_LDR_REG: u32 = 0x0D0;
+const APIC_DFR_REG: u32 = 0x0E0;
+const APIC_SPIV_REG: u32 = 0x0F0;
+const APIC_ESR_REG: u32 = 0x280;
+const APIC_LVTCMCI_REG: u32 = 0x2F0;
+const APIC_ICR_REG: u32 = 0x300;
+const APIC_ICR2_REG: u32 = 0x310;
+const APIC_LVTT_REG: u32 = 0x320;
+const APIC_LVTTHMR_REG: u32 = 0x330;
+const APIC_LVTPC_REG: u32 = 0x340;
+const APIC_LVT0_REG: u32 = 0x350;
+const APIC_LVT1_REG: u32 = 0x360;
+const APIC_LVTERR_REG: u32 = 0x370;
+const APIC_TMICT_REG: u32 = 0x380;
+const APIC_TMCCT_REG: u32 = 0x390;
+const APIC_TDCR_REG: u32 = 0x3E0;
+const APIC_SELF_IPI_REG: u32 = 0x3F0;
+const APIC_VERSION_VALUE: u32 = 0x0005_0014;
+const APIC_LVT_MASKED: u32 = 1 << 16;
+
 const EPT_MEMTYPE_WB: u64 = 6;
 const EPT_TABLE_FLAGS: u64 = 0x7;
 const EPT_LEAF_FLAGS: u64 = 0x7 | (EPT_MEMTYPE_WB << 3);
@@ -199,11 +227,14 @@ const LINUX_DEBUG_EXCEPTION_BITMAP: u32 =
     (@as(u32, 1) << 13) | // #GP
     0; // #PF
 
-const DEFAULT_CMDLINE = "console=ttyS0 nokaslr rdinit=/init";
+const DEFAULT_CMDLINE = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 ignore_loglevel nokaslr noapictimer rdinit=/init";
+const GUEST_BOOT_GDT_GPA: u64 = 0x0000_6000;
+const GUEST_EBDA_SEGMENT: u16 = 0x9FC0;
+const GUEST_BASE_MEMORY_KB: u16 = 639;
 const GUEST_IDENTITY_PD_TABLES: usize = 8; // 8 * 1GiB mapped via 2MiB leaves
 const GUEST_IDENTITY_MAP_BYTES: u64 = @as(u64, GUEST_IDENTITY_PD_TABLES) * 1024 * 1024 * 1024;
 const EPT_PREFAULT_WINDOW_PAGES_DEMO: usize = 512; // 512 * 4KiB = 2MiB
-const EPT_PREFAULT_WINDOW_PAGES_LINUX: usize = 64; // map 64 pages per EPT violation to reduce VMEXIT overhead
+const EPT_PREFAULT_WINDOW_PAGES_LINUX: usize = 512; // map 2 MiB per Linux EPT violation to reduce boot-time VMEXIT churn
 const MAX_GUEST_MAPS: usize = 262144;
 const GUEST_POOL_PAGES: usize = 65536;
 const PREEMPTION_TIMER_INITIAL: u32 = 0x7FFFFFFF;
@@ -225,15 +256,133 @@ var pit_configured: bool = false;
 // -- Interrupt injection state --
 var timer_irq_pending: bool = false;
 var preemption_timer_active: bool = false;
+var guest_apic_base: u64 = 0x0000_0000_FEE0_0900;
+var lapic_regs: [LAPIC_REG_WORDS]u32 = [_]u32{0} ** LAPIC_REG_WORDS;
 // COM1 (ttyS0) IER shadow and THRE IRQ4 pending flag
+var serial_dll: u8 = 0x01;
+var serial_dlm: u8 = 0x00;
 var serial_ier: u8 = 0;
+var serial_fcr: u8 = 0;
+var serial_lcr: u8 = 0x03;
+var serial_mcr: u8 = 0;
+var serial_scr: u8 = 0;
 var serial_irq4_pending: bool = false;
 var timer_inject_count: u64 = 0;
 var timer_exit_count: u64 = 0;
+var unknown_msr_read_logs: u8 = 0;
+var unknown_msr_write_logs: u8 = 0;
 
 // -- Port 0x61 (System Control Port B) emulation --
 var port_61_value: u8 = 0;
 var port_61_reads: u32 = 0;
+
+fn lapicRegIndex(offset: u64) ?usize {
+    if (offset >= LAPIC_MMIO_SIZE or (offset & 0xF) != 0) return null;
+    return @as(usize, @intCast(offset >> 2));
+}
+
+fn lapicWriteRaw(offset: u32, value: u32) void {
+    const idx = lapicRegIndex(@as(u64, offset)) orelse return;
+    lapic_regs[idx] = value;
+}
+
+fn resetLapicState() void {
+    @memset(lapic_regs[0..], 0);
+    lapicWriteRaw(APIC_ID_REG, 0);
+    lapicWriteRaw(APIC_LVR_REG, APIC_VERSION_VALUE);
+    lapicWriteRaw(APIC_TASKPRI_REG, 0);
+    lapicWriteRaw(APIC_DFR_REG, 0xFFFF_FFFF);
+    lapicWriteRaw(APIC_LDR_REG, 0);
+    lapicWriteRaw(APIC_SPIV_REG, 0xFF);
+    lapicWriteRaw(APIC_LVTCMCI_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_LVTT_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_LVTTHMR_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_LVTPC_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_LVT0_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_LVT1_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_LVTERR_REG, APIC_LVT_MASKED);
+    lapicWriteRaw(APIC_ESR_REG, 0);
+    lapicWriteRaw(APIC_ICR_REG, 0);
+    lapicWriteRaw(APIC_ICR2_REG, 0);
+    lapicWriteRaw(APIC_TMICT_REG, 0);
+    lapicWriteRaw(APIC_TMCCT_REG, 0);
+    lapicWriteRaw(APIC_TDCR_REG, 0);
+}
+
+fn lapicRead(offset: u64) u32 {
+    const idx = lapicRegIndex(offset) orelse return 0;
+    return lapic_regs[idx];
+}
+
+fn lapicWrite(offset: u64, value: u32) void {
+    const reg = @as(u32, @intCast(offset));
+    switch (reg) {
+        APIC_ID_REG => lapicWriteRaw(APIC_ID_REG, value & 0xFF00_0000),
+        APIC_LVR_REG => {},
+        APIC_TASKPRI_REG => lapicWriteRaw(APIC_TASKPRI_REG, value & 0xFF),
+        APIC_EOI_REG => {},
+        APIC_LDR_REG => lapicWriteRaw(APIC_LDR_REG, value & 0xFF00_0000),
+        APIC_DFR_REG => lapicWriteRaw(APIC_DFR_REG, value | 0x0FFF_FFFF),
+        APIC_SPIV_REG => lapicWriteRaw(APIC_SPIV_REG, value & 0x3FF),
+        APIC_ESR_REG => lapicWriteRaw(APIC_ESR_REG, 0),
+        APIC_ICR2_REG => lapicWriteRaw(APIC_ICR2_REG, value & 0xFF00_0000),
+        APIC_ICR_REG => lapicWriteRaw(APIC_ICR_REG, value),
+        APIC_LVTCMCI_REG, APIC_LVTT_REG, APIC_LVTTHMR_REG, APIC_LVTPC_REG, APIC_LVT0_REG, APIC_LVT1_REG, APIC_LVTERR_REG => lapicWriteRaw(reg, value),
+        APIC_TMICT_REG => {
+            lapicWriteRaw(APIC_TMICT_REG, value);
+            lapicWriteRaw(APIC_TMCCT_REG, value);
+        },
+        APIC_TDCR_REG => lapicWriteRaw(APIC_TDCR_REG, value & 0xB),
+        APIC_SELF_IPI_REG => {},
+        else => {
+            if (lapicRegIndex(offset) != null) {
+                lapicWriteRaw(reg, value);
+            }
+        },
+    }
+}
+
+fn resetGuestDeviceState() void {
+    pic_master_imr = 0xFF;
+    pic_slave_imr = 0xFF;
+    pic_master_icw_step = 0;
+    pic_slave_icw_step = 0;
+    pic_master_vector_base = 0x20;
+    pic_slave_vector_base = 0x28;
+
+    pit_channel0_reload = 0;
+    pit_channel0_mode = 0;
+    pit_write_lsb_next = true;
+    pit_reload_low = 0;
+    pit_configured = false;
+
+    timer_irq_pending = false;
+    preemption_timer_active = false;
+    guest_apic_base = 0x0000_0000_FEE0_0900;
+    resetLapicState();
+
+    serial_dll = 0x01;
+    serial_dlm = 0x00;
+    serial_ier = 0;
+    serial_fcr = 0;
+    serial_lcr = 0x03;
+    serial_mcr = 0;
+    serial_scr = 0;
+    serial_irq4_pending = false;
+
+    timer_inject_count = 0;
+    timer_exit_count = 0;
+    unknown_msr_read_logs = 0;
+    unknown_msr_write_logs = 0;
+
+    port_61_value = 0;
+    port_61_reads = 0;
+
+    vmexit_count = 0;
+    vmx_start_tsc = 0;
+    ept_violation_count = 0;
+    guest_linux_entry_active = false;
+}
 
 fn translateHostVirtToPhys(virt: u64) ?u64 {
     return host_paging.translate(vmx_hhdm_offset, virt);
@@ -269,6 +418,7 @@ const VMX_USE_EPT: bool = true;
 
 const VmxError = error{
     Unsupported,
+    VmxUnsupported,
     FeatureControlDenied,
     OutOfMemory,
     VmxonFailed,
@@ -281,6 +431,7 @@ const VmxError = error{
     GuestTooLarge,
     GuestMapOverflow,
     VmlaunchFailed,
+    VmresumeFailed,
 };
 
 const GuestPageMap = struct {
@@ -742,6 +893,26 @@ fn guestPagePtr(gpa: u64) ?[*]u8 {
     return @ptrFromInt(hpa + vmx_hhdm_offset);
 }
 
+fn seedGuestLowMemoryPage() VmxError!void {
+    const low_hpa = try ensureGuestPage(0);
+    const low: [*]u8 = @ptrFromInt(low_hpa + vmx_hhdm_offset);
+
+    // Seed the BIOS Data Area with the conventional memory / EBDA view that
+    // matches the reserved low-memory hole we advertise via E820.
+    std.mem.writeInt(u16, low[0x40E..0x410], GUEST_EBDA_SEGMENT, .little);
+    std.mem.writeInt(u16, low[0x413..0x415], GUEST_BASE_MEMORY_KB, .little);
+}
+
+fn buildGuestBootGdt() VmxError!void {
+    const gdt_hpa = try ensureGuestPage(GUEST_BOOT_GDT_GPA);
+    const gdt_page: [*]u8 = @ptrFromInt(gdt_hpa + vmx_hhdm_offset);
+    const gdt_entries = @as(*[512]u64, @ptrCast(@alignCast(gdt_page)));
+
+    @memset(gdt_entries, 0);
+    gdt_entries[2] = 0x00af9a000000ffff; // __BOOT_CS selector 0x10
+    gdt_entries[3] = 0x00af92000000ffff; // __BOOT_DS selector 0x18
+}
+
 fn copyIntoGuest(gpa_base: u64, data: []const u8) VmxError!void {
     var offset: usize = 0;
     while (offset < data.len) {
@@ -793,6 +964,8 @@ fn stageFallbackGuest(layout: linux_boot.LaunchLayout) VmxError!void {
     serialWrite("VMX: stage S3\n");
 
     // Required pages for boot params, cmdline, stack, and guest paging roots.
+    try seedGuestLowMemoryPage();
+    try buildGuestBootGdt();
     _ = try ensureGuestPage(layout.boot_params_gpa);
     _ = try ensureGuestPage(layout.cmdline_gpa);
     _ = try ensureGuestPage(layout.guest_stack_top_gpa - pmm.PAGE_SIZE);
@@ -814,6 +987,8 @@ fn stageFallbackGuest(layout: linux_boot.LaunchLayout) VmxError!void {
 fn stageParsedGuest(parsed: *const linux_boot.ParsedBzImage, layout: linux_boot.LaunchLayout) VmxError!void {
     serialWrite("VMX: stage S3\n");
 
+    try seedGuestLowMemoryPage();
+    try buildGuestBootGdt();
     _ = try ensureGuestPage(layout.boot_params_gpa);
     _ = try ensureGuestPage(layout.cmdline_gpa);
     _ = try ensureGuestPage(layout.guest_stack_top_gpa - pmm.PAGE_SIZE);
@@ -1031,9 +1206,10 @@ fn loadHostState() VmxError!void {
 fn loadGuestState(launch: *const GuestLaunchState) VmxError!void {
     serialWrite("VMX: guest G0\n");
     const guest_cr0 = sanitizeCrValue(cpu.readCr0(), IA32_VMX_CR0_FIXED0, IA32_VMX_CR0_FIXED1);
-    const linux_boot_cr4_requested: u64 = (@as(u64, 1) << 5) | (@as(u64, 1) << 6);
-    const guest_cr4 = sanitizeCrValue(cpu.readCr4(), IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1);
-    const guest_cr4_shadow = if (guest_linux_entry_active) linux_boot_cr4_requested else guest_cr4;
+    const linux_boot_cr4_requested: u64 = @as(u64, 1) << 5; // CR4.PAE required for IA-32e paging
+    const guest_cr4_requested = if (guest_linux_entry_active) linux_boot_cr4_requested else cpu.readCr4();
+    const guest_cr4 = sanitizeCrValue(guest_cr4_requested, IA32_VMX_CR4_FIXED0, IA32_VMX_CR4_FIXED1);
+    const guest_cr4_shadow = guest_cr4;
     const guest_cr4_mask = if (guest_linux_entry_active) guest_cr4 & ~linux_boot_cr4_requested else 0;
     const host_efer = cpu.rdmsr(IA32_EFER);
     const guest_efer = host_efer | (1 << 8) | (1 << 10);
@@ -1046,12 +1222,14 @@ fn loadGuestState(launch: *const GuestLaunchState) VmxError!void {
     try vmwriteChecked(VMCS_CTRL_CR0_READ_SHADOW, guest_cr0);
     try vmwriteChecked(VMCS_CTRL_CR4_READ_SHADOW, guest_cr4_shadow);
 
-    try vmwriteChecked(VMCS_GUEST_ES_SELECTOR, 0x10);
-    try vmwriteChecked(VMCS_GUEST_CS_SELECTOR, 0x08);
-    try vmwriteChecked(VMCS_GUEST_SS_SELECTOR, 0x10);
-    try vmwriteChecked(VMCS_GUEST_DS_SELECTOR, 0x10);
-    try vmwriteChecked(VMCS_GUEST_FS_SELECTOR, 0x10);
-    try vmwriteChecked(VMCS_GUEST_GS_SELECTOR, 0x10);
+    // Linux 64-bit boot protocol expects __BOOT_CS=0x10 and __BOOT_DS=0x18
+    // with flat 4 GiB segment semantics at entry.
+    try vmwriteChecked(VMCS_GUEST_ES_SELECTOR, 0x18);
+    try vmwriteChecked(VMCS_GUEST_CS_SELECTOR, 0x10);
+    try vmwriteChecked(VMCS_GUEST_SS_SELECTOR, 0x18);
+    try vmwriteChecked(VMCS_GUEST_DS_SELECTOR, 0x18);
+    try vmwriteChecked(VMCS_GUEST_FS_SELECTOR, 0x18);
+    try vmwriteChecked(VMCS_GUEST_GS_SELECTOR, 0x18);
     try vmwriteChecked(VMCS_GUEST_LDTR_SELECTOR, 0);
     try vmwriteChecked(VMCS_GUEST_TR_SELECTOR, cpu.readTr() & 0xFFF8);
 
@@ -1063,7 +1241,7 @@ fn loadGuestState(launch: *const GuestLaunchState) VmxError!void {
     try vmwriteChecked(VMCS_GUEST_GS_LIMIT, 0xFFFF);
     try vmwriteChecked(VMCS_GUEST_LDTR_LIMIT, 0);
     try vmwriteChecked(VMCS_GUEST_TR_LIMIT, 0x67);
-    try vmwriteChecked(VMCS_GUEST_GDTR_LIMIT, 0xFFFF);
+    try vmwriteChecked(VMCS_GUEST_GDTR_LIMIT, 0x1F);
     try vmwriteChecked(VMCS_GUEST_IDTR_LIMIT, 0xFFFF);
 
     try vmwriteChecked(VMCS_GUEST_ES_ACCESS_RIGHTS, 0xC093);
@@ -1086,7 +1264,7 @@ fn loadGuestState(launch: *const GuestLaunchState) VmxError!void {
     try vmwriteChecked(VMCS_GUEST_GS_BASE, 0);
     try vmwriteChecked(VMCS_GUEST_LDTR_BASE, 0);
     try vmwriteChecked(VMCS_GUEST_TR_BASE, 0);
-    try vmwriteChecked(VMCS_GUEST_GDTR_BASE, 0);
+    try vmwriteChecked(VMCS_GUEST_GDTR_BASE, GUEST_BOOT_GDT_GPA);
     try vmwriteChecked(VMCS_GUEST_IDTR_BASE, 0);
     try vmwriteChecked(VMCS_GUEST_DR7, 0x400);
     try vmwriteChecked(VMCS_GUEST_RSP, launch.guest_rsp);
@@ -1117,6 +1295,8 @@ fn handleCpuid(regs: *GuestRegs) void {
     // to use paravirtualized clocks or MSRs that we don't emulate.
     if (leaf == 1) {
         out.ecx &= ~@as(u32, 1 << 31); // Clear HYPERVISOR bit
+        out.ecx &= ~@as(u32, 1 << 21); // Hide x2APIC; only xAPIC-style behavior is emulated.
+        out.ecx &= ~@as(u32, 1 << 24); // Hide TSC-deadline timer; LAPIC deadline MSRs are not emulated.
     } else if (leaf >= 0x40000000 and leaf <= 0x400000FF) {
         out.eax = 0;
         out.ebx = 0;
@@ -1134,8 +1314,20 @@ fn handleCpuid(regs: *GuestRegs) void {
 fn handleMsrRead(regs: *GuestRegs) void {
     const msr = @as(u32, @truncate(regs.rcx));
     const value = switch (msr) {
+        IA32_APIC_BASE => guest_apic_base,
         IA32_EFER, IA32_PAT, IA32_FS_BASE, IA32_GS_BASE => cpu.rdmsr(msr),
-        else => 0,
+        else => blk: {
+            if (guest_linux_entry_active and unknown_msr_read_logs < 8) {
+                const rip = vmread(VMCS_GUEST_RIP) orelse 0;
+                serialWrite("VMX: unhandled msr-read msr=0x");
+                printHex(msr);
+                serialWrite(" rip=0x");
+                printHex(rip);
+                serialWrite("\n");
+                unknown_msr_read_logs += 1;
+            }
+            break :blk 0;
+        },
     };
     regs.rax = value & 0xFFFF_FFFF;
     regs.rdx = value >> 32;
@@ -1146,8 +1338,23 @@ fn handleMsrWrite(regs: *GuestRegs) void {
     const msr = @as(u32, @truncate(regs.rcx));
     const value = (regs.rdx << 32) | (regs.rax & 0xFFFF_FFFF);
     switch (msr) {
+        IA32_APIC_BASE => {
+            guest_apic_base = (value & 0x0000_0000_FFFF_FD00) | 0x0000_0000_FEE0_0000;
+        },
         IA32_FS_BASE, IA32_GS_BASE, IA32_EFER => cpu.wrmsr(msr, value),
-        else => {},
+        else => {
+            if (guest_linux_entry_active and unknown_msr_write_logs < 8) {
+                const rip = vmread(VMCS_GUEST_RIP) orelse 0;
+                serialWrite("VMX: unhandled msr-write msr=0x");
+                printHex(msr);
+                serialWrite(" val=0x");
+                printHex(value);
+                serialWrite(" rip=0x");
+                printHex(rip);
+                serialWrite("\n");
+                unknown_msr_write_logs += 1;
+            }
+        },
     }
     advanceGuestRip();
 }
@@ -1156,6 +1363,7 @@ fn handleIoExit(regs: *GuestRegs) void {
     const qualification = vmread(VMCS_EXIT_QUALIFICATION) orelse 0;
     const port = @as(u16, @truncate(qualification >> 16));
     const is_in = (qualification & 8) != 0;
+    const serial_dlab = (serial_lcr & 0x80) != 0;
 
     if (port == 0x20 or port == 0x21 or port == 0xA0 or port == 0xA1) {
         handlePicIo(port, is_in, regs);
@@ -1163,30 +1371,55 @@ fn handleIoExit(regs: *GuestRegs) void {
         handlePitIo(port, is_in, regs);
     } else if (port == 0x61) {
         handlePort61(is_in, regs);
-    } else if (port == 0x3F8 and !is_in) {
-        // COM1 TX: forward char to host serial
-        const c = @as(u8, @truncate(regs.rax));
-        const s = [_]u8{c};
-        serialWrite(&s);
-    } else if (port == 0x3F9) {
+    } else if (port == 0x3F8) {
         if (is_in) {
-            // COM1 IER read
-            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | serial_ier;
+            const value: u8 = if (serial_dlab) serial_dll else 0;
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | value;
         } else {
-            // COM1 IER write - track THRE interrupt enable (bit 1)
-            serial_ier = @as(u8, @truncate(regs.rax));
-            if ((serial_ier & 0x02) != 0 and (pic_master_imr & 0x10) == 0) {
-                serial_irq4_pending = true;
-            } else if ((serial_ier & 0x02) == 0) {
-                serial_irq4_pending = false;
+            const value = @as(u8, @truncate(regs.rax));
+            if (serial_dlab) {
+                serial_dll = value;
+            } else {
+                const s = [_]u8{value};
+                serialWrite(&s);
             }
         }
-    } else if (port == 0x3FA and is_in) {
-        // COM1 IIR: return THRE interrupt (0x02) when THRI enabled, else no interrupt (0x01)
-        if ((serial_ier & 0x02) != 0) {
-            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x02;
+    } else if (port == 0x3F9) {
+        if (is_in) {
+            const value: u8 = if (serial_dlab) serial_dlm else serial_ier;
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | value;
         } else {
-            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0x01;
+            const value = @as(u8, @truncate(regs.rax));
+            if (serial_dlab) {
+                serial_dlm = value;
+            } else {
+                serial_ier = value;
+                if ((serial_ier & 0x02) != 0 and (pic_master_imr & 0x10) == 0) {
+                    serial_irq4_pending = true;
+                } else if ((serial_ier & 0x02) == 0) {
+                    serial_irq4_pending = false;
+                }
+            }
+        }
+    } else if (port == 0x3FA) {
+        if (is_in) {
+            var value: u8 = if ((serial_ier & 0x02) != 0) 0x02 else 0x01;
+            if ((serial_fcr & 0x01) != 0) value |= 0xC0;
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | value;
+        } else {
+            serial_fcr = @as(u8, @truncate(regs.rax));
+        }
+    } else if (port == 0x3FB) {
+        if (is_in) {
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | serial_lcr;
+        } else {
+            serial_lcr = @as(u8, @truncate(regs.rax));
+        }
+    } else if (port == 0x3FC) {
+        if (is_in) {
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | serial_mcr;
+        } else {
+            serial_mcr = @as(u8, @truncate(regs.rax));
         }
     } else if (port == 0x3FD and is_in) {
         // COM1 LSR (Line Status Register) - THRE+TEMT always set (no physical TX FIFO)
@@ -1194,6 +1427,12 @@ fn handleIoExit(regs: *GuestRegs) void {
     } else if (port == 0x3FE and is_in) {
         // COM1 MSR - report DCD+DSR+CTS asserted (no delta bits)
         regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | 0xB0;
+    } else if (port == 0x3FF) {
+        if (is_in) {
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | serial_scr;
+        } else {
+            serial_scr = @as(u8, @truncate(regs.rax));
+        }
     } else if (is_in) {
         // Default 0 for unhandled IN
         regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00);
@@ -1288,7 +1527,7 @@ fn handleEptViolation(regs: *GuestRegs) bool {
         if (translateGlaToGpa(rip)) |rip_gpa| {
             if (guestPagePtr(rip_gpa & 0x000F_FFFF_FFFF_F000)) |page| {
                 const rip_off = rip_gpa & 0xFFF;
-                const rip_ptr = page[rip_off..].ptr;
+                const rip_ptr: [*]const u8 = page + rip_off;
                 val = decodeMmioWrite(rip_ptr, regs);
             }
         }
@@ -1316,9 +1555,14 @@ fn handleEptViolation(regs: *GuestRegs) bool {
         advanceGuestRip();
         return true;
     }
-    if (gpa >= 0xFEE00000 and gpa < 0xFEE01000) {
-        const offset = gpa - 0xFEE00000;
-        if (offset == 0x300 or offset == 0x310) {
+    if (gpa >= LAPIC_MMIO_BASE and gpa < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE) {
+        const offset = gpa - LAPIC_MMIO_BASE;
+        if (is_write) {
+            lapicWrite(offset, val);
+        } else {
+            regs.rax = lapicRead(offset);
+        }
+        if (offset == APIC_ICR_REG or offset == APIC_ICR2_REG) {
             if (is_write) {
                 serialWrite("VMX: LAPIC ICR write val=0x");
                 printHex(val);
@@ -1908,6 +2152,7 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
     vmexit_count += 1;
     const reason = raw_reason & 0xFFFF;
     const is_spam = reason == VMEXIT_REASON_EPT_VIOLATION or
+        reason == VMEXIT_REASON_EXTERNAL_INTERRUPT or
         reason == VMEXIT_REASON_XSETBV or
         reason == VMEXIT_REASON_CPUID or
         reason == VMEXIT_REASON_MSR_READ or
@@ -1958,8 +2203,10 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
             // the PIC master and yield to the Catenary scheduler so that Ring-3
             // services continue to make progress alongside the guest.
             cpu.outb(0x20, 0x20); // EOI to PIC master
-            const scheduler = @import("../../kernel/scheduler.zig");
-            scheduler.schedule();
+            if (build_options.services_active) {
+                const scheduler = @import("../../kernel/scheduler.zig");
+                scheduler.schedule();
+            }
             return true;
         },
         VMEXIT_REASON_XSETBV => {
@@ -2169,12 +2416,14 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
 
     serialWrite("vmx: global vmxon active\n");
 
-    if (microvm_registry.create(GUEST_POOL_PAGES)) |id| {
+    if (microvm_registry.create(GUEST_POOL_PAGES, 1, 0, 0, 0, 0)) |id| {
         current_instance_id = id;
     } else {
         serialWrite("VMX: failed to create microvm instance\n");
         return error.OutOfMemory;
     }
+
+    resetGuestDeviceState();
 
     stageLinuxGuest() catch {
         serialWrite("VMX: stage failed\n");
@@ -2182,7 +2431,7 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
     };
 
     const scheduler = @import("../../kernel/scheduler.zig");
-    _ = scheduler.spawnWithVmx(null, true, current_instance_id.?) catch {
+    _ = scheduler.spawnWithVmx(null, true, current_instance_id.?, 0) catch {
         serialWrite("VMX: failed to spawn vmx thread\n");
     };
 }

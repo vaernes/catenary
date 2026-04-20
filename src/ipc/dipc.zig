@@ -151,6 +151,7 @@ pub fn checkedPayloadSliceFromPage(hhdm_offset: u64, page_phys: u64) ?[]const u8
 pub fn payloadFromPage(hhdm_offset: u64, page_phys: u64) []const u8 {
     const hdr = headerFromPage(hhdm_offset, page_phys);
     const payload_len = @as(usize, hdr.payload_len);
+    if (payload_len > MAX_PAYLOAD) return &[_]u8{};
     const payload_ptr: [*]const u8 = @ptrFromInt(page_phys + hhdm_offset + HEADER_SIZE);
     return payload_ptr[0..payload_len];
 }

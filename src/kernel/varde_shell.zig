@@ -33,6 +33,8 @@ const LSR_TX_EMPTY: u8 = 1 << 5;
 var cmd_buf: [128]u8 = undefined;
 var cmd_len: usize = 0;
 var prompt_needed: bool = true;
+/// Telnet IAC state machine: number of bytes still to skip.
+var iac_skip: u8 = 0;
 
 pub fn init() void {
     cpu.outb(COM2_DATA + 1, 0x00); // Disable all interrupts
@@ -45,7 +47,8 @@ pub fn init() void {
 }
 
 inline fn rxReady() bool {
-    return (cpu.inb(COM2_LSR) & LSR_DATA_READY) != 0;
+    const lsr = cpu.inb(COM2_LSR);
+    return (lsr & LSR_DATA_READY) != 0 and lsr != 0xFF;
 }
 
 inline fn txReady() bool {
@@ -110,6 +113,7 @@ fn cmdHelp() void {
     write("The load-bearing span is secure.\r\n");
     write("  help     — this message\r\n");
     write("  status   — kernel phase and hardening\r\n");
+    write("  top      — active process threads\r\n");
     write("  services — service registry slots\r\n");
     write("  vms      — list active MicroVM instances\r\n");
     write("  memory   — PMM page count\r\n");
@@ -182,9 +186,71 @@ fn cmdMemory() void {
     write("  (use 'status' for full kernel info)\r\n");
 }
 
+fn cmdTop() void {
+    const scheduler = @import("scheduler.zig");
+    const arch = @import("../arch.zig");
+
+    write("\r\n=== THREAD TIME (TOP) ===\r\n");
+    write("TID  SID  VMID State   Cpu   Ticks\r\n");
+    write("--------------------------------------\r\n");
+
+    // We read current TSC just once for the snapshot
+    const now = arch.cpu.rdtsc();
+    var sum: u64 = 0;
+
+    // Compute total time first
+    for (scheduler.threads) |*t| {
+        if (t.state == .Empty) continue;
+        var tsc = t.total_tsc;
+        if (t.state == .Running) {
+            if (now > scheduler.last_tsc_stamp) {
+                tsc += (now - scheduler.last_tsc_stamp);
+            }
+        }
+        sum += tsc;
+    }
+
+    if (sum == 0) sum = 1;
+
+    for (scheduler.threads) |*t| {
+        if (t.state == .Empty) continue;
+
+        var tsc = t.total_tsc;
+        if (t.state == .Running) {
+            if (now > scheduler.last_tsc_stamp) {
+                tsc += (now - scheduler.last_tsc_stamp);
+            }
+        }
+
+        const pct = (tsc * 100) / sum;
+
+        writeDec(t.id);
+        write("\t");
+        writeDec(t.sid);
+        write("\t");
+        writeDec(t.vmid);
+        write("\t");
+
+        switch (t.state) {
+            .Running => write("Run  "),
+            .Ready => write("Rdy  "),
+            .Waiting => write("Wait "),
+            .Empty => write("Unk  "),
+        }
+        write("\t");
+
+        writeDec(pct);
+        write("%\t");
+        writeDec(tsc);
+        write("\r\n");
+    }
+}
+
 fn dispatch(cmd: []const u8) void {
     if (strEq(cmd, "help")) {
         cmdHelp();
+    } else if (strEq(cmd, "top")) {
+        cmdTop();
     } else if (strEq(cmd, "status")) {
         cmdStatus();
     } else if (strEq(cmd, "services")) {
@@ -219,17 +285,28 @@ pub fn poll() void {
         printPrompt();
     }
 
-    if (rxReady()) {
+    while (rxReady()) {
         const c = cpu.inb(COM2_DATA);
         handleChar(c);
     }
 
-    if (kbd.getChar()) |c| {
+    while (kbd.getChar()) |c| {
         handleChar(c);
     }
 }
 
 fn handleChar(c: u8) void {
+    // Telnet IAC filtering: skip negotiation sequences (0xFF CMD OPT).
+    if (iac_skip > 0) {
+        iac_skip -= 1;
+        return;
+    }
+    if (c == 0xFF) {
+        // IAC byte — skip this and the next 2 bytes (CMD + OPTION).
+        iac_skip = 2;
+        return;
+    }
+
     if (c == '\r' or c == '\n') {
         write("\r\n");
         dispatch(cmd_buf[0..cmd_len]);

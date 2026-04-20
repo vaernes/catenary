@@ -420,17 +420,19 @@ pub export fn _kernel_main() callconv(.c) noreturn {
 
     bootLog("Spawning threads...\n");
     traceByte('p');
-    thread_a_id = scheduler.spawn(threadA) catch |err| {
-        bootLog("Spawn A failed: ");
-        bootLog(@errorName(err));
-        bootLog("\n");
-        while (true) arch.cpu.halt();
-    };
-    _ = scheduler.spawn(threadB) catch |err| {
-        bootLog("Spawn B failed: ");
-        bootLog(@errorName(err));
-        bootLog("\n");
-    };
+    if (!build_options.vmm_active) {
+        thread_a_id = scheduler.spawn(threadA) catch |err| {
+            bootLog("Spawn A failed: ");
+            bootLog(@errorName(err));
+            bootLog("\n");
+            while (true) arch.cpu.halt();
+        };
+        _ = scheduler.spawn(threadB) catch |err| {
+            bootLog("Spawn B failed: ");
+            bootLog(@errorName(err));
+            bootLog("\n");
+        };
+    }
 
     if (!timer_initialized_early) {
         timer.init();

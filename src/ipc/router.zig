@@ -99,7 +99,7 @@ test "routePage rejects invalid header" {
         .dst = .{ .node = dipc.Ipv6Addr.loopback(), .endpoint = 2 },
     };
 
-    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, null, @intFromPtr(&page));
+    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
     try std.testing.expectError(error.BadHeader, res);
 }
 
@@ -110,7 +110,7 @@ test "routePage local endpoint not found" {
     var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
     _ = makeTestHeader(&page, dipc.Ipv6Addr.loopback(), dipc.Ipv6Addr.loopback(), 1234);
 
-    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, null, @intFromPtr(&page));
+    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
     try std.testing.expectError(error.NoRoute, res);
 }
 
@@ -124,7 +124,7 @@ test "routePage remote requires net daemon" {
     var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
     _ = makeTestHeader(&page, dipc.Ipv6Addr.loopback(), remote, 3);
 
-    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, null, @intFromPtr(&page));
+    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
     try std.testing.expectError(error.NoNetDaemon, res);
 }
 
@@ -139,7 +139,7 @@ test "routePage queues for microvm" {
     var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
     _ = makeTestHeader(&page, dipc.Ipv6Addr.loopback(), dipc.Ipv6Addr.loopback(), endpoint);
 
-    const result = try routePage(0, dipc.Ipv6Addr.loopback(), &table, null, @intFromPtr(&page));
+    const result = try routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
     try std.testing.expectEqual(RouteResult.QueuedForMicrovm, result);
 
     const queued = microvm_bridge.dequeue() orelse return error.TestUnexpectedResult;
@@ -164,10 +164,10 @@ test "routePage reports busy when microvm queue full" {
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         _ = makeTestHeader(&pages[i].bytes, dipc.Ipv6Addr.loopback(), dipc.Ipv6Addr.loopback(), endpoint);
-        _ = try routePage(0, dipc.Ipv6Addr.loopback(), &table, null, @intFromPtr(&pages[i].bytes));
+        _ = try routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&pages[i].bytes));
     }
 
     _ = makeTestHeader(&pages[8].bytes, dipc.Ipv6Addr.loopback(), dipc.Ipv6Addr.loopback(), endpoint);
-    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, null, @intFromPtr(&pages[8].bytes));
+    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&pages[8].bytes));
     try std.testing.expectError(error.Busy, res);
 }

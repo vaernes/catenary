@@ -33,7 +33,7 @@ pub const Instance = struct {
     kernel_size: u64 = 0,
     initramfs_phys: u64 = 0,
     initramfs_size: u64 = 0,
-    vmcs_phys: [8]?u64 = [_]?u64{null} ** 8,
+    vmcs_phys: ?u64 = null,
     ept_pml4_phys: ?u64 = null,
     /// Host-physical address of the guest-specific page pool.
     pool_phys: ?u64 = null,

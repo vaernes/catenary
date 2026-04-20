@@ -137,6 +137,10 @@ fn printHex(n: u64) void {
     }
 }
 
+inline fn clearSmapAccessIfActive() void {
+    if ((cpu.readCr4() & (1 << 21)) != 0) cpu.clac();
+}
+
 pub export fn userModeBreakpointBridge(status: u64, arg0: u64, rip: u64) void {
     _ = status;
     _ = arg0;
@@ -147,6 +151,7 @@ pub export fn userModeBreakpointBridge(status: u64, arg0: u64, rip: u64) void {
 }
 
 pub export fn userModeGpBridge(error_code: u64, rip: u64, cs: u64, flags: u64, rsp: u64, ss: u64) void {
+    clearSmapAccessIfActive();
     serialWrite("\n[GPF] err=");
     printHex(error_code);
     serialWrite(" rip=");
@@ -188,10 +193,15 @@ pub export fn userModeGpBridge(error_code: u64, rip: u64, cs: u64, flags: u64, r
     current_user_state.demo_status = .general_protection;
     current_user_state.demo_error_code = error_code;
     current_user_state.demo_fault_rip = rip;
+
+    // Ring-3 fault: park the thread to prevent an infinite fault loop.
+    const t_gp = scheduler.get_current_thread();
+    t_gp.state = .Waiting;
+    scheduler.schedule();
 }
 
 pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, flags: u64, rsp: u64, ss: u64) void {
-    _ = cs;
+    clearSmapAccessIfActive();
     _ = flags;
     _ = rsp;
     _ = ss;
@@ -213,6 +223,13 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
     serialWrite(" rip=");
     printHex(rip);
     serialWrite("\n");
+
+    // If Ring-3 fault, park the thread to prevent an infinite fault loop.
+    if ((cs & 0x3) != 0) {
+        const t_pf = scheduler.get_current_thread();
+        t_pf.state = .Waiting;
+        scheduler.schedule();
+    }
 }
 
 pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, token: u64) u64 {
@@ -503,11 +520,17 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const ptr = arg0;
             const len = arg1;
             if (ptr < 0x0000_8000_0000_0000 and len <= 4096 and ptr +% len <= 0x0000_8000_0000_0000) {
+                // If SMAP is active, temporarily allow supervisor access
+                // to user pages. Check CR4.SMAP (bit 21) at runtime since
+                // stac/clac #UD on CPUs without SMAP support.
+                const smap_active = (cpu.readCr4() & (1 << 21)) != 0;
+                if (smap_active) cpu.stac();
                 const buf: [*]const u8 = @ptrFromInt(ptr);
                 var j: usize = 0;
                 while (j < len) : (j += 1) {
                     serialByte(buf[j]);
                 }
+                if (smap_active) cpu.clac();
             }
             return 0;
         },

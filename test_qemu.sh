@@ -74,12 +74,36 @@ trap cleanup EXIT
 
 echo "[+] Waiting for all milestones (timeout ${TIMEOUT_SECS}s)..."
 ok=0
-core_ok=1
-IFS=';' read -r -a all_patterns <<< "${CORE_PATTERNS}"
+required_patterns=()
+
+if [ -n "${CORE_PATTERNS}" ]; then
+    IFS=';' read -r -a core_patterns <<< "${CORE_PATTERNS}"
+    required_patterns+=("${core_patterns[@]}")
+else
+    core_patterns=()
+fi
+
+if [ -n "${VMX_EPT_PATTERNS}" ]; then
+    IFS=';' read -r -a vmx_patterns <<< "${VMX_EPT_PATTERNS}"
+    required_patterns+=("${vmx_patterns[@]}")
+else
+    vmx_patterns=()
+fi
+
+if [ -n "${VMX_LINUX_PATTERNS}" ]; then
+    IFS=';' read -r -a linux_patterns <<< "${VMX_LINUX_PATTERNS}"
+    required_patterns+=("${linux_patterns[@]}")
+else
+    linux_patterns=()
+fi
+
 for ((i=0; i<${TIMEOUT_SECS}; i++)); do
     if [ -f qemu_serial.log ]; then
         all_found=1
-        for p in "${all_patterns[@]}"; do
+        for p in "${required_patterns[@]}"; do
+            if [ -z "${p}" ]; then
+                continue
+            fi
             if ! grep -Fq "${p}" qemu_serial.log; then
                 all_found=0
                 break
@@ -97,34 +121,16 @@ echo "[+] Serial log (tail):"
 tail -n 200 qemu_serial.log || true
 
 if [ "${ok}" -eq 1 ]; then
-    if [ -n "${VMX_EPT_PATTERNS}" ]; then
-        IFS=';' read -r -a vmx_patterns <<< "${VMX_EPT_PATTERNS}"
-        for pattern in "${vmx_patterns[@]}"; do
-            if ! grep -Fq "${pattern}" qemu_serial.log; then
-                echo "[!] SMOKE FAIL: missing VMX/EPT milestone '${pattern}'"
-                core_ok=0
-            fi
-        done
-    fi
-    if [ -n "${VMX_LINUX_PATTERNS}" ]; then
-        IFS=';' read -r -a linux_patterns <<< "${VMX_LINUX_PATTERNS}"
-        for pattern in "${linux_patterns[@]}"; do
-            if ! grep -Fq "${pattern}" qemu_serial.log; then
-                echo "[!] SMOKE FAIL: missing Linux guest milestone '${pattern}'"
-                core_ok=0
-            fi
-        done
-    fi
-fi
-
-if [ "${ok}" -eq 1 ] && [ "${core_ok}" -eq 1 ]; then
     echo "[+] SMOKE PASS: observed guest and core milestones"
     exit 0
 fi
 
 if [ "${ok}" -eq 0 ]; then
     echo "[!] SMOKE FAIL: not all milestones observed within ${TIMEOUT_SECS}s"
-    for p in "${all_patterns[@]}"; do
+    for p in "${required_patterns[@]}"; do
+        if [ -z "${p}" ]; then
+            continue
+        fi
         if ! grep -Fq "${p}" qemu_serial.log 2>/dev/null; then
             echo "[!]   missing: '${p}'"
         fi

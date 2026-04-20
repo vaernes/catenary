@@ -113,7 +113,7 @@ pub fn handleKernelControlPage(
             // Create response DIPC page
             const table_const: *const endpoint_table.EndpointTable = table;
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&value));
-            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, null, msg_page);
+            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
         .pci_write_config => {
             const sr = @import("../services/service_registry.zig");
@@ -152,7 +152,7 @@ pub fn handleKernelControlPage(
 
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
             const table_const: *const endpoint_table.EndpointTable = table;
-            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, null, msg_page);
+            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
         .phys_free => {
             const sr = @import("../services/service_registry.zig");
@@ -204,13 +204,7 @@ pub fn handleKernelControlPage(
             if (microvm_registry.create(p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
                 const serialWrite = @import("../kernel/fb.zig").serialWrite;
                 serialWrite("configd: MicroVM created via DIPC\n");
-
-                // STUB: We launch it here for now to simulate the configd/clusterd flow
-                // This replaces the static init() from configd.zig
-                const vmx = @import("../arch/x86_64/vmx.zig");
-                vmx.launchFromRegistry(id) catch {
-                    serialWrite("configd: VMX launch failed\n");
-                };
+                _ = id;
             } else {
                 return error.BadPayload;
             }
@@ -219,9 +213,7 @@ pub fn handleKernelControlPage(
             if (remaining != @sizeOf(control_protocol.StartMicrovmPayload)) return error.BadPayload;
             const p: *const control_protocol.StartMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
             const microvm_registry = @import("../vmm/microvm_registry.zig");
-            const inst = microvm_registry.getInstance(p.instance_id) orelse return error.BadPayload;
-            _ = inst;
-            // Not starting fully in this mock implementation, just marking it handled.
+            if (!microvm_registry.start(p.instance_id)) return error.BadPayload;
         },
         .stop_microvm, .delete_microvm => return error.BadPayload,
     }

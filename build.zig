@@ -12,6 +12,16 @@ pub fn build(b: *std.Build) void {
     });
 
     const opts = b.addOptions();
+    const guest_image_blob = b.createModule(.{
+        .root_source_file = b.path("assets/guest/guest_image_blob.zig"),
+        .target = kernel_target,
+        .optimize = optimize,
+    });
+    const guest_initramfs_blob = b.createModule(.{
+        .root_source_file = b.path("assets/guest/guest_initramfs_blob.zig"),
+        .target = kernel_target,
+        .optimize = optimize,
+    });
     // Unified OS Version & Metadata
     opts.addOption([]const u8, "os_version_str", b.option([]const u8, "os_version_str", "Override OS version string") orelse "0.1.0");
     const commit_id = b.run(&[_][]const u8{ "git", "rev-parse", "--short", "HEAD" });
@@ -22,7 +32,6 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "vmm_active", b.option(bool, "vmm_active", "Enable VMX/HVM hypervisor subsystem") orelse false);
     const vmm_launch_val = b.option(bool, "vmm_launch_linux", "Launch Linux guest on boot") orelse false;
     opts.addOption(bool, "vmm_launch_linux", vmm_launch_val);
-
 
     const exe = b.addExecutable(.{
         .name = "kernel.elf",
@@ -35,6 +44,8 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.root_module.addOptions("build_options", opts);
+    exe.root_module.addImport("guest_image_blob", guest_image_blob);
+    exe.root_module.addImport("guest_initramfs_blob", guest_initramfs_blob);
 
     if (arch == .x86_64) {
         exe.root_module.single_threaded = true;
@@ -95,6 +106,7 @@ pub fn build(b: *std.Build) void {
     if (arch == .x86_64) {
         kernel_tests.use_llvm = true;
         kernel_tests.use_lld = true;
+        kernel_tests.root_module.addAssemblyFile(b.path("src/arch/x86_64/switch_context.S"));
     }
 
     const run_kernel_tests = b.addRunArtifact(kernel_tests);

@@ -211,6 +211,7 @@ pub fn allocContiguous(n_pages: u64) ?u64 {
 pub fn freePage(phys_addr: u64) void {
     if (!initialized) return;
     const page = phys_addr / PAGE_SIZE;
+    if (page >= highest_page) return;
     clearBit(page);
     if (page != 0 and page < next_search_page) {
         next_search_page = @as(usize, @intCast(page));

@@ -12,7 +12,7 @@ limine/
 # Temporary files
 tmp/
 *.tmp
-
+.venv/
 # Editor/OS specific
 .vscode/
 .idea/
