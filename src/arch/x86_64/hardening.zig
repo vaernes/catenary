@@ -7,6 +7,8 @@ pub const BaselineReport = struct {
     smep_enabled: bool = false,
     smap_supported: bool = false,
     smap_enabled: bool = false,
+    umip_supported: bool = false,
+    umip_enabled: bool = false,
 };
 
 const MSR_EFER: u32 = 0xC000_0080;
@@ -22,11 +24,13 @@ const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
 const CR4_SMEP: u64 = 1 << 20;
 const CR4_SMAP: u64 = 1 << 21;
+const CR4_UMIP: u64 = 1 << 11;
 const CPUID_EXT_NX_EDX_BIT: u32 = 20;
 const CPUID_STD_SSE_EDX_BIT: u32 = 25;
 const CPUID_STD_SSE2_EDX_BIT: u32 = 26;
 const CPUID_STRUCT_EXT_SMEP_EBX_BIT: u32 = 7;
 const CPUID_STRUCT_EXT_SMAP_EBX_BIT: u32 = 20;
+const CPUID_STRUCT_EXT_UMIP_ECX_BIT: u32 = 2;
 
 fn cpuidBitSet(value: u32, bit: u32) bool {
     return (value & (@as(u32, 1) << @as(u5, @intCast(bit)))) != 0;
@@ -73,14 +77,17 @@ pub fn applyBaseline() BaselineReport {
         const structured = cpu.cpuid(7, 0);
         report.smep_supported = cpuidBitSet(structured.ebx, CPUID_STRUCT_EXT_SMEP_EBX_BIT);
         report.smap_supported = cpuidBitSet(structured.ebx, CPUID_STRUCT_EXT_SMAP_EBX_BIT);
-        if (report.smep_supported or report.smap_supported) {
+        report.umip_supported = cpuidBitSet(structured.ecx, CPUID_STRUCT_EXT_UMIP_ECX_BIT);
+        if (report.smep_supported or report.smap_supported or report.umip_supported) {
             var cr4 = cpu.readCr4();
             if (report.smep_supported) cr4 |= CR4_SMEP;
             if (report.smap_supported) cr4 |= CR4_SMAP;
+            if (report.umip_supported) cr4 |= CR4_UMIP;
             cpu.writeCr4(cr4);
             const applied = cpu.readCr4();
             report.smep_enabled = (applied & CR4_SMEP) != 0;
             report.smap_enabled = (applied & CR4_SMAP) != 0;
+            report.umip_enabled = (applied & CR4_UMIP) != 0;
         }
     }
 

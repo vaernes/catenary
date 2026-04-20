@@ -212,6 +212,14 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
     }
 }
 
+pub fn accessOk(ptr: u64, size: u64) bool {
+    const limit: u64 = 0x0000_8000_0000_0000;
+    if (ptr >= limit) return false;
+    const end = ptr +% size;
+    if (end < ptr or end > limit) return false;
+    return true;
+}
+
 pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, token: u64) u64 {
     _ = rip;
 
@@ -576,7 +584,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         9 => {
             const ptr = arg0;
             const len = arg1;
-            if (ptr < 0x0000_8000_0000_0000 and len <= 4096 and ptr +% len <= 0x0000_8000_0000_0000) {
+            if (len <= 4096 and accessOk(ptr, len)) {
                 // If SMAP is active, temporarily allow supervisor access
                 // to user pages. Check CR4.SMAP (bit 21) at runtime since
                 // stac/clac #UD on CPUs without SMAP support.

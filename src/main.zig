@@ -23,6 +23,8 @@ const service_manager = @import("services/service_manager.zig");
 const keyboard = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/keyboard.zig") else struct {};
 const user_mode = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/user_mode.zig") else struct {};
 const hvm = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/hvm.zig") else struct {};
+const stack_protector = @import("kernel/stack_protector.zig");
+const wx_enforce = @import("kernel/wx_enforce.zig");
 
 pub const OS_NAME = "Catenary OS";
 pub const OS_VERSION = std.SemanticVersion.parse(build_options.os_version_str) catch std.SemanticVersion{ .major = 0, .minor = 0, .patch = 0 };
@@ -181,6 +183,7 @@ fn reportHardeningBaseline(report: arch.hardening.BaselineReport) void {
     printHardeningState("NXE", report.nx_enabled, report.nx_supported);
     printHardeningState("SMEP", report.smep_enabled, report.smep_supported);
     printHardeningState("SMAP", report.smap_enabled, report.smap_supported);
+    printHardeningState("UMIP", report.umip_enabled, report.umip_supported);
 }
 
 const KERNEL_LINKER_VIRT_BASE: u64 = 0xFFFF_FFFF_8100_0000;
@@ -292,6 +295,10 @@ pub export fn _kernel_main() callconv(.c) noreturn {
     const hardening = arch.hardening.applyBaseline();
     reportHardeningBaseline(hardening);
 
+    // Seed the stack canary with hardware entropy as early as possible.
+    stack_protector.initCanary();
+    bootLog("Stack canary seeded.\n");
+
     fb.init(&limine_framebuffer_request, bootLog);
     fb.clear(0x004A4E69); // Sea Gray background
     fb.drawRect(0, 0, 800, 20, 0x00E2725B); // Terracotta bar
@@ -384,6 +391,15 @@ pub export fn _kernel_main() callconv(.c) noreturn {
             if (!selftest.run(bootLog)) {
                 bootLog("selftest: fatal\n");
                 while (true) arch.cpu.halt();
+            }
+
+            // W^X enforcement: audit kernel page tables and fix any page
+            // that is simultaneously writable and executable.
+            const wx_result = wx_enforce.enforce(hhdm.offset);
+            if (wx_result.violations_found > 0) {
+                bootLog("W^X: fixed violations in kernel mappings\n");
+            } else {
+                bootLog("W^X: kernel mappings clean\n");
             }
 
             manager.init(hhdm.offset);
