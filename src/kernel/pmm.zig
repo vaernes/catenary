@@ -1,5 +1,6 @@
 const std = @import("std");
 const limine = @import("limine.zig");
+const builtin = @import("builtin");
 
 /// Physical Memory Manager (PMM).
 ///
@@ -208,10 +209,61 @@ pub fn allocContiguous(n_pages: u64) ?u64 {
     }
     return null;
 }
+/// Zero a physical page via the HHDM mapping.
+/// Used to scrub page contents before returning to the free pool so that
+/// a subsequent allocator cannot observe secrets left by the previous owner.
+var hhdm_offset_cached: u64 = 0;
+
+pub fn setHhdmOffset(offset: u64) void {
+    hhdm_offset_cached = offset;
+}
+
+fn zeroPage(phys_addr: u64) void {
+    if (hhdm_offset_cached == 0) return; // Too early; HHDM not yet known.
+    const ptr: [*]u8 = @ptrFromInt(phys_addr + hhdm_offset_cached);
+    // Manual loop to avoid hidden SIMD/alignment requirements in early kernel.
+    var i: usize = 0;
+    while (i < PAGE_SIZE) : (i += 1) {
+        ptr[i] = 0;
+    }
+}
+
+fn serialWriteSecurity(s: []const u8) void {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+    for (s) |c| {
+        asm volatile ("outb %al, %dx"
+            :
+            : [al] "{al}" (c),
+              [dx] "{dx}" (@as(u16, 0x3F8)),
+        );
+    }
+}
+
 pub fn freePage(phys_addr: u64) void {
     if (!initialized) return;
     const page = phys_addr / PAGE_SIZE;
     if (page >= highest_page) return;
+
+    // Double-free detection: if the page is already free, log and bail.
+    if (!testBit(page)) {
+        serialWriteSecurity("PMM: DOUBLE-FREE detected page=0x");
+        // Best-effort hex print of page number
+        const hex = "0123456789ABCDEF";
+        var shift: u6 = 60;
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            const nibble: usize = @intCast((@as(u64, page) >> shift) & 0xF);
+            serialWriteSecurity(hex[nibble..][0..1]);
+            if (shift >= 4) shift -= 4;
+        }
+        serialWriteSecurity("\n");
+        return;
+    }
+
+    // Zero the page before returning it to the pool to prevent
+    // information leakage between services/MicroVMs.
+    zeroPage(phys_addr);
+
     clearBit(page);
     if (page != 0 and page < next_search_page) {
         next_search_page = @as(usize, @intCast(page));
@@ -292,6 +344,12 @@ pub fn allocGuardedRegion(n_pages: usize) ?GuardedRegion {
 /// Free a previously allocated guarded region (guards + data pages).
 pub fn freeGuardedRegion(region: GuardedRegion) void {
     if (!initialized) return;
+
+    // Zero the data pages (not the guard pages — they're unmapped).
+    var d: usize = 0;
+    while (d < region.n_pages) : (d += 1) {
+        zeroPage(region.data_phys + @as(u64, d) * PAGE_SIZE);
+    }
 
     const start_page = @as(usize, @intCast(region.guard_low_phys / PAGE_SIZE));
     const total_pages = region.n_pages + 2;

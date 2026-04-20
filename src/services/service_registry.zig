@@ -37,6 +37,9 @@ pub const Slot = struct {
     /// Physical address of the DIPC page currently mapped at the service's
     /// receive window VA (0x7F00_0000_0000). Cleared when the page is freed.
     receive_page_phys: u64 = 0,
+    /// Number of DIPC pages currently in-flight from this service.
+    /// Used for rate limiting to prevent resource exhaustion.
+    inflight_dipc_pages: u32 = 0,
 };
 
 var slots: [MAX_SERVICES]Slot = undefined;
@@ -353,6 +356,26 @@ pub fn clearRecvPage(service_id: u32) u64 {
 pub fn getSlotByIndex(i: usize) ?Slot {
     if (i >= MAX_SERVICES) return null;
     return slots[i];
+}
+
+/// Maximum number of DIPC pages a single service may have in-flight
+/// before new sends are rejected. Prevents a malicious service from
+/// exhausting the PMM.
+pub const MAX_INFLIGHT_DIPC_PAGES: u32 = 64;
+
+/// Try to increment the in-flight page count for a service.
+/// Returns false if the limit would be exceeded.
+pub fn acquireDipcSlot(service_id: u32) bool {
+    const slot = findMutable(service_id) orelse return false;
+    if (slot.inflight_dipc_pages >= MAX_INFLIGHT_DIPC_PAGES) return false;
+    slot.inflight_dipc_pages += 1;
+    return true;
+}
+
+/// Decrement the in-flight page count when a page is freed or delivered.
+pub fn releaseDipcSlot(service_id: u32) void {
+    const slot = findMutable(service_id) orelse return;
+    if (slot.inflight_dipc_pages > 0) slot.inflight_dipc_pages -= 1;
 }
 
 test "registerRemoteService stores remote node address" {

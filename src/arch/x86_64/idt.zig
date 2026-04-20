@@ -19,11 +19,15 @@ var idt: [256]IdtEntry = undefined;
 var idtr: cpu.DescriptorTablePointer = undefined;
 
 pub fn setGate(vector: u8, isr: *const fn () callconv(.naked) void, flags: u8) void {
+    setGateWithIst(vector, isr, flags, 0);
+}
+
+pub fn setGateWithIst(vector: u8, isr: *const fn () callconv(.naked) void, flags: u8, ist: u8) void {
     const addr = @intFromPtr(isr);
     idt[vector] = IdtEntry{
         .isr_low = @as(u16, @truncate(addr & 0xFFFF)),
         .kernel_cs = 0x08, // Kernel code segment offset
-        .ist = 0,
+        .ist = ist,
         .attributes = flags,
         .isr_mid = @as(u16, @truncate((addr >> 16) & 0xFFFF)),
         .isr_high = @as(u32, @truncate((addr >> 32) & 0xFFFFFFFF)),
@@ -173,7 +177,7 @@ pub fn init() void {
         setGate(@as(u8, @intCast(i)), ignoreIsr, 0x8E);
     }
 
-    setGate(8, genericIsr, 0x8E); // Double Fault
+    setGateWithIst(8, genericIsr, 0x8E, 1); // Double Fault — IST1 for dedicated stack
     setGate(0, deIsr, 0x8E);
     setGate(1, dbIsr, 0x8E);
     setGate(3, user_mode.breakpointIsr, 0xEE);

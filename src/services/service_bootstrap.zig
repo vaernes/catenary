@@ -30,6 +30,69 @@ pub const ServiceKind = enum(u16) {
     configd = 9,
 };
 
+/// Per-service syscall allow-list.
+///
+/// Each bit position in the returned u32 corresponds to a syscall op number.
+/// Ops above 31 are encoded in a second word (`allowedSyscallsHigh`).
+/// A set bit means the service is allowed to invoke that op.
+///
+/// Common ops available to all services:
+///   op=1  (SYS_ACTIVATE)           — report ready
+///   op=2  (SYS_REGISTER_ENDPOINT)  — register DIPC endpoint
+///   op=3  (SYS_RECV)               — receive DIPC message
+///   op=4  (SYS_FREE_PAGE)          — free a received page
+///   op=6  (SYS_SEND)               — send DIPC message
+///   op=9  (SYS_SERIAL_WRITE)       — debug serial output
+///   op=17 (SYS_MAP_RECV)           — map received page into VA
+///
+/// Service-specific additions:
+///   netd/storaged: op=5 (DMA alloc), op=7 (MMIO map), op=13/14 (PCI config)
+///   dashd:         op=16 (draw text)
+///   windowd:       op=16 (draw text), op=21 (varde shell history)
+///   inputd:        op=8 (read scancode)
+///   containerd/clusterd/configd: base IPC ops only
+const COMMON_OPS_LOW: u32 =
+    (1 << 1) | // SYS_ACTIVATE
+    (1 << 2) | // SYS_REGISTER_ENDPOINT
+    (1 << 3) | // SYS_RECV
+    (1 << 4) | // SYS_FREE_PAGE
+    (1 << 6) | // SYS_SEND
+    (1 << 9) | // SYS_SERIAL_WRITE
+    (1 << 17); // SYS_MAP_RECV
+
+const HW_ACCESS_OPS_LOW: u32 =
+    (1 << 5) | // SYS_DMA_ALLOC
+    (1 << 7) | // SYS_MMIO_MAP
+    (1 << 13) | // SYS_PCI_READ
+    (1 << 14); // SYS_PCI_WRITE
+
+const FB_DRAW_OP: u32 = (1 << 16); // SYS_DRAW_TEXT
+const KBD_OP: u32 = (1 << 8); // SYS_READ_SCANCODE
+const SHELL_HISTORY_OP: u32 = (1 << 21); // SYS_SHELL_HISTORY
+
+/// Returns the allowed syscall bitmask for a given ServiceKind.
+/// Bit N set = syscall op N is permitted.
+pub fn allowedSyscallMask(kind: ServiceKind) u32 {
+    return switch (kind) {
+        .netd => COMMON_OPS_LOW | HW_ACCESS_OPS_LOW,
+        .storaged => COMMON_OPS_LOW | HW_ACCESS_OPS_LOW,
+        .dashd => COMMON_OPS_LOW | FB_DRAW_OP,
+        .windowd => COMMON_OPS_LOW | FB_DRAW_OP | KBD_OP | SHELL_HISTORY_OP,
+        .inputd => COMMON_OPS_LOW | KBD_OP,
+        .containerd => COMMON_OPS_LOW,
+        .clusterd => COMMON_OPS_LOW,
+        .configd => COMMON_OPS_LOW,
+        .vmm => COMMON_OPS_LOW | HW_ACCESS_OPS_LOW,
+    };
+}
+
+/// Check whether a given syscall op is allowed for the specified service kind.
+pub fn isSyscallAllowed(kind: ServiceKind, op: u64) bool {
+    if (op > 31) return false; // Ops > 31 are not allocated
+    const mask = allowedSyscallMask(kind);
+    return (mask & (@as(u32, 1) << @as(u5, @intCast(op)))) != 0;
+}
+
 pub const RuntimeMode = enum(u16) {
     oneshot = 1,
     persistent = 2,

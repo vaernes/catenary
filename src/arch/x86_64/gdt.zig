@@ -20,6 +20,11 @@ pub const Tss = packed struct {
 
 var gdt: [7]u64 align(16) = undefined;
 var gdtr: cpu.DescriptorTablePointer = undefined;
+
+// Dedicated 16KB stack for IST1 (double-fault handler).
+// Must survive for the entire kernel lifetime.
+var ist1_stack: [16384]u8 align(16) linksection(".bss") = undefined;
+
 var tss: Tss align(16) = .{
     .iopb_offset = @sizeOf(Tss),
 };
@@ -30,6 +35,9 @@ pub fn init() void {
     gdt[2] = 0x00af92000000ffff; // Kernel data (0x10)
     gdt[3] = 0x00affb0000000000; // User code (0x18) - DPL 3, Long Mode, Readable
     gdt[4] = 0x00aff30000000000; // User data (0x20) - DPL 3, Writable, Long Mode (Ignored but present)
+
+    // Populate IST1 with the dedicated double-fault stack.
+    tss.ist1 = @intFromPtr(&ist1_stack) + ist1_stack.len;
 
     // TSS Descriptor (Task State Segment) - 16 bytes in x86_64
     const tss_ptr = @intFromPtr(&tss);

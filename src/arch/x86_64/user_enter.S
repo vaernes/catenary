@@ -29,8 +29,10 @@ enterUserMode:
     # Prepare IRETQ stack frame
     pushq %r8         # SS
     pushq %rsi        # RSP
-    # pushq $0x0202     # RFLAGS (IF=1, IOPL=0) - for production
-    pushq $0x3202     # RFLAGS (IF=1, IOPL=3) - allow Ring-3 I/O for debug stubs
+    # RFLAGS: IF=1, IOPL=0 — Ring 3 must use syscalls for all port I/O.
+    # WARNING: Do NOT set IOPL=3 in production; it bypasses all kernel I/O
+    # capability checks and lets any service access arbitrary hardware.
+    pushq $0x0202     # RFLAGS (IF=1, IOPL=0)
     pushq %rcx        # CS
     pushq %rdi        # RIP
 

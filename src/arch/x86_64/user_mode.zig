@@ -222,6 +222,24 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         serialByte('.');
     }
 
+    // --- Syscall allow-list enforcement ---
+    // Skip legacy nop ops (0x1000..0x1004) since they are harmless.
+    if (op < 0x1000 or op > 0x1004) {
+        // Look up the calling service's kind to check the allow-list.
+        if (service_registry.serviceIdForCapability(token)) |sid| {
+            if (service_registry.getServiceKind(sid)) |kind| {
+                if (!service_bootstrap.isSyscallAllowed(kind, op)) {
+                    serialWrite("[SECURITY] syscall op=0x");
+                    printHex(op);
+                    serialWrite(" denied for service kind=0x");
+                    printHex(@intFromEnum(kind));
+                    serialWrite("\n");
+                    return 0xFFFFFFFF;
+                }
+            }
+        }
+    }
+
     switch (op) {
         0x1000...0x1004 => {
             return 0;
@@ -327,6 +345,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 if (recv_phys != 0) {
                     const pml4_4 = service_registry.getTaskBoundAddressSpace(sid4) orelse {
                         pmm.freePage(recv_phys);
+                        service_registry.releaseDipcSlot(sid4);
                         return 0;
                     };
                     const old_cr3_4 = cpu.readCr3();
@@ -334,9 +353,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                     host_paging.unmap(hhdm_offset, RECV_VA) catch {};
                     cpu.writeCr3(old_cr3_4);
                     pmm.freePage(recv_phys);
+                    service_registry.releaseDipcSlot(sid4);
                 }
             } else {
                 pmm.freePage(arg0);
+                service_registry.releaseDipcSlot(sid4);
             }
             return 0;
         },
@@ -378,7 +399,12 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // Kernel copies it to a fresh PMM page, re-signs with kernel auth key, and routes.
         // Returns 0 on success, 1 on failure.
         6 => {
-            _ = service_registry.serviceIdForCapability(token) orelse return 1;
+            const sid6 = service_registry.serviceIdForCapability(token) orelse return 1;
+            // Rate-limit: reject if this service already has too many pages in-flight.
+            if (!service_registry.acquireDipcSlot(sid6)) {
+                serialWrite("[SECURITY] DIPC rate limit exceeded for service\n");
+                return 1;
+            }
             const src_phys = arg0;
             if (src_phys == 0 or (src_phys & 0xFFF) != 0) return 1;
             const src_hdr: *const dipc.PageHeader = @ptrFromInt(src_phys + hhdm_offset);

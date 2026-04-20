@@ -306,6 +306,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
         if (limine_hhdm_request.response) |hhdm| {
             hhdm_offset_global = hhdm.offset;
             pmm.init(memmap, hhdm.offset);
+            pmm.setHhdmOffset(hhdm.offset);
             bootLog("PMM initialized.\n");
 
             scheduler.init(hhdm.offset);
