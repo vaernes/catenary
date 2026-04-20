@@ -90,7 +90,7 @@ pub export fn umain() noreturn {
                 if (scancodeToAscii(scancode)) |c| {
                     // Send to dashd as a simple raw DIPC payload.
                     const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA);
-                    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+                    const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA, 8) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
                     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
                     header.* = .{
                         .magic = lib.WireMagic,

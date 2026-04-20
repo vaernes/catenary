@@ -54,4 +54,4 @@ To achieve 100% OCI (Docker) compatibility without the massive technical debt of
 * [x] **Phase 2: Core Abstractions** — CPU descriptors and physical memory management.
 * [x] **Phase 3: Scheduling & IPC** — Task switching and local message passing.
 * [x] **Phase 4: Hypervisor & MicroVMs** — Intel VT-x integration and booting isolated Linux guest kernels.
-* [ ] **Phase 5: Networking & Orchestration** (*Current*) — IPv6 networking, distributed IPC, and multi-node cluster orchestration.
+* [x] **Phase 5: Networking & Orchestration** (*Current*) — IPv6 networking, distributed IPC, and multi-node cluster orchestration.

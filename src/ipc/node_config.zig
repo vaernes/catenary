@@ -12,6 +12,10 @@ pub fn getLocalNode() dipc.Ipv6Addr {
     return local_node;
 }
 
+pub fn isLocalAddress(addr: dipc.Ipv6Addr) bool {
+    return dipc.Ipv6Addr.eql(addr, local_node) or dipc.Ipv6Addr.eql(addr, dipc.Ipv6Addr.loopback());
+}
+
 pub fn setLocalNode(addr: dipc.Ipv6Addr) void {
     local_node = addr;
     node_locked = true;

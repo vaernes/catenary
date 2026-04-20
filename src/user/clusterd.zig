@@ -33,7 +33,7 @@ pub export fn umain() noreturn {
 
     const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA);
 
-    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA, 7) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
     header.* = .{
         .magic = lib.WireMagic,
@@ -65,13 +65,74 @@ pub export fn umain() noreturn {
 
     _ = lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
 
+    var remote_launched: bool = false;
+
     lib.serialWrite("clusterd: entering event loop\n");
     while (true) {
         const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
         if (page_phys != 0) {
-            _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            lib.serialWrite("clusterd: SYS_RECV returned a page\n");
+            const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
+            if (recv_va != 0) {
+                lib.serialWrite("clusterd: mapped page\n");
+                const in_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+                const in_control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+
+                if (in_control.op == .registry_sync and !remote_launched) {
+                    lib.serialWrite("clusterd: received registry_sync\n");
+                    var is_local = true;
+                    for (0..16) |i| {
+                        if (in_header.src.node.bytes[i] != local_node.bytes[i]) {
+                            is_local = false;
+                        }
+                    }
+
+                    if (!is_local and in_header.src.node.bytes[15] != 1) {
+                        remote_launched = true;
+                        lib.serialWrite("clusterd: discovered remote node via registry_sync, requesting remote MicroVM launch\n");
+
+                        const src_node = in_header.src.node;
+                        const out_header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+                        out_header.* = .{
+                            .magic = lib.WireMagic,
+                            .version = lib.WireVersion,
+                            .header_len = @as(u16, @intCast(@sizeOf(lib.PageHeader))),
+                            .payload_len = @as(u32, @intCast(@sizeOf(lib.ControlHeader) + @sizeOf(lib.CreateMicrovmPayload))),
+                            .auth_tag = 0,
+                            .src = .{ .node = local_node, .endpoint = 7 },
+                            .dst = .{ .node = src_node, .endpoint = bs.reserved_kernel_control_endpoint },
+                        };
+
+                        const control_out: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(scratch) + @sizeOf(lib.PageHeader));
+                        control_out.* = .{
+                            .op = .create_microvm,
+                            .payload_len = @as(u32, @intCast(@sizeOf(lib.CreateMicrovmPayload))),
+                        };
+
+                        const out_payload: *align(1) lib.CreateMicrovmPayload = @ptrFromInt(@intFromPtr(scratch) + @sizeOf(lib.PageHeader) + @sizeOf(lib.ControlHeader));
+                        out_payload.* = .{
+                            .mem_pages = 16384,
+                            .vcpus = 1,
+                            .kernel_phys = bs.linux_bzimage_phys,
+                            .kernel_size = bs.linux_bzimage_size,
+                            .initramfs_phys = bs.initramfs_phys,
+                            .initramfs_size = bs.initramfs_size,
+                            .name = [_]u8{0} ** 32,
+                        };
+                        @memcpy(out_payload.name[0..13], "remote-micron"); // name length is < 32
+
+                        _ = lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
+                    }
+                }
+
+                // configd also frees DIPC_RECV_VA and here we do the same since MAP_RECV maps into VA
+                _ = lib.syscall(SYS_FREE_PAGE, lib.DIPC_RECV_VA, 0, token);
+            } else {
+                _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            }
         }
-        asm volatile ("pause");
+
+        for (0..100000) |_| asm volatile ("pause");
     }
 }
 

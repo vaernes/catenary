@@ -1,8 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-
-
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
 const SYS_FREE_PAGE = 4;
@@ -16,8 +14,6 @@ const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
-
-
 
 fn printHex(n: u64) void {
     const hex = "0123456789ABCDEF";
@@ -61,7 +57,7 @@ pub export fn umain() noreturn {
     // Send a block write request to storaged via DIPC
     const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA + 1 * 4096);
 
-    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA + 1 * 4096, 6) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
     header.* = .{
         .magic = lib.WireMagic,

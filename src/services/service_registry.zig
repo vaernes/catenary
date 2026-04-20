@@ -1,8 +1,9 @@
 const std = @import("std");
+const dipc = @import("../ipc/dipc.zig");
 const service_bootstrap = @import("service_bootstrap.zig");
 const trust = @import("../kernel/trust.zig");
 
-pub const MAX_SERVICES: usize = 8;
+pub const MAX_SERVICES: usize = 32;
 
 pub const ServiceState = enum(u8) {
     empty = 0,
@@ -20,6 +21,7 @@ pub const Slot = struct {
     class: service_bootstrap.ProcessClass = .user_service,
     kind: service_bootstrap.ServiceKind = .netd,
     is_remote: bool = false,
+    remote_node: dipc.Ipv6Addr = dipc.Ipv6Addr{ .bytes = [_]u8{0} ** 16 },
     runtime_mode: service_bootstrap.RuntimeMode = .oneshot,
     state: ServiceState = .empty,
     entry_rip: u64 = 0,
@@ -107,12 +109,13 @@ fn ensureInit() void {
     if (!initialized) init();
 }
 
-pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8) bool {
+pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8, remote_node: dipc.Ipv6Addr) bool {
     ensureInit();
     // Try to find if we already track this remote service
     for (0..MAX_SERVICES) |i| {
         if (slots[i].in_use and slots[i].service_id == service_id and slots[i].is_remote) {
             slots[i].state = @enumFromInt(state);
+            slots[i].remote_node = remote_node;
             return true;
         }
     }
@@ -124,6 +127,7 @@ pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8) bool {
                 .is_remote = true,
                 .service_id = service_id,
                 .kind = @enumFromInt(kind_val),
+                .remote_node = remote_node,
                 .state = @enumFromInt(state),
             };
             return true;
@@ -349,4 +353,19 @@ pub fn clearRecvPage(service_id: u32) u64 {
 pub fn getSlotByIndex(i: usize) ?Slot {
     if (i >= MAX_SERVICES) return null;
     return slots[i];
+}
+
+test "registerRemoteService stores remote node address" {
+    init();
+
+    var remote_node = dipc.Ipv6Addr{ .bytes = [_]u8{0} ** 16 };
+    remote_node.bytes[0] = 0x20;
+    remote_node.bytes[1] = 0x01;
+    remote_node.bytes[15] = 0x55;
+
+    try std.testing.expect(registerRemoteService(77, @intFromEnum(service_bootstrap.ServiceKind.netd), @intFromEnum(ServiceState.active), remote_node));
+
+    const slot = lookup(77) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(slot.is_remote);
+    try std.testing.expect(dipc.Ipv6Addr.eql(slot.remote_node, remote_node));
 }

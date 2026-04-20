@@ -28,6 +28,7 @@ pub const ControlOp = enum(u16) {
     registry_sync = 18,
     list_microvms = 19,
     get_node_status = 20,
+    get_node_addr = 21,
 };
 
 pub const ControlHeader = extern struct {
@@ -141,6 +142,10 @@ pub const NodeStatusResult = extern struct {
     free_mem_pages: u32,
     active_vms: u32,
     _pad: u32 = 0,
+};
+
+pub const NodeAddrResult = extern struct {
+    addr: dipc.Ipv6Addr,
 };
 
 pub const RegisterStoragedServicePayload = extern struct {

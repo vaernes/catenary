@@ -176,6 +176,7 @@ pub const ControlOp = enum(u16) {
     registry_sync = 18,
     list_microvms = 19,
     get_node_status = 20,
+    get_node_addr = 21,
 };
 
 pub const ControlHeader = extern struct {
@@ -185,6 +186,10 @@ pub const ControlHeader = extern struct {
 };
 
 pub const CONTROL_HEADER_SIZE: usize = @sizeOf(ControlHeader);
+
+pub const SetNodeAddrPayload = extern struct {
+    addr: Ipv6Addr,
+};
 
 pub const CreateMicrovmPayload = extern struct {
     mem_pages: u32,
@@ -230,6 +235,10 @@ pub const NodeStatusResult = extern struct {
     free_mem_pages: u32,
     active_vms: u32,
     _pad: u32 = 0,
+};
+
+pub const NodeAddrResult = extern struct {
+    addr: Ipv6Addr,
 };
 
 pub const TelemetryUpdatePayload = extern struct {
@@ -303,6 +312,51 @@ pub const UpdateMicrovmNamePayload = extern struct {
     _pad: u32 = 0,
     name: [32]u8,
 };
+
+pub fn queryCurrentNode(
+    bs: *const BootstrapDescriptor,
+    token: u64,
+    scratch_phys: u64,
+    scratch_va: u64,
+    src_endpoint: EndpointId,
+) ?Ipv6Addr {
+    if (scratch_phys == 0 or scratch_va == 0) return null;
+
+    const bootstrap_node = Ipv6Addr{ .bytes = bs.local_node };
+    const scratch: [*]u8 = ptrFrom([*]u8, scratch_va);
+
+    const header: *align(1) PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = WireMagic,
+        .version = WireVersion,
+        .header_len = @as(u16, @intCast(DIPC_HEADER_SIZE)),
+        .payload_len = @as(u32, @intCast(@sizeOf(ControlHeader))),
+        .auth_tag = 0,
+        .src = .{ .node = bootstrap_node, .endpoint = src_endpoint },
+        .dst = .{ .node = bootstrap_node, .endpoint = bs.reserved_kernel_control_endpoint },
+    };
+
+    const control: *align(1) ControlHeader = @ptrFromInt(@intFromPtr(scratch) + DIPC_HEADER_SIZE);
+    control.* = .{
+        .op = .get_node_addr,
+        .payload_len = 0,
+    };
+
+    if (syscall(SYS_SEND_PAGE, scratch_phys, 0, token) != 0) return null;
+
+    const page_phys = syscall(SYS_RECV, 0, 0, token);
+    if (page_phys == 0) return null;
+    const recv_va = syscall(SYS_MAP_RECV, page_phys, 0, token);
+    if (recv_va == 0) {
+        _ = syscall(SYS_FREE_PAGE, page_phys, 0, token);
+        return null;
+    }
+
+    const result: *align(1) const NodeAddrResult = @ptrFromInt(recv_va + DIPC_HEADER_SIZE);
+    const addr = result.addr;
+    _ = syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
+    return addr;
+}
 
 pub extern fn umain() noreturn;
 

@@ -198,16 +198,35 @@ pub fn handleKernelControlPage(
             if (remaining != @sizeOf(control_protocol.RegistrySyncPayload)) return error.BadPayload;
             const p: *const control_protocol.RegistrySyncPayload = @ptrCast(@alignCast(payload_ptr));
             const sr = @import("../services/service_registry.zig");
-            if (!sr.registerRemoteService(p.service_id, p.service_kind, p.state)) {
+            if (!sr.registerRemoteService(p.service_id, p.service_kind, p.state, hdr.src.node)) {
                 serialWrite("kernel_control: registry sync failed to register remote service\n");
             } else {
                 serialWrite("kernel_control: remote service registered from sync\n");
             }
+            // Forward to local clusterd and configd so they can react to remote node registrations.
+            // Preserve hdr.src so the receiving daemon can identify which remote node sent it.
+            const fwd_payload_len = @sizeOf(control_protocol.ControlHeader) + @sizeOf(control_protocol.RegistrySyncPayload);
+            const fwd_payload: []const u8 = base[0..fwd_payload_len];
+            const table_const: *const endpoint_table.EndpointTable = table;
+            const clusterd_dst = dipc.Address{
+                .node = node_config.getLocalNode(),
+                .endpoint = @intFromEnum(identity.ReservedEndpoint.clusterd),
+            };
+            const configd_dst = dipc.Address{
+                .node = node_config.getLocalNode(),
+                .endpoint = @intFromEnum(identity.ReservedEndpoint.configd),
+            };
+            if (dipc.allocPageMessage(hhdm_offset, hdr.src, clusterd_dst, fwd_payload)) |fwd_page| {
+                _ = router.routePageWithLocalNode(hhdm_offset, table_const, fwd_page) catch {};
+            } else |_| {}
+            if (dipc.allocPageMessage(hhdm_offset, hdr.src, configd_dst, fwd_payload)) |fwd_page| {
+                _ = router.routePageWithLocalNode(hhdm_offset, table_const, fwd_page) catch {};
+            } else |_| {}
         },
         // poll_netd_inbox and assign_node_addr are handled directly in the trap bridge
         // (user_mode.zig) and do not go through the DIPC page path, so the kernel
         // control handler treats them as unrecognised and returns an error to the caller.
-        .poll_netd_inbox, .assign_node_addr => return error.BadPayload,
+        .poll_netd_inbox, .assign_node_addr, .get_node_addr => return error.BadPayload,
         .create_microvm => {
             if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
             if (remaining != @sizeOf(control_protocol.CreateMicrovmPayload)) return error.BadPayload;

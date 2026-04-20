@@ -17,7 +17,7 @@ DEFAULT_VMX_LINUX_PATTERNS=""
 
 case "${SMOKE_PROFILE}" in
     default)
-        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
         ;;
     vmx-linux)
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true -Dvmm_active=true -Dvmm_launch_linux=true -Dservices_active=false"
@@ -26,7 +26,7 @@ case "${SMOKE_PROFILE}" in
         ;;
     vmx-linux-services)
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true -Dvmm_active=true -Dvmm_launch_linux=true"
-        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;dashd: starting;containerd: starting;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
         DEFAULT_VMX_LINUX_PATTERNS="kernel_control: staged MicroVM launched via DIPC;VMX: entering guest via vmlaunch;Linux version;Catenary OS Guest Init: SUCCESS;guest_rootfs: init started"
         ;;
     *)
@@ -159,10 +159,35 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
     sleep 1
 done
 
+post_flush_pass=0
+if [ "${ok}" -eq 0 ]; then
+    cleanup
+    if [ -f qemu_serial.log ]; then
+        all_found=1
+        for p in "${required_patterns[@]}"; do
+            if [ -z "${p}" ]; then
+                continue
+            fi
+            if ! pattern_seen "${p}"; then
+                all_found=0
+                break
+            fi
+        done
+        if [ "${all_found}" -eq 1 ]; then
+            ok=1
+            post_flush_pass=1
+        fi
+    fi
+fi
+
 echo "[+] Serial log (tail):"
 tail -n 200 qemu_serial.log || true
 
 if [ "${ok}" -eq 1 ]; then
+    if [ "${post_flush_pass}" -eq 1 ]; then
+        echo "[+] SMOKE PASS: observed milestones after final serial flush"
+        exit 0
+    fi
     echo "[+] SMOKE PASS: observed guest and core milestones"
     exit 0
 fi

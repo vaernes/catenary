@@ -2640,7 +2640,7 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
 
     serialWrite("vmx: global vmxon active\n");
 
-    if (microvm_registry.create(GUEST_POOL_PAGES, 1, 0, 0, 0, 0)) |id| {
+    if (microvm_registry.create([_]u8{0} ** 32, GUEST_POOL_PAGES, 1, 0, 0, 0, 0)) |id| {
         current_instance_id = id;
     } else {
         serialWrite("VMX: failed to create microvm instance\n");

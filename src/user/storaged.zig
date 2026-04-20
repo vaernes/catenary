@@ -4,7 +4,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 
-
 // ---------------------------------------------------------------------------
 // Low-level serial + lib.syscall interface (same convention as netd.zig)
 // ---------------------------------------------------------------------------
@@ -19,7 +18,6 @@ fn printHex(n: u64) void {
         shift -= 4;
     }
 }
-
 
 const SYS_LOG = 1;
 const SYS_REGISTER = 2;
@@ -600,7 +598,8 @@ pub export fn umain() noreturn {
 
         const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
         const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
-        const local_node = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
+        const reply_dst = incoming_hdr.src;
+        const local_node = lib.queryCurrentNode(bs_desc, g_token, g_dipc_scratch_phys, DIPC_SCRATCH_VA, bs_desc.reserved_storaged_endpoint) orelse lib.Ipv6Addr{ .bytes = bs_desc.local_node };
 
         const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
         header.* = .{
@@ -610,7 +609,7 @@ pub export fn umain() noreturn {
             .payload_len = @as(u32, @intCast(@sizeOf(lib.ControlHeader) + @sizeOf(lib.VirtioBlkResponsePayload))),
             .auth_tag = 0,
             .src = .{ .node = local_node, .endpoint = bs_desc.reserved_storaged_endpoint },
-            .dst = incoming_hdr.src,
+            .dst = reply_dst,
         };
 
         const control: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);

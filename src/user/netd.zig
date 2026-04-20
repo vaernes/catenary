@@ -186,6 +186,7 @@ const DIPC_WIRE_MAGIC: u32 = lib.WireMagic;
 const DIPC_WIRE_VERSION: u16 = lib.WireVersion;
 const DIPC_HEADER_SIZE: usize = lib.DIPC_HEADER_SIZE;
 const DIPC_UDP_PORT: u16 = 0x4450; // 'DP' – custom port for DIPC-over-UDP
+const IPV6_ALL_NODES_MULTICAST: [16]u8 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 
 // State globals
 var g_io_base: u16 = 0;
@@ -199,6 +200,70 @@ var g_tx_ring_phys: u64 = 0;
 var g_rxbuf_phys: u64 = 0;
 var g_txbuf_phys: u64 = 0;
 var g_dipc_scratch_phys: u64 = 0;
+var g_kernel_control_endpoint: u64 = 0;
+
+// IPv6 Neighbor Cache — maps IPv6 address → Ethernet MAC.
+const NEIGHBOR_CACHE_SIZE: usize = 32;
+const NeighborEntry = struct {
+    valid: bool = false,
+    ipv6: [16]u8 = [_]u8{0} ** 16,
+    mac: [6]u8 = [_]u8{0} ** 6,
+};
+var g_neighbor_cache: [NEIGHBOR_CACHE_SIZE]NeighborEntry = [_]NeighborEntry{.{}} ** NEIGHBOR_CACHE_SIZE;
+var g_neighbor_evict: usize = 0; // round-robin eviction index
+
+fn lookupNeighbor(ipv6: *const [16]u8) ?[6]u8 {
+    for (&g_neighbor_cache) |*e| {
+        if (!e.valid) continue;
+        var match = true;
+        for (0..16) |i| if (e.ipv6[i] != ipv6[i]) {
+            match = false;
+            break;
+        };
+        if (match) return e.mac;
+    }
+    return null;
+}
+
+fn learnNeighbor(ipv6: *const [16]u8, mac: *const [6]u8) void {
+    // Skip link-local multicast and unspecified
+    if (ipv6[0] == 0xff) return;
+    // Update existing entry
+    for (&g_neighbor_cache) |*e| {
+        if (!e.valid) continue;
+        var match = true;
+        for (0..16) |i| if (e.ipv6[i] != ipv6[i]) {
+            match = false;
+            break;
+        };
+        if (match) {
+            @memcpy(&e.mac, mac);
+            return;
+        }
+    }
+    // Find empty slot
+    for (&g_neighbor_cache) |*e| {
+        if (!e.valid) {
+            e.valid = true;
+            @memcpy(&e.ipv6, ipv6);
+            @memcpy(&e.mac, mac);
+            return;
+        }
+    }
+    // Round-robin eviction
+    const slot = g_neighbor_evict % NEIGHBOR_CACHE_SIZE;
+    g_neighbor_evict += 1;
+    g_neighbor_cache[slot].valid = true;
+    @memcpy(&g_neighbor_cache[slot].ipv6, ipv6);
+    @memcpy(&g_neighbor_cache[slot].mac, mac);
+}
+
+fn isAllNodesMulticast(addr: *const [16]u8) bool {
+    for (IPV6_ALL_NODES_MULTICAST, 0..) |byte, index| {
+        if (addr[index] != byte) return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Virtio ring helpers
@@ -364,6 +429,46 @@ fn sendNeighborAdvertisement(
     txFrame(&frame);
 }
 
+// Send an ICMPv6 Neighbor Solicitation for target_ipv6 so we can learn its MAC.
+fn sendNeighborSolicitation(target_ipv6: *const [16]u8) void {
+    // Solicited-node multicast: ff02::1:ffXX:XXXX (last 3 bytes of target)
+    var sol_mcast: [16]u8 = [_]u8{0} ** 16;
+    sol_mcast[0] = 0xff;
+    sol_mcast[1] = 0x02;
+    sol_mcast[11] = 0x01;
+    sol_mcast[12] = 0xff;
+    sol_mcast[13] = target_ipv6[13];
+    sol_mcast[14] = target_ipv6[14];
+    sol_mcast[15] = target_ipv6[15];
+    // Ethernet multicast MAC for solicited-node: 33:33:ff:XX:XX:XX
+    const dst_mac = [6]u8{ 0x33, 0x33, 0xff, target_ipv6[13], target_ipv6[14], target_ipv6[15] };
+
+    // ICMPv6 NS: type(1)+code(1)+cksum(2)+reserved(4)+target(16)+SLLAO(8) = 32 bytes
+    var icmp: [32]u8 = [_]u8{0} ** 32;
+    icmp[0] = 135; // NS
+    @memcpy(icmp[8..24], target_ipv6);
+    icmp[24] = 1;
+    icmp[25] = 1; // option: Source Link-Layer Address, len=1 (8 bytes)
+    @memcpy(icmp[26..32], &g_our_mac);
+    const ck = icmpv6Checksum(&g_our_ipv6, &sol_mcast, &icmp);
+    icmp[2] = @truncate(ck >> 8);
+    icmp[3] = @truncate(ck);
+
+    var frame: [86]u8 = [_]u8{0} ** 86;
+    @memcpy(frame[0..6], &dst_mac);
+    @memcpy(frame[6..12], &g_our_mac);
+    frame[12] = 0x86;
+    frame[13] = 0xDD;
+    frame[14] = 0x60;
+    put_be16(frame[18..20], 32); // ICMPv6 payload len
+    frame[20] = 0x3A;
+    frame[21] = 255;
+    @memcpy(frame[22..38], &g_our_ipv6);
+    @memcpy(frame[38..54], &sol_mcast);
+    @memcpy(frame[54..86], &icmp);
+    txFrame(&frame);
+}
+
 // Build and send an ICMPv6 Echo Reply.
 fn sendEchoReply(
     dst_mac: *const [6]u8,
@@ -420,6 +525,35 @@ fn deriveLinkLocal(mac: *const [6]u8) [16]u8 {
     return ip;
 }
 
+fn publishKernelNodeAddress(bs: *const BootstrapDescriptor, token: u64) bool {
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
+    const bootstrap_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
+        .payload_len = @as(u32, @intCast(@sizeOf(lib.ControlHeader) + @sizeOf(lib.SetNodeAddrPayload))),
+        .auth_tag = 0,
+        .src = .{ .node = bootstrap_node, .endpoint = bs.reserved_netd_endpoint },
+        .dst = .{ .node = bootstrap_node, .endpoint = bs.reserved_kernel_control_endpoint },
+    };
+
+    const control: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    control.* = .{
+        .op = .set_node_addr,
+        .payload_len = @as(u32, @intCast(@sizeOf(lib.SetNodeAddrPayload))),
+    };
+
+    const payload: *align(1) lib.SetNodeAddrPayload = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
+    payload.* = .{
+        .addr = .{ .bytes = g_our_ipv6 },
+    };
+
+    return lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, token) == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Receive packet handler
 // ---------------------------------------------------------------------------
@@ -438,6 +572,9 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
         const dst_ip = f[38..54][0..16];
         const src_mac = f[6..12][0..6];
 
+        // Opportunistically learn the sender's MAC from any incoming IPv6 frame.
+        learnNeighbor(src_ip, src_mac);
+
         if (next_hdr == 0x3A and frame_len >= 54 + payload_len) {
             // ICMPv6
             const icmp_type = f[54];
@@ -445,6 +582,10 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
             if (icmp_type == 135 and payload_len >= 24) {
                 // Target address at f[62..78]
                 const target = f[62..78][0..16];
+                // Also learn sender from SLLAO option if present (option at f[78]: type=1, len=1, mac=f[80..86])
+                if (payload_len >= 32 and f[78] == 1 and f[79] == 1) {
+                    learnNeighbor(src_ip, f[80..86][0..6]);
+                }
                 // Check if solicitation is for our address
                 var match = true;
                 for (g_our_ipv6, 0..) |b, i| {
@@ -455,6 +596,14 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
                 }
                 if (match) {
                     sendNeighborAdvertisement(src_mac, src_ip, target);
+                }
+            }
+            // Neighbor Advertisement (type 136) — update neighbor cache with target/TLLAO
+            else if (icmp_type == 136 and payload_len >= 24) {
+                // Target at f[62..78], TLLAO option at f[78]: type=2, len=1, mac=f[80..86]
+                const target = f[62..78][0..16];
+                if (payload_len >= 32 and f[78] == 2 and f[79] == 1) {
+                    learnNeighbor(target, f[80..86][0..6]);
                 }
             }
             // Echo Request (type 128)
@@ -491,6 +640,18 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
                             lib.ptrFrom([*]u8, DIPC_SCRATCH_VA)[0..copy_len],
                             udp_payload[0..copy_len],
                         );
+
+                        const scratch_hdr: *align(1) lib.PageHeader = @ptrFromInt(DIPC_SCRATCH_VA);
+                        if (scratch_hdr.version == DIPC_WIRE_VERSION and
+                            @as(usize, scratch_hdr.header_len) == DIPC_HEADER_SIZE and
+                            scratch_hdr.dst.endpoint == g_kernel_control_endpoint and
+                            isAllNodesMulticast(&scratch_hdr.dst.node.bytes))
+                        {
+                            for (g_our_ipv6, 0..) |byte, index| {
+                                scratch_hdr.dst.node.bytes[index] = byte;
+                            }
+                        }
+
                         _ = lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, token);
                     }
                 }
@@ -553,8 +714,26 @@ fn pollDipc(token: u64) void {
                 // Ethernet(14) + IPv6(40) + UDP(8) + DIPC = total frame
                 const frame_len = 14 + 40 + 8 + dipc_total;
                 var frame: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
-                // Ethernet: broadcast dst MAC
-                @memset(frame[0..6], 0xFF);
+
+                // Determine Ethernet destination MAC:
+                // - IPv6 multicast ff02::1 → 33:33:00:00:00:01
+                // - other multicast (ff:*) → 33:33 + last 4 bytes
+                // - unicast → neighbor cache lookup; fallback to broadcast + send NDP NS
+                if (dst_node[0] == 0xff) {
+                    // Ethernet multicast MAC: 33:33 + last 4 bytes of IPv6 dst
+                    frame[0] = 0x33;
+                    frame[1] = 0x33;
+                    frame[2] = dst_node[12];
+                    frame[3] = dst_node[13];
+                    frame[4] = dst_node[14];
+                    frame[5] = dst_node[15];
+                } else if (lookupNeighbor(dst_node)) |resolved_mac| {
+                    @memcpy(frame[0..6], &resolved_mac);
+                } else {
+                    // Unknown unicast MAC — send Ethernet broadcast and trigger NDP resolution.
+                    @memset(frame[0..6], 0xFF);
+                    sendNeighborSolicitation(dst_node);
+                }
                 @memcpy(frame[6..12], &g_our_mac);
                 frame[12] = 0x86;
                 frame[13] = 0xDD;
@@ -586,12 +765,9 @@ fn pollDipc(token: u64) void {
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
+    g_kernel_control_endpoint = bs.reserved_kernel_control_endpoint;
 
     lib.serialWrite("netd: starting\n");
-
-    // Register with kernel.
-    _ = lib.syscall(SYS_REGISTER, 0, 0, token);
-    lib.serialWrite("netd: registered\n");
 
     // Scan PCI for legacy virtio-net (VID=1AF4, DID=1000).
     var found_bus: u8 = 0;
@@ -623,6 +799,8 @@ pub export fn umain() noreturn {
 
     if (!found) {
         lib.serialWrite("netd: no virtio-net found; entering idle loop\n");
+        _ = lib.syscall(SYS_REGISTER, 0, 0, token);
+        lib.serialWrite("netd: registered\n");
         while (true) {
             _ = lib.syscall(SYS_RECV, 0, 0, token);
             asm volatile ("pause");
@@ -697,6 +875,17 @@ pub export fn umain() noreturn {
     g_our_ipv6 = deriveLinkLocal(&g_our_mac);
     lib.serialWrite("netd: link-local IPv6 assigned\n");
 
+    if (publishKernelNodeAddress(bs, token)) {
+        lib.serialWrite("netd: published kernel node address\n");
+    } else {
+        lib.serialWrite("netd: failed to publish kernel node address\n");
+    }
+
+    // Register after publishing the canonical node address so later service
+    // registration broadcasts use the updated kernel-local identity.
+    _ = lib.syscall(SYS_REGISTER, 0, 0, token);
+    lib.serialWrite("netd: registered\n");
+
     // Pre-fill RX descriptors.
     fillRxQueue();
 
@@ -717,4 +906,9 @@ pub export fn umain() noreturn {
         pollDipc(token);
         asm volatile ("pause");
     }
+}
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
 }

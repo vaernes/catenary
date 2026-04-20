@@ -175,7 +175,7 @@ pub export fn umain() noreturn {
     lib.serialWrite("windowd: registered at endpoint 9\n");
     lib.serialWrite("windowd: starting TUI...\n");
 
-    const dma_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, token);
+    const dma_phys = lib.syscall(SYS_ALLOC_DMA, 2, 0, token);
     if (dma_phys == 0) while (true) asm volatile ("pause");
 
     drawTui(dma_phys, token);
@@ -206,7 +206,7 @@ pub export fn umain() noreturn {
                 } else if (evt.ascii == '\n') {
                     if (form_name_len > 0) {
                         const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA + 4096); // slot 1 VA
-                        const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+                        const local_node = lib.queryCurrentNode(bs, token, dma_phys + 4096, DMA_BASE_VA + 4096, 9) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
                         const head: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
                         head.* = .{
                             .magic = lib.WireMagic,

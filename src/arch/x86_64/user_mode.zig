@@ -235,6 +235,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             const table = @import("../../ipc/manager.zig").endpointTable();
+            const identity = @import("../../ipc/identity.zig");
             switch (kind) {
                 .netd => {
                     table.registerReservedNetdService(sid);
@@ -259,11 +260,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const dst_node = dipc.Ipv6Addr{ .bytes = [_]u8{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
             const dst_addr = dipc.Address{
                 .node = dst_node,
-                .endpoint = @intFromEnum(@import("../../ipc/identity.zig").ReservedEndpoint.kernel_control),
+                .endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
             };
             const src_addr = dipc.Address{
                 .node = node_config.getLocalNode(),
-                .endpoint = @intFromEnum(@import("../../ipc/identity.zig").ReservedEndpoint.kernel_control),
+                .endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
             };
 
             var payload = control_protocol.ControlHeader{
@@ -283,6 +284,24 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const msg_page = dipc.allocPageMessage(hhdm_offset_local, src_addr, dst_addr, &combined_payload) catch 0;
             if (msg_page != 0) {
                 _ = router.routePageWithLocalNode(hhdm_offset_local, table, msg_page) catch {};
+            }
+
+            const configd_addr = dipc.Address{
+                .node = node_config.getLocalNode(),
+                .endpoint = @intFromEnum(identity.ReservedEndpoint.configd),
+            };
+            const configd_page = dipc.allocPageMessage(hhdm_offset_local, src_addr, configd_addr, &combined_payload) catch 0;
+            if (configd_page != 0) {
+                _ = router.routePageWithLocalNode(hhdm_offset_local, table, configd_page) catch {};
+            }
+
+            const clusterd_addr = dipc.Address{
+                .node = node_config.getLocalNode(),
+                .endpoint = @intFromEnum(identity.ReservedEndpoint.clusterd),
+            };
+            const clusterd_page = dipc.allocPageMessage(hhdm_offset_local, src_addr, clusterd_addr, &combined_payload) catch 0;
+            if (clusterd_page != 0) {
+                _ = router.routePageWithLocalNode(hhdm_offset_local, table, clusterd_page) catch {};
             }
 
             return 0;
@@ -381,7 +400,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
 
             const identity = @import("../../ipc/identity.zig");
             const node_config = @import("../../ipc/node_config.zig");
-            if (dipc.Ipv6Addr.eql(dst_hdr.dst.node, node_config.getLocalNode()) and
+            if (node_config.isLocalAddress(dst_hdr.dst.node) and
                 dst_hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control))
             {
                 const control_handler = @import("../../control/control_handler.zig");

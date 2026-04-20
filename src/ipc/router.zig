@@ -37,7 +37,7 @@ pub fn routePage(
     if (hdr.magic != dipc.WireMagic or hdr.version != dipc.WireVersion) return error.BadHeader;
     if (!dipc.verifyPageAuth(hhdm_offset, page_phys)) return error.BadSignature;
 
-    if (dipc.Ipv6Addr.eql(hdr.dst.node, local_node)) {
+    if (dipc.Ipv6Addr.eql(hdr.dst.node, local_node) or dipc.Ipv6Addr.eql(hdr.dst.node, dipc.Ipv6Addr.loopback())) {
         const target = table.lookup(hdr.dst.endpoint) orelse return error.NoRoute;
         switch (target) {
             .thread => |tid| {
@@ -49,7 +49,10 @@ pub fn routePage(
                 return .QueuedForMicrovm;
             },
             .service => |sid| {
-                if (!scheduler.sendToService(sid, page_phys)) return error.Busy;
+                if (!scheduler.sendToService(sid, page_phys)) {
+                    
+                    return error.Busy;
+                }
                 return .DeliveredLocal;
             },
         }
@@ -126,6 +129,22 @@ test "routePage remote requires net daemon" {
 
     const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
     try std.testing.expectError(error.NoNetDaemon, res);
+}
+
+test "routePage treats loopback as local alias" {
+    var table: endpoint_table.EndpointTable = undefined;
+    table.init();
+
+    var local: dipc.Ipv6Addr = dipc.Ipv6Addr.loopback();
+    local.bytes[0] = 0xFE;
+    local.bytes[1] = 0x80;
+    local.bytes[15] = 0x42;
+
+    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
+    _ = makeTestHeader(&page, local, dipc.Ipv6Addr.loopback(), 1234);
+
+    const res = routePage(0, local, &table, @intFromPtr(&page));
+    try std.testing.expectError(error.NoRoute, res);
 }
 
 test "routePage queues for microvm" {

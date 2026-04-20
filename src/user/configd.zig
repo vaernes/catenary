@@ -228,7 +228,7 @@ fn drawUi(text_phys: u64, token: u64, local_node: [16]u8) void {
 
 fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u64) void {
     const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_DIPC_SLOT);
-    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    const local_node = lib.queryCurrentNode(bs, token, dipc_phys_slot1, DMA_DIPC_SLOT, EP_CONFIGD) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
 
     // mem_pages = 256 (1 GiB / 4 KiB = 256 pages for a 1 MiB VM)
     const mem_pages: u32 = 256;
@@ -357,6 +357,7 @@ fn handleRegistrySync(page_va: u64) void {
     if (slot) |s| {
         // Accumulate service kind bitmask so we can display which services are present
         s.services |= @as(u16, 1) << @as(u4, @truncate(payload.service_kind & 0xF));
+        lib.serialWrite("configd: registry sync applied\n");
     }
 }
 
@@ -407,4 +408,9 @@ pub export fn umain() noreturn {
 
         asm volatile ("pause");
     }
+}
+
+export fn _user_start() callconv(.c) noreturn {
+    umain();
+    while (true) {}
 }
