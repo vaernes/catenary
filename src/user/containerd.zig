@@ -20,7 +20,8 @@ fn printHex(n: u64) void {
     var shift: u6 = 60;
     while (true) {
         const nibble: usize = @intCast((n >> shift) & 0xF);
-        lib.outb(0x3F8, hex[nibble]);
+        const c = hex[nibble];
+        _ = lib.syscall(lib.SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
         if (shift == 0) break;
         shift -= 4;
     }
@@ -81,7 +82,9 @@ pub export fn umain() noreturn {
     };
 
     lib.serialWrite("containerd: sending image block to storaged...\n");
-    _ = lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token);
+    while (lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token) != 0) {
+        asm volatile ("pause");
+    }
 
     lib.serialWrite("containerd: entering event loop\n");
     while (true) {
@@ -98,8 +101,10 @@ pub export fn umain() noreturn {
                         lib.serialWrite("containerd: unpack block WRITE FAILED!\n");
                     }
                 }
+                _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
+            } else {
+                _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
-            _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
         }
         asm volatile ("pause");
     }

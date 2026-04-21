@@ -407,20 +407,37 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // Kernel copies it to a fresh PMM page, re-signs with kernel auth key, and routes.
         // Returns 0 on success, 1 on failure.
         6 => {
-            const sid6 = service_registry.serviceIdForCapability(token) orelse return 1;
+            const sid6 = service_registry.serviceIdForCapability(token) orelse {
+                serialWrite("[SEND_PAGE] Invalid capability token\n");
+                return 1;
+            };
             // Rate-limit: reject if this service already has too many pages in-flight.
             if (!service_registry.acquireDipcSlot(sid6)) {
                 serialWrite("[SECURITY] DIPC rate limit exceeded for service\n");
                 return 1;
             }
+            var sender_slot_handed_off = false;
+            defer if (!sender_slot_handed_off) service_registry.releaseDipcSlot(sid6);
             const src_phys = arg0;
-            if (src_phys == 0 or (src_phys & 0xFFF) != 0) return 1;
+            if (src_phys == 0 or (src_phys & 0xFFF) != 0) {
+                serialWrite("[SEND_PAGE] Bad physical address\n");
+                return 1;
+            }
             const src_hdr: *const dipc.PageHeader = @ptrFromInt(src_phys + hhdm_offset);
-            if (src_hdr.magic != dipc.WireMagic) return 1;
+            if (src_hdr.magic != dipc.WireMagic) {
+                serialWrite("[SEND_PAGE] Bad magic\n");
+                return 1;
+            }
             const payload_len6 = @as(usize, src_hdr.payload_len);
-            if (payload_len6 > dipc.MAX_PAYLOAD) return 1;
+            if (payload_len6 > dipc.MAX_PAYLOAD) {
+                serialWrite("[SEND_PAGE] Payload too large\n");
+                return 1;
+            }
             // Allocate a fresh kernel-owned page for routing.
-            const dst_phys = pmm.allocPage() orelse return 1;
+            const dst_phys = pmm.allocPage() orelse {
+                serialWrite("[SEND_PAGE] OOM\n");
+                return 1;
+            };
             const dst_virt = dst_phys + hhdm_offset;
             // Copy header + payload.
             const src_bytes: [*]const u8 = @ptrFromInt(src_phys + hhdm_offset);
@@ -434,11 +451,22 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
 
             const identity = @import("../../ipc/identity.zig");
             const node_config = @import("../../ipc/node_config.zig");
-            if (node_config.isLocalAddress(dst_hdr.dst.node) and
-                dst_hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control))
-            {
+            _ = node_config; // temporarily unused
+
+            const is_kernel_control = dst_hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control);
+
+            if (is_kernel_control) {
                 const control_handler = @import("../../control/control_handler.zig");
-                control_handler.handleKernelControlPage(hhdm_offset, table6, dst_phys) catch {
+                control_handler.handleKernelControlPage(hhdm_offset, table6, dst_phys) catch |err| {
+                    if (err == error.Unauthorized) {
+                        serialWrite("[SEND_PAGE] handleKernelControlPage Unauthorized\n");
+                    } else if (err == error.BadHeader) {
+                        serialWrite("[SEND_PAGE] handleKernelControlPage BadHeader\n");
+                    } else if (err == error.BadPayload) {
+                        serialWrite("[SEND_PAGE] handleKernelControlPage BadPayload\n");
+                    } else {
+                        serialWrite("[SEND_PAGE] handleKernelControlPage (other error)\n");
+                    }
                     pmm.freePage(dst_phys);
                     return 1;
                 };
@@ -447,9 +475,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             }
 
             _ = router.routePageWithLocalNode(hhdm_offset, table6, dst_phys) catch {
+                serialWrite("[SEND_PAGE] routePageWithLocalNode failed\n");
                 pmm.freePage(dst_phys);
                 return 1;
             };
+            sender_slot_handed_off = true;
             return 0;
         },
         // op=7: map a physical MMIO range into service IO window (0x7E00_0000_0000).
@@ -577,6 +607,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             scheduler.schedule();
             return 0xFFFFFFFF;
         },
+        24 => {
+            _ = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
+            scheduler.schedule();
+            return 0;
+        },
         // op=9: SYS_SERIAL_WRITE — atomically write a user-space buffer to
         // the serial port.  INT gate has IF=0, so this cannot be preempted by
         // the timer, preventing interleaved output from concurrent services.
@@ -598,6 +633,31 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 if (smap_active) cpu.clac();
             }
             return 0;
+        },
+        22, 23 => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
+            const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
+            if (kind != .netd and kind != .storaged) return 0xFFFFFFFF;
+            const port = @as(u16, @truncate(arg0));
+            const size = @as(u8, @truncate(arg1 >> 32));
+            const val = @as(u32, @truncate(arg1));
+
+            if (op == 22) { // SYS_PORT_IN
+                return switch (size) {
+                    1 => @as(u64, cpu.inb(port)),
+                    2 => @as(u64, cpu.inw(port)),
+                    4 => @as(u64, cpu.inl(port)),
+                    else => 0xFFFFFFFF,
+                };
+            } else { // SYS_PORT_OUT
+                switch (size) {
+                    1 => cpu.outb(port, @as(u8, @truncate(val))),
+                    2 => cpu.outw(port, @as(u16, @truncate(val))),
+                    4 => cpu.outl(port, val),
+                    else => {},
+                }
+                return 0;
+            }
         },
         else => {},
     }

@@ -48,9 +48,11 @@ pub var last_tsc_stamp: u64 = 0;
 pub fn init(offset: u64) void {
     hhdm_offset = offset;
     for (0..THREAD_TARGET_COUNT) |i| {
-        threads[i].state = .Empty;
-        threads[i].id = 0;
-        threads[i].sid = 0;
+        threads[i] = Thread{
+            .rsp = 0,
+            .id = 0,
+            .state = .Empty,
+        };
     }
     threads[0].state = .Running;
     threads[0].id = 0;
@@ -98,10 +100,12 @@ pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootst
 
             const tid = next_thread_id;
             next_thread_id += 1;
-            threads[i].rsp = rsp;
-            threads[i].id = tid;
-            threads[i].sid = sid;
-            threads[i].state = .Ready;
+            threads[i] = Thread{
+                .rsp = rsp,
+                .id = tid,
+                .sid = sid,
+                .state = .Ready,
+            };
 
             arch.cpu.outb(0x3F8, '!');
             const hex = "0123456789ABCDEF";
@@ -136,9 +140,11 @@ pub fn spawn(entry: *const fn () void) !u32 {
             for (0..6) |j| @as(*u64, @ptrFromInt(rsp + j * 8)).* = 0;
             const id = next_thread_id;
             next_thread_id += 1;
-            threads[i].rsp = rsp;
-            threads[i].id = id;
-            threads[i].state = .Ready;
+            threads[i] = Thread{
+                .rsp = rsp,
+                .id = id,
+                .state = .Ready,
+            };
             return id;
         }
     }
@@ -218,12 +224,14 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
 
             const id = next_thread_id;
             next_thread_id += 1;
-            threads[i].rsp = rsp;
-            threads[i].id = id;
-            threads[i].is_vmx = is_vmx;
-            threads[i].vmid = vmid;
-            threads[i].vcpu_idx = vcpu_idx;
-            threads[i].state = .Ready;
+            threads[i] = Thread{
+                .rsp = rsp,
+                .id = id,
+                .state = .Ready,
+                .is_vmx = is_vmx,
+                .vmid = vmid,
+                .vcpu_idx = vcpu_idx,
+            };
             return id;
         }
     }

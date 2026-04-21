@@ -49,6 +49,7 @@ pub const SYS_MAP_RECV = 17;
 pub const SYS_FB_DRAW_COLORED = 18;
 pub const SYS_FB_FILL_RECT = 19;
 pub const SYS_TRY_RECV = 20;
+pub const SYS_YIELD = 24;
 
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -65,6 +66,7 @@ pub const BootstrapDescriptor = extern struct {
     runtime_mode: u16,
     _r0: u16,
     service_id: u32,
+    user_id: u32,
     flags: u32,
     persistent_trap_vector: u8,
     _r1: u8,
@@ -118,7 +120,8 @@ pub fn printHex(n: u64) void {
     var shift: u6 = 60;
     while (true) {
         const nibble: usize = @intCast((n >> shift) & 0xF);
-        outb(0x3F8, hex[nibble]);
+        const c = hex[nibble];
+        _ = syscall(SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
         if (shift == 0) break;
         shift -= 4;
     }

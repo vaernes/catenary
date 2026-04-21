@@ -34,11 +34,28 @@ pub fn routePage(
     page_phys: u64,
 ) RouteError!RouteResult {
     const hdr = dipc.headerFromPage(hhdm_offset, page_phys);
-    if (hdr.magic != dipc.WireMagic or hdr.version != dipc.WireVersion) return error.BadHeader;
-    if (!dipc.verifyPageAuth(hhdm_offset, page_phys)) return error.BadSignature;
+    if (hdr.magic != dipc.WireMagic) {
+        const arch_cpu = @import("../arch.zig").cpu;
+        for ("Routing failed: BadMagic\n") |c| arch_cpu.outb(0x3F8, c);
+        return error.BadHeader;
+    }
+    if (hdr.version != dipc.WireVersion) {
+        const arch_cpu = @import("../arch.zig").cpu;
+        for ("Routing failed: BadVersion\n") |c| arch_cpu.outb(0x3F8, c);
+        return error.BadHeader;
+    }
+    if (!dipc.verifyPageAuth(hhdm_offset, page_phys)) {
+        const arch_cpu = @import("../arch.zig").cpu;
+        for ("Routing failed: BadSignature\n") |c| arch_cpu.outb(0x3F8, c);
+        return error.BadSignature;
+    }
 
     if (dipc.Ipv6Addr.eql(hdr.dst.node, local_node) or dipc.Ipv6Addr.eql(hdr.dst.node, dipc.Ipv6Addr.loopback())) {
-        const target = table.lookup(hdr.dst.endpoint) orelse return error.NoRoute;
+        const target = table.lookup(hdr.dst.endpoint) orelse {
+            const arch_cpu = @import("../arch.zig").cpu;
+            for ("Routing failed: NoRoute\n") |c| arch_cpu.outb(0x3F8, c);
+            return error.NoRoute;
+        };
         switch (target) {
             .thread => |tid| {
                 if (!scheduler.send(tid, page_phys)) return error.Busy;
@@ -50,7 +67,6 @@ pub fn routePage(
             },
             .service => |sid| {
                 if (!scheduler.sendToService(sid, page_phys)) {
-                    
                     return error.Busy;
                 }
                 return .DeliveredLocal;

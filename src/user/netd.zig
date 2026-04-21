@@ -9,55 +9,63 @@ const lib = @import("lib.zig");
 // Low-level I/O helpers
 // ---------------------------------------------------------------------------
 
+const SYS_PORT_IN = 22;
+const SYS_PORT_OUT = 23;
+
+fn outb(port: u16, val: u8) void {
+    _ = lib.syscall(SYS_PORT_OUT, port, (@as(u64, 1) << 32) | val, g_token);
+}
+
 fn outw(port: u16, val: u16) void {
-    asm volatile ("outw %[val], %[port]"
-        :
-        : [val] "{ax}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
+    _ = lib.syscall(SYS_PORT_OUT, port, (@as(u64, 2) << 32) | val, g_token);
 }
 fn outl(port: u16, val: u32) void {
-    asm volatile ("outl %[val], %[port]"
-        :
-        : [val] "{eax}" (val),
-          [port] "{dx}" (port),
-        : .{ .memory = true });
+    _ = lib.syscall(SYS_PORT_OUT, port, (@as(u64, 4) << 32) | val, g_token);
 }
 fn inb(port: u16) u8 {
-    return asm volatile ("inb %[port], %[val]"
-        : [val] "={al}" (-> u8),
-        : [port] "{dx}" (port),
-    );
+    return @as(u8, @truncate(lib.syscall(SYS_PORT_IN, port, (@as(u64, 1) << 32), g_token)));
 }
 fn inw(port: u16) u16 {
-    return asm volatile ("inw %[port], %[val]"
-        : [val] "={ax}" (-> u16),
-        : [port] "{dx}" (port),
-    );
+    return @as(u16, @truncate(lib.syscall(SYS_PORT_IN, port, (@as(u64, 2) << 32), g_token)));
 }
 fn inl(port: u16) u32 {
-    return asm volatile ("inl %[port], %[val]"
-        : [val] "={eax}" (-> u32),
-        : [port] "{dx}" (port),
-    );
+    return @as(u32, @truncate(lib.syscall(SYS_PORT_IN, port, (@as(u64, 4) << 32), g_token)));
 }
 
 fn serialByte(c: u8) void {
-    lib.outb(0x3F8, c);
+    _ = lib.syscall(lib.SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
 }
+
+fn hexDigit(nibble: u8) u8 {
+    return "0123456789ABCDEF"[nibble & 0x0F];
+}
+
+fn writeMacAddressLine(mac: *const [6]u8) void {
+    var line: [18]u8 = undefined;
+    for (mac, 0..) |b, i| {
+        const base = i * 3;
+        line[base] = hexDigit(@as(u8, @truncate(b >> 4)));
+        line[base + 1] = hexDigit(b);
+        line[base + 2] = if (i == mac.len - 1) '\n' else ':';
+    }
+    lib.serialWrite(line[0..]);
+}
+
 fn printHex(n: u64) void {
     const hex = "0123456789ABCDEF";
     var shift: u6 = 60;
     while (true) {
         const nibble: usize = @intCast((n >> shift) & 0xF);
-        lib.outb(0x3F8, hex[nibble]);
+        const c = hex[nibble];
+        _ = lib.syscall(lib.SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
         if (shift == 0) break;
         shift -= 4;
     }
 }
 fn printDec(n: u64) void {
     if (n == 0) {
-        lib.outb(0x3F8, '0');
+        const c: u8 = '0';
+        _ = lib.syscall(lib.SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
         return;
     }
     var buf: [20]u8 = undefined;
@@ -70,7 +78,8 @@ fn printDec(n: u64) void {
     var i: usize = len;
     while (i > 0) {
         i -= 1;
-        lib.outb(0x3F8, buf[i]);
+        const c = buf[i];
+        _ = lib.syscall(lib.SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
     }
 }
 
@@ -509,20 +518,19 @@ fn sendEchoReply(
 
 // Derive link-local IPv6 address from MAC (EUI-64).
 // fe80::XX/10 where XX encodes MAC via RFC 4291 App A.
-fn deriveLinkLocal(mac: *const [6]u8) [16]u8 {
-    var ip: [16]u8 = [_]u8{0} ** 16;
-    ip[0] = 0xFE;
-    ip[1] = 0x80;
+fn deriveLinkLocal(mac: *const [6]u8, out: *[16]u8) void {
+    @memset(out[0..], 0);
+    out[0] = 0xFE;
+    out[1] = 0x80;
     // EUI-64: insert FFFE in middle, flip U/L bit
-    ip[8] = mac[0] ^ 0x02;
-    ip[9] = mac[1];
-    ip[10] = mac[2];
-    ip[11] = 0xFF;
-    ip[12] = 0xFE;
-    ip[13] = mac[3];
-    ip[14] = mac[4];
-    ip[15] = mac[5];
-    return ip;
+    out[8] = mac[0] ^ 0x02;
+    out[9] = mac[1];
+    out[10] = mac[2];
+    out[11] = 0xFF;
+    out[12] = 0xFE;
+    out[13] = mac[3];
+    out[14] = mac[4];
+    out[15] = mac[5];
 }
 
 fn publishKernelNodeAddress(bs: *const BootstrapDescriptor, token: u64) bool {
@@ -762,8 +770,11 @@ fn pollDipc(token: u64) void {
 // Entry point
 // ---------------------------------------------------------------------------
 
+var g_token: u64 = 0;
+
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    g_token = bs.capability_token;
     const token = bs.capability_token;
     g_kernel_control_endpoint = bs.reserved_kernel_control_endpoint;
 
@@ -823,9 +834,9 @@ pub export fn umain() noreturn {
     lib.serialWrite("\n");
 
     // Reset device.
-    lib.outb(g_io_base + VIRTIO_PCI_STATUS, 0);
-    lib.outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE);
-    lib.outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    outb(g_io_base + VIRTIO_PCI_STATUS, 0);
+    outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE);
+    outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
     // Negotiate features (accept none beyond basic).
     _ = inl(g_io_base + VIRTIO_PCI_HOST_FEATURES);
@@ -858,21 +869,17 @@ pub export fn umain() noreturn {
     outl(g_io_base + VIRTIO_PCI_QUEUE_ADDR, @truncate(g_tx_ring_phys >> 12));
 
     // Enable device.
-    lib.outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
+    outb(g_io_base + VIRTIO_PCI_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK);
 
     // Read MAC address from config space.
     for (0..6) |i| {
         g_our_mac[i] = inb(g_io_base + VIRTIO_NET_MAC_OFFSET + @as(u16, @intCast(i)));
     }
     lib.serialWrite("netd: MAC=");
-    for (g_our_mac) |b| {
-        printHex(b);
-        serialByte(':');
-    }
-    serialByte('\n');
+    writeMacAddressLine(&g_our_mac);
 
     // Derive link-local IPv6 address from MAC (EUI-64 per RFC 4291).
-    g_our_ipv6 = deriveLinkLocal(&g_our_mac);
+    deriveLinkLocal(&g_our_mac, &g_our_ipv6);
     lib.serialWrite("netd: link-local IPv6 assigned\n");
 
     if (publishKernelNodeAddress(bs, token)) {

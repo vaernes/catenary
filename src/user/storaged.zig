@@ -13,7 +13,8 @@ fn printHex(n: u64) void {
     var shift: u6 = 60;
     while (true) {
         const nibble: usize = @intCast((n >> shift) & 0xF);
-        lib.outb(0x3F8, hex[nibble]);
+        const c = hex[nibble];
+        _ = lib.syscall(lib.SYS_SERIAL_WRITE, @intFromPtr(&c), 1, 0);
         if (shift == 0) break;
         shift -= 4;
     }
@@ -32,6 +33,13 @@ const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 const IO_WINDOW_VA: u64 = 0x0000_7E00_0000_0000;
 const PAGE_SIZE: u64 = 4096;
+
+fn spinPauseWithYield(counter: u32) void {
+    asm volatile ("pause");
+    if ((counter & 0x3FFF) == 0) {
+        _ = lib.syscall(lib.SYS_YIELD, 0, 0, g_token);
+    }
+}
 
 // PCI config read/write via kernel lib.syscalls
 fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
@@ -215,7 +223,7 @@ fn submitAdmin(sqe: NvmeSqe) u16 {
             adminCqDoorbell(g_adm_cq_head);
             return @truncate(status);
         }
-        asm volatile ("pause");
+        spinPauseWithYield(@as(u32, @truncate(timeout)));
     }
     return 0xFFFF; // timeout
 }
@@ -238,7 +246,7 @@ fn submitIO(sqe: NvmeSqe) u16 {
             ioCqDoorbell(g_io_cq_head);
             return @truncate(status);
         }
-        asm volatile ("pause");
+        spinPauseWithYield(timeout);
     }
     return 0xFFFF;
 }
@@ -416,8 +424,6 @@ pub export fn umain() noreturn {
     g_token = bs_desc.capability_token;
 
     lib.serialWrite("storaged: starting\n");
-    _ = lib.syscall(SYS_REGISTER, 0, bs_desc.reserved_storaged_endpoint, g_token);
-    lib.serialWrite("storaged: registered\n");
 
     // ----- PCI scan for NVMe (class=0x01, subclass=0x08, prog_if=0x02) -----
     var nvme_bus: u8 = 0;
@@ -500,7 +506,7 @@ pub export fn umain() noreturn {
     nvmeW32(NVME_REG_CC, nvmeR32(NVME_REG_CC) & ~NVME_CC_EN);
     {
         var t: u32 = 100_000;
-        while (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY != 0 and t > 0) t -= 1;
+        while (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY != 0 and t > 0) : (t -= 1) spinPauseWithYield(t);
     }
 
     // ----- Configure admin queues -----
@@ -514,7 +520,7 @@ pub export fn umain() noreturn {
     nvmeW32(NVME_REG_CC, cc);
     {
         var t: u32 = 2_000_000;
-        while (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY == 0 and t > 0) t -= 1;
+        while (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY == 0 and t > 0) : (t -= 1) spinPauseWithYield(t);
     }
     if (nvmeR32(NVME_REG_CSTS) & NVME_CSTS_RDY == 0) {
         lib.serialWrite("storaged: controller did not become ready\n");
@@ -555,6 +561,9 @@ pub export fn umain() noreturn {
         while (true) asm volatile ("pause");
     }
     lib.serialWrite("storaged: IO queues ready\n");
+
+    _ = lib.syscall(SYS_REGISTER, 0, bs_desc.reserved_storaged_endpoint, g_token);
+    lib.serialWrite("storaged: registered\n");
 
     // ----- Main event loop -----
     while (true) {

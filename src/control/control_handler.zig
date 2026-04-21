@@ -32,10 +32,16 @@ fn payloadBase(hhdm_offset: u64, page_phys: u64) [*]const u8 {
 }
 
 fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.ControlOp) bool {
-    _ = op;
-
-    if (!dipc.Ipv6Addr.eql(hdr.src.node, node_config.getLocalNode())) return false;
-    return hdr.src.endpoint == @intFromEnum(identity.ReservedEndpoint.netd);
+    const dipc_local = node_config.getLocalNode();
+    if (op != .set_node_addr and !dipc.Ipv6Addr.eql(hdr.src.node, dipc_local)) {
+        for ("Control: reject: src_node mismatch\n") |c| arch_cpu.outb(0x3F8, c);
+        return false;
+    }
+    if (hdr.src.endpoint != @intFromEnum(identity.ReservedEndpoint.netd)) {
+        for ("Control: reject: src_endpoint mismatch\n") |c| arch_cpu.outb(0x3F8, c);
+        return false;
+    }
+    return true;
 }
 
 fn isAuthorizedMicrovmSource(hdr: *const dipc.PageHeader) bool {
@@ -96,10 +102,20 @@ pub fn handleKernelControlPage(
             table.registerReservedDashdService(sid);
         },
         .set_node_addr => {
-            if (!isAuthorizedControlSource(hdr, ch.op)) return error.Unauthorized;
-            if (remaining != @sizeOf(control_protocol.SetNodeAddrPayload)) return error.BadPayload;
+            if (!isAuthorizedControlSource(hdr, ch.op)) {
+                for ("Control: set_node_addr auth failed\n") |c| arch_cpu.outb(0x3F8, c);
+                return error.Unauthorized;
+            }
+            if (remaining != @sizeOf(control_protocol.SetNodeAddrPayload)) {
+                for ("Control: set_node_addr length failed\n") |c| arch_cpu.outb(0x3F8, c);
+                return error.BadPayload;
+            }
             const p: *const control_protocol.SetNodeAddrPayload = @ptrCast(@alignCast(payload_ptr));
-            if (!node_config.assignLocalNode(p.addr)) return error.NodeLocked;
+            if (!node_config.assignLocalNode(p.addr)) {
+                for ("Control: set_node_addr lock failed\n") |c| arch_cpu.outb(0x3F8, c);
+                return error.NodeLocked;
+            }
+            for ("Control: set_node_addr success\n") |c| arch_cpu.outb(0x3F8, c);
         },
         .revoke_node_addr => {
             if (!isAuthorizedControlSource(hdr, ch.op)) return error.Unauthorized;

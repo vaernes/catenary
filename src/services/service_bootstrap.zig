@@ -49,6 +49,7 @@ pub const ServiceKind = enum(u16) {
 ///   op=6  (SYS_SEND)               — send DIPC message
 ///   op=9  (SYS_SERIAL_WRITE)       — debug serial output
 ///   op=17 (SYS_MAP_RECV)           — map received page into VA
+///   op=24 (SYS_YIELD)              — cooperative scheduler yield
 ///
 /// Service-specific additions:
 ///   netd/storaged: op=5 (DMA alloc), op=7 (MMIO map), op=13/14 (PCI config)
@@ -64,12 +65,15 @@ const COMMON_OPS_LOW: u32 =
     (1 << 5) | // SYS_DMA_ALLOC
     (1 << 6) | // SYS_SEND
     (1 << 9) | // SYS_SERIAL_WRITE
-    (1 << 17); // SYS_MAP_RECV
+    (1 << 17) | // SYS_MAP_RECV
+    (1 << 24); // SYS_YIELD
 
 const HW_ACCESS_OPS_LOW: u32 =
     (1 << 7) | // SYS_MMIO_MAP
     (1 << 13) | // SYS_PCI_READ
-    (1 << 14); // SYS_PCI_WRITE
+    (1 << 14) | // SYS_PCI_WRITE
+    (1 << 22) | // SYS_PORT_IN
+    (1 << 23); // SYS_PORT_OUT
 
 const FB_DRAW_OP: u32 = (1 << 16); // SYS_DRAW_TEXT
 const KBD_OP: u32 = (1 << 8); // SYS_READ_SCANCODE

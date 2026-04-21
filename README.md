@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/language-Zig-F7A41D?style=flat-square" alt="Zig"/>
   <img src="https://img.shields.io/badge/arch-x86__64-36454F?style=flat-square" alt="x86_64"/>
   <img src="https://img.shields.io/badge/bootloader-Limine-CD7F32?style=flat-square" alt="Limine"/>
-  <img src="https://img.shields.io/badge/status-Phase%205-2E8B57?style=flat-square" alt="Phase 5"/>
+  <img src="https://img.shields.io/badge/status-Phase%206-blue?style=flat-square" alt="Phase 6"/>
 </p>
 
 ---
@@ -77,7 +77,8 @@ Catenary OS acts as a **Type-1 hypervisor**, booting stripped-down Linux kernels
 - [x] **Phase 2: Core Abstractions** — CPU descriptors and physical memory management.
 - [x] **Phase 3: Scheduling & IPC** — Task switching and local message passing.
 - [x] **Phase 4: Hypervisor & MicroVMs** — Intel VT-x integration and booting isolated Linux guest kernels.
-- [ ] **Phase 5: Networking & Orchestration** (*Current*) — IPv6 networking, distributed IPC, and multi-node cluster orchestration.
+- [x] **Phase 5: Networking & Orchestration** — IPv6 networking, distributed IPC, and multi-node cluster orchestration.
+- [ ] **Phase 6: Storage & Persistent State** (*Current*) — NVMe drivers, block I/O, and encrypted storage volumes.
 
 ---
 
