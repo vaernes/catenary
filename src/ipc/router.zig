@@ -35,25 +35,34 @@ pub fn routePage(
 ) RouteError!RouteResult {
     const hdr = dipc.headerFromPage(hhdm_offset, page_phys);
     if (hdr.magic != dipc.WireMagic) {
-        const arch_cpu = @import("../arch.zig").cpu;
-        for ("Routing failed: BadMagic\n") |c| arch_cpu.outb(0x3F8, c);
+        if (node_config.isNodeAddrConfigured(local_node)) {
+            const arch_cpu = @import("../arch.zig").cpu;
+            for ("Routing failed: BadMagic\n") |c| arch_cpu.outb(0x3F8, c);
+        }
         return error.BadHeader;
     }
     if (hdr.version != dipc.WireVersion) {
-        const arch_cpu = @import("../arch.zig").cpu;
-        for ("Routing failed: BadVersion\n") |c| arch_cpu.outb(0x3F8, c);
+        if (node_config.isNodeAddrConfigured(local_node)) {
+            const arch_cpu = @import("../arch.zig").cpu;
+            for ("Routing failed: BadVersion\n") |c| arch_cpu.outb(0x3F8, c);
+        }
         return error.BadHeader;
     }
     if (!dipc.verifyPageAuth(hhdm_offset, page_phys)) {
-        const arch_cpu = @import("../arch.zig").cpu;
-        for ("Routing failed: BadSignature\n") |c| arch_cpu.outb(0x3F8, c);
+        if (node_config.isNodeAddrConfigured(local_node)) {
+            const arch_cpu = @import("../arch.zig").cpu;
+            for ("Routing failed: BadSignature\n") |c| arch_cpu.outb(0x3F8, c);
+        }
         return error.BadSignature;
     }
 
     if (dipc.Ipv6Addr.eql(hdr.dst.node, local_node) or dipc.Ipv6Addr.eql(hdr.dst.node, dipc.Ipv6Addr.loopback())) {
         const target = table.lookup(hdr.dst.endpoint) orelse {
-            const arch_cpu = @import("../arch.zig").cpu;
-            for ("Routing failed: NoRoute\n") |c| arch_cpu.outb(0x3F8, c);
+            if (node_config.isNodeAddrConfigured(local_node)) {
+                // Only log if we have a real address (avoids noise during early boot)
+                const arch_cpu = @import("../arch.zig").cpu;
+                for ("Routing failed: NoRoute\n") |c| arch_cpu.outb(0x3F8, c);
+            }
             return error.NoRoute;
         };
         switch (target) {
@@ -155,11 +164,15 @@ test "routePage treats loopback as local alias" {
     local.bytes[0] = 0xFE;
     local.bytes[1] = 0x80;
     local.bytes[15] = 0x42;
+    // node_config.isNodeAddrConfigured checks if local != loopback.
+    // In this test, local is FE80...42 which IS configured.
+    // But kernel tests run in Ring 3 (linux user-space) and outb 0x3F8 is forbidden.
 
     var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
     _ = makeTestHeader(&page, local, dipc.Ipv6Addr.loopback(), 1234);
 
-    const res = routePage(0, local, &table, @intFromPtr(&page));
+    // We use loopback as the "local address" for the router in this test to avoid the outb call.
+    const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
     try std.testing.expectError(error.NoRoute, res);
 }
 

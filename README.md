@@ -143,7 +143,7 @@ Welcome to my hobby project! Catenary OS is an operating system built from scrat
 
 To prevent the AI from simply regurgitating existing templates, the project enforces a strict set of "hard mode" constraints:
 
-* **The Language Constraint (Zig):** Written entirely in Zig. Because Zig is a relatively new language with an actively evolving syntax, the AI has a much smaller pool of training data to rely on. This forces the synthesis of novel logic rather than copy-pasting C/C++ Stack Overflow answers.
+* **The Language Constraint (Zig):** Written entirely in Zig. Zig has a substantially smaller training corpus than C/C++ or Rust, which reduces the risk of the AI pattern-matching against well-known codebases and forces the synthesis of novel logic rather than recycling familiar templates.
 * **No Linux/Unix DNA in the Kernel:** Ring 0 is strictly forbidden from referencing, copying, or emulating Linux kernel internals, Unix architecture, or POSIX standards. The microkernel design must be entirely original. (OCI/Docker compatibility is achieved the honest way: by running real Linux kernels inside hardware-isolated MicroVMs, not by reimplementing Linux semantics in the kernel.)
 * **Freestanding Environment:** Built entirely from scratch on bare metal. No libc, no OS-level syscall wrappers, and no existing OS-level safety nets. Zig's standard library is used only for the OS-independent utilities it provides in freestanding mode (formatting, data structures, math) — everything requiring a host OS is off-limits.
 

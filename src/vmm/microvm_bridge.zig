@@ -109,10 +109,15 @@ pub fn routeVirtioBlkNotify(vmid: u32, queue_idx: u16) void {
     q.last_avail_idx = idx;
 }
 
-fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virtio_blk.QueueState, chain_head: u16) !void {
-    _ = inst;
+const DescriptorChainInfo = struct {
+    request: virtio_blk.RequestHeader,
+    data_hpa: u64,
+    data_len: u32,
+    status_addr: u64,
+};
+
+fn decodeDescriptorChain(hhdm: u64, q: *virtio_blk.QueueState, chain_head: u16) !DescriptorChainInfo {
     const vmx = @import("../arch/x86_64/vmx.zig");
-    const hhdm = bridge_hhdm_offset;
 
     const desc_hpa = vmx.findGuestPageHpaPublic(q.desc_addr) orelse return error.InvalidGpa;
     const desc_ptr: [*]const u8 = @ptrFromInt(desc_hpa + hhdm + (q.desc_addr & 0xFFF));
@@ -120,13 +125,15 @@ fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virti
     // Virtio Descriptor is 16 bytes: addr(8), len(4), flags(2), next(2)
     const d_off = @as(usize, chain_head) * 16;
     const d_addr = std.mem.readInt(u64, desc_ptr[d_off .. d_off + 8][0..8], .little);
-    _ = std.mem.readInt(u32, desc_ptr[d_off + 8 .. d_off + 12][0..4], .little);
     const d_flags = std.mem.readInt(u16, desc_ptr[d_off + 12 .. d_off + 14][0..2], .little);
     const d_next = std.mem.readInt(u16, desc_ptr[d_off + 14 .. d_off + 16][0..2], .little);
 
-    var data_hpa: u64 = 0;
-    var data_len: u32 = 0;
-    var status_addr: u64 = 0;
+    var info = DescriptorChainInfo{
+        .request = undefined,
+        .data_hpa = 0,
+        .data_len = 0,
+        .status_addr = 0,
+    };
 
     if ((d_flags & 1) != 0) {
         const d2_off = @as(usize, d_next) * 16;
@@ -135,22 +142,28 @@ fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virti
         const d2_flags = std.mem.readInt(u16, desc_ptr[d2_off + 12 .. d2_off + 14][0..2], .little);
 
         if ((d2_flags & 1) != 0) {
-            data_len = d2_len;
+            info.data_len = d2_len;
             if (vmx.findGuestPageHpaPublic(d2_addr)) |hpa_base| {
-                data_hpa = hpa_base + (d2_addr & 0xFFF);
+                info.data_hpa = hpa_base + (d2_addr & 0xFFF);
             }
             const d3_idx = std.mem.readInt(u16, desc_ptr[d2_off + 14 .. d2_off + 16][0..2], .little);
             const d3_off = @as(usize, d3_idx) * 16;
-            status_addr = std.mem.readInt(u64, desc_ptr[d3_off .. d3_off + 8][0..8], .little);
+            info.status_addr = std.mem.readInt(u64, desc_ptr[d3_off .. d3_off + 8][0..8], .little);
         } else {
-            status_addr = d2_addr;
+            info.status_addr = d2_addr;
         }
     }
 
-    // First descriptor in blk request is the Header (RequestHeader)
     const hdr_hpa = vmx.findGuestPageHpaPublic(d_addr) orelse return error.InvalidGpa;
     const hdr_ptr: [*]const virtio_blk.RequestHeader = @ptrFromInt(hdr_hpa + hhdm + (d_addr & 0xFFF));
-    const req_hdr = hdr_ptr[0];
+    info.request = hdr_ptr[0];
+    return info;
+}
+
+fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virtio_blk.QueueState, chain_head: u16) !void {
+    _ = inst;
+    const hhdm = bridge_hhdm_offset;
+    const info = try decodeDescriptorChain(hhdm, q, chain_head);
 
     // Allocate DIPC page for storaged
     const table = bridge_endpoint_table orelse return;
@@ -165,14 +178,14 @@ fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virti
 
     // Format payload: RequestHeader + metadata
     var payload: [64]u8 = [_]u8{0} ** 64;
-    std.mem.copyForwards(u8, payload[0..@sizeOf(virtio_blk.RequestHeader)], std.mem.asBytes(&req_hdr));
+    std.mem.copyForwards(u8, payload[0..@sizeOf(virtio_blk.RequestHeader)], std.mem.asBytes(&info.request));
     // Additional metadata: VMID (32..36), chain_head (36..38), data_len (38..40), data_hpa (40..48)
     std.mem.writeInt(u32, payload[32..36][0..4], vmid, .little);
     std.mem.writeInt(u16, payload[36..38][0..2], chain_head, .little);
-    std.mem.writeInt(u16, payload[38..40][0..2], @as(u16, @truncate(data_len)), .little);
-    std.mem.writeInt(u64, payload[40..48][0..8], data_hpa, .little);
+    std.mem.writeInt(u16, payload[38..40][0..2], @as(u16, @truncate(info.data_len)), .little);
+    std.mem.writeInt(u64, payload[40..48][0..8], info.data_hpa, .little);
     // Also save status_addr so handleVirtioBlkResponse knows where to write the status
-    std.mem.writeInt(u64, payload[48..56][0..8], status_addr, .little);
+    std.mem.writeInt(u64, payload[48..56][0..8], info.status_addr, .little);
 
     const msg_page = try dipc.allocPageMessage(hhdm, kernel_addr, storaged_addr, &payload);
 
@@ -229,31 +242,11 @@ pub fn handleVirtioBlkResponse(vmid: u32, head_idx: u16, io_status: u8) void {
 
     const inst = virtio_blk.getInstance(vmid) orelse return;
     const q = &inst.queues[0];
-
-    // Retrieve the original descriptor chain to find the status byte address.
-    const desc_hpa = vmx.findGuestPageHpaPublic(q.desc_addr) orelse return;
-    const desc_ptr: [*]const u8 = @ptrFromInt(desc_hpa + hhdm + (q.desc_addr & 0xFFF));
-    const d_off = @as(usize, head_idx) * 16;
-    const d_flags = std.mem.readInt(u16, desc_ptr[d_off + 12 .. d_off + 14][0..2], .little);
-    const d_next = std.mem.readInt(u16, desc_ptr[d_off + 14 .. d_off + 16][0..2], .little);
-
-    var status_addr: u64 = 0;
-    if ((d_flags & 1) != 0) {
-        const d2_off = @as(usize, d_next) * 16;
-        const d2_addr = std.mem.readInt(u64, desc_ptr[d2_off .. d2_off + 8][0..8], .little);
-        const d2_flags = std.mem.readInt(u16, desc_ptr[d2_off + 12 .. d2_off + 14][0..2], .little);
-        if ((d2_flags & 1) != 0) {
-            const d3_idx = std.mem.readInt(u16, desc_ptr[d2_off + 14 .. d2_off + 16][0..2], .little);
-            const d3_off = @as(usize, d3_idx) * 16;
-            status_addr = std.mem.readInt(u64, desc_ptr[d3_off .. d3_off + 8][0..8], .little);
-        } else {
-            status_addr = d2_addr;
-        }
-    }
+    const info = decodeDescriptorChain(hhdm, q, head_idx) catch return;
 
     // Write io_status to guest status descriptor memory
-    if (vmx.findGuestPageHpaPublic(status_addr)) |status_hpa| {
-        const status_ptr: [*]u8 = @ptrFromInt(status_hpa + hhdm + (status_addr & 0xFFF));
+    if (vmx.findGuestPageHpaPublic(info.status_addr)) |status_hpa| {
+        const status_ptr: [*]u8 = @ptrFromInt(status_hpa + hhdm + (info.status_addr & 0xFFF));
         status_ptr[0] = io_status;
     }
 
@@ -265,12 +258,14 @@ pub fn handleVirtioBlkResponse(vmid: u32, head_idx: u16, io_status: u8) void {
     const current_used_idx = std.mem.readInt(u16, used_idx_ptr[0..2], .little);
 
     const elem_off = 4 + (@as(usize, current_used_idx % q.num) * 8);
+    const used_len: u32 = if (info.request.type == virtio_blk.VIRTIO_BLK_T_IN) info.data_len + 1 else 1;
     // Write UsedElem: id (4 bytes), len (4 bytes)
     std.mem.writeInt(u32, used_ptr[elem_off .. elem_off + 4][0..4], head_idx, .little);
-    std.mem.writeInt(u32, used_ptr[elem_off + 4 .. elem_off + 8][0..4], 1, .little); // 1 byte written (status)
+    std.mem.writeInt(u32, used_ptr[elem_off + 4 .. elem_off + 8][0..4], used_len, .little);
 
     // Update used index
     std.mem.writeInt(u16, used_idx_ptr[0..2], current_used_idx +% 1, .little);
+    q.last_used_idx = current_used_idx +% 1;
 
     inst.interrupt_status |= 1;
     vmx.injectGuestInterrupt(vmid, 14);

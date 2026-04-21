@@ -36,3 +36,7 @@ pub fn revokeLocalNode() void {
 pub fn isLocalNodeLocked() bool {
     return node_locked;
 }
+
+pub fn isNodeAddrConfigured(addr: dipc.Ipv6Addr) bool {
+    return !dipc.Ipv6Addr.eql(addr, dipc.Ipv6Addr.loopback());
+}
