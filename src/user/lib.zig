@@ -49,6 +49,9 @@ pub const SYS_MAP_RECV = 17;
 pub const SYS_FB_DRAW_COLORED = 18;
 pub const SYS_FB_FILL_RECT = 19;
 pub const SYS_TRY_RECV = 20;
+pub const SYS_GET_VARDE_LOG = 21;
+pub const SYS_VARDE_INJECT = 25;
+pub const SYS_FB_GET_INFO = 26;
 pub const SYS_YIELD = 24;
 
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
@@ -56,6 +59,20 @@ pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
 pub const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 pub const USER_CONFIG_VADDR: usize = USER_BOOTSTRAP_VADDR - (64 * PAGE_SIZE);
 pub const PAGE_SIZE: u64 = 4096;
+
+// Mirror of identity.ReservedEndpoint for user-space use.
+pub const ReservedEndpoint = enum(u64) {
+    netd           = 1,
+    kernel_control = 2,
+    router         = 3,
+    storaged       = 4,
+    dashd          = 5,
+    containerd     = 6,
+    clusterd       = 7,
+    inputd         = 8,
+    windowd        = 9,
+    configd        = 10,
+};
 
 pub const BootstrapDescriptor = extern struct {
     magic: u32,
@@ -202,6 +219,7 @@ pub const CreateMicrovmPayload = extern struct {
     initramfs_phys: u64,
     initramfs_size: u64,
     name: [32]u8,
+    container: [32]u8,
 };
 
 pub const StartMicrovmPayload = extern struct {
@@ -291,6 +309,7 @@ pub const VmSnapshotEntry = extern struct {
     cpu_cycles: u64,
     exit_count: u64,
     name: [32]u8,
+    container: [32]u8,
 };
 
 pub const MAX_VM_SNAPSHOT_ENTRIES: usize = 32;
@@ -307,6 +326,7 @@ pub const VmSnapshotListPayload = extern struct {
             .cpu_cycles = 0,
             .exit_count = 0,
             .name = [_]u8{0} ** 32,
+            .container = [_]u8{0} ** 32,
         }} ** MAX_VM_SNAPSHOT_ENTRIES,
 };
 
@@ -333,7 +353,7 @@ pub fn queryCurrentNode(
         .magic = WireMagic,
         .version = WireVersion,
         .header_len = @as(u16, @intCast(DIPC_HEADER_SIZE)),
-        .payload_len = @as(u32, @intCast(@sizeOf(ControlHeader))),
+        .payload_len = @as(u32, @intCast(CONTROL_HEADER_SIZE)),
         .auth_tag = 0,
         .src = .{ .node = bootstrap_node, .endpoint = src_endpoint },
         .dst = .{ .node = bootstrap_node, .endpoint = bs.reserved_kernel_control_endpoint },
@@ -382,4 +402,13 @@ pub fn _user_start() callconv(.naked) noreturn {
         ),
         else => @compileError("Unsupported architecture"),
     }
+}
+
+pub fn getFramebufferInfo() ?struct { width: u32, height: u32 } {
+    const res = syscall(SYS_FB_GET_INFO, 0, 0, 0);
+    if (res == 0 or res == 0xFFFFFFFF) return null;
+    return .{
+        .width  = @as(u32, @truncate(res >> 32)),
+        .height = @as(u32, @truncate(res & 0xFFFF_FFFF)),
+    };
 }

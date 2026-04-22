@@ -295,8 +295,8 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
         .name = [_]u8{0} ** 32,
+        .container = [_]u8{0} ** 32,
     };
-    @memcpy(payload.name[0..7], "default");
 
     // The kernel's SYS_SEND_PAGE copies from the DMA phys page, re-signs, and routes.
     _ = lib.syscall(SYS_SEND_PAGE, dipc_phys_slot1, 0, token);
@@ -409,6 +409,7 @@ fn handleListMicrovms(bs: *const BootstrapDescriptor, token: u64, text_phys: u64
             .cpu_cycles = 0,
             .exit_count = 0,
             .name = [_]u8{0} ** 32,
+            .container = [_]u8{0} ** 32,
         };
         // Copy first 3 chars of index as a default name placeholder
         _ = i;

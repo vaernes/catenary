@@ -60,6 +60,7 @@ pub export fn umain() noreturn {
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
         .name = [_]u8{0} ** 32,
+        .container = [_]u8{0} ** 32,
     };
     @memcpy(payload.name[0..7], "default");
 
@@ -118,6 +119,7 @@ pub export fn umain() noreturn {
                             .initramfs_phys = bs.initramfs_phys,
                             .initramfs_size = bs.initramfs_size,
                             .name = [_]u8{0} ** 32,
+                            .container = [_]u8{0} ** 32,
                         };
                         @memcpy(out_payload.name[0..13], "remote-micron"); // name length is < 32
 

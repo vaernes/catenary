@@ -29,6 +29,14 @@ pub fn drawRect(x: u32, y: u32, w: u32, h: u32, color: u32) void {
     }
 }
 
+pub fn getFramebufferInfo() ?struct { width: u32, height: u32 } {
+    const fb = framebuffer orelse return null;
+    return .{
+        .width = @as(u32, @truncate(fb.width)),
+        .height = @as(u32, @truncate(fb.height)),
+    };
+}
+
 pub fn clear(color: u32) void {
     const fb = framebuffer orelse return;
     drawRect(0, 0, @as(u32, @truncate(fb.width)), @as(u32, @truncate(fb.height)), color);

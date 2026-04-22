@@ -268,7 +268,7 @@ pub fn handleKernelControlPage(
             }
 
             const microvm_registry = @import("../vmm/microvm_registry.zig");
-            if (microvm_registry.create(p.name, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
+            if (microvm_registry.create(p.name, p.container, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
                 serialWrite("configd: MicroVM created via DIPC\n");
                 _ = id;
             } else {
@@ -314,6 +314,7 @@ pub fn handleKernelControlPage(
                             .cpu_cycles = inst.cpu_cycles,
                             .exit_count = inst.exit_count,
                             .name = inst.name,
+                            .container = inst.container,
                         };
                         res.count += 1;
                     }

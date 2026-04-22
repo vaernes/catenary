@@ -27,6 +27,7 @@ pub const Instance = struct {
     instance_id: u32 = 0,
     state: MicrovmState = .empty,
     name: [32]u8 = [_]u8{0} ** 32,
+    container: [32]u8 = [_]u8{0} ** 32,
     /// Guest RAM size in 4 KiB pages (e.g. 16384 = 64 MiB).
     mem_pages: u32 = 0,
     vcpus: u32 = 1,
@@ -97,7 +98,7 @@ pub fn findMutable(instance_id: u32) ?*Instance {
 
 /// Allocate a new MicroVM slot.  Returns the stable instance_id or null if the
 /// table is full.
-pub fn create(name: [32]u8, mem_pages: u32, vcpus: u32, kernel_phys: u64, kernel_size: u64, initramfs_phys: u64, initramfs_size: u64) ?u32 {
+pub fn create(name: [32]u8, container: [32]u8, mem_pages: u32, vcpus: u32, kernel_phys: u64, kernel_size: u64, initramfs_phys: u64, initramfs_size: u64) ?u32 {
     ensureInit();
     for (0..instances.len) |i| {
         if (!instances[i].in_use) {
@@ -108,6 +109,7 @@ pub fn create(name: [32]u8, mem_pages: u32, vcpus: u32, kernel_phys: u64, kernel
                 .instance_id = id,
                 .state = .created,
                 .name = name,
+                .container = container,
                 .mem_pages = mem_pages,
                 .vcpus = vcpus,
                 .kernel_phys = kernel_phys,

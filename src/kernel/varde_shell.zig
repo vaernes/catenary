@@ -68,6 +68,15 @@ var prompt_needed: bool = true;
 /// Telnet IAC state machine: number of bytes still to skip.
 var iac_skip: u8 = 0;
 
+// Command history for navigation (UP/DOWN arrows)
+const MAX_HISTORY = 16;
+var history_cmds: [MAX_HISTORY][128]u8 = [_][128]u8{[_]u8{0} ** 128} ** MAX_HISTORY;
+var history_lens: [MAX_HISTORY]usize = [_]usize{0} ** MAX_HISTORY;
+var history_count: usize = 0;
+var history_write_idx: usize = 0;
+var browse_idx: isize = -1; // -1 means not browsing history
+var esc_state: u8 = 0; // 0=normal, 1=ESC received, 2=ESC [ received
+
 pub fn init() void {
     cpu.outb(COM2_DATA + 1, 0x00); // Disable all interrupts
     cpu.outb(COM2_DATA + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -301,6 +310,20 @@ fn dispatch(cmd: []const u8) void {
         write(cmd);
         write("'  (try 'help')\r\n");
     }
+
+    // Save to history if not empty and different from the last entry
+    if (cmd.len > 0) {
+        const last_idx = @as(usize, @intCast(@mod(@as(isize, @intCast(history_write_idx)) - 1, @as(isize, MAX_HISTORY))));
+        const is_duplicate = history_count > 0 and strEq(cmd, history_cmds[last_idx][0..history_lens[last_idx]]);
+        if (!is_duplicate) {
+            const len = if (cmd.len > 127) 127 else cmd.len;
+            @memcpy(history_cmds[history_write_idx][0..len], cmd[0..len]);
+            history_lens[history_write_idx] = len;
+            history_write_idx = (history_write_idx + 1) % MAX_HISTORY;
+            if (history_count < MAX_HISTORY) history_count += 1;
+        }
+    }
+    browse_idx = -1;
 }
 
 /// Print the shell prompt. Call once after init.
@@ -323,7 +346,7 @@ pub fn poll() void {
     }
 }
 
-fn handleChar(c: u8) void {
+pub fn handleChar(c: u8) void {
     // Telnet IAC filtering: skip negotiation sequences (0xFF CMD OPT).
     if (iac_skip > 0) {
         iac_skip -= 1;
@@ -332,6 +355,45 @@ fn handleChar(c: u8) void {
     if (c == 0xFF) {
         // IAC byte — skip this and the next 2 bytes (CMD + OPTION).
         iac_skip = 2;
+        return;
+    }
+
+    // Escape sequence state machine for arrows
+    if (esc_state == 0) {
+        if (c == 27) {
+            esc_state = 1;
+            return;
+        }
+    } else if (esc_state == 1) {
+        if (c == '[') {
+            esc_state = 2;
+            return;
+        }
+        esc_state = 0;
+    } else if (esc_state == 2) {
+        esc_state = 0;
+        if (c == 'A') { // UP arrow
+            if (history_count > 0) {
+                if (browse_idx == -1) {
+                    browse_idx = @as(isize, @intCast(history_count)) - 1;
+                } else if (browse_idx > 0) {
+                    browse_idx -= 1;
+                }
+                loadHistory();
+            }
+            return;
+        } else if (c == 'B') { // DOWN arrow
+            if (browse_idx != -1) {
+                if (browse_idx < @as(isize, @intCast(history_count)) - 1) {
+                    browse_idx += 1;
+                    loadHistory();
+                } else {
+                    browse_idx = -1;
+                    clearLine();
+                }
+            }
+            return;
+        }
         return;
     }
 
@@ -351,4 +413,22 @@ fn handleChar(c: u8) void {
         cmd_len += 1;
         writeByte(c); // echo
     }
+}
+
+fn clearLine() void {
+    while (cmd_len > 0) {
+        cmd_len -= 1;
+        write("\x08 \x08");
+    }
+}
+
+fn loadHistory() void {
+    clearLine();
+    if (browse_idx < 0) return;
+    const h_idx = @as(usize, @intCast(@mod(@as(isize, @intCast(history_write_idx)) - @as(isize, @intCast(history_count)) + browse_idx, @as(isize, MAX_HISTORY))));
+    const len = history_lens[h_idx];
+    const cmd = history_cmds[h_idx][0..len];
+    @memcpy(cmd_buf[0..len], cmd);
+    cmd_len = len;
+    write(cmd);
 }

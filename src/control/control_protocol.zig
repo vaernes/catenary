@@ -103,6 +103,7 @@ pub const CreateMicrovmPayload = extern struct {
     initramfs_phys: u64,
     initramfs_size: u64,
     name: [32]u8,
+    container: [32]u8,
 };
 
 /// Request the kernel to transition instance_id to running and initiate VMX launch.
@@ -158,6 +159,7 @@ pub const VmSnapshotEntry = extern struct {
     cpu_cycles: u64,
     exit_count: u64,
     name: [32]u8,
+    container: [32]u8,
 };
 
 pub const MAX_VM_SNAPSHOT_ENTRIES: usize = 32;
@@ -174,6 +176,7 @@ pub const VmSnapshotListPayload = extern struct {
             .cpu_cycles = 0,
             .exit_count = 0,
             .name = [_]u8{0} ** 32,
+            .container = [_]u8{0} ** 32,
         }} ** MAX_VM_SNAPSHOT_ENTRIES,
 };
 

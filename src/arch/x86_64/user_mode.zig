@@ -714,6 +714,27 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 return 0;
             }
         },
+        25 => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
+            const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
+            if (kind != .windowd) return 0xFFFFFFFF;
+            const vsh = @import("../../kernel/varde_shell.zig");
+            vsh.handleChar(@as(u8, @truncate(arg0)));
+            return 0;
+        },
+        // op=26: SYS_FB_GET_INFO — get framebuffer resolution.
+        // Returns (width << 32) | height.
+        // Restricted to windowd.
+        26 => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
+            const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
+            if (kind != .windowd) return 0xFFFFFFFF;
+            const fb = @import("../../kernel/fb.zig");
+            if (fb.getFramebufferInfo()) |info| {
+                return (@as(u64, info.width) << 32) | info.height;
+            }
+            return 0;
+        },
         else => {},
     }
     current_user_state.demo_status = .syscall;
