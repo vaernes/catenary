@@ -40,7 +40,7 @@ echo "[+] Installing Limine to ISO..."
 
 echo "[+] Running QEMU..."
 # Serial for main kernel log + Serial for guest/varde bridge
-GTK_PATH= qemu-system-x86_64 -enable-kvm -M q35 -m 256M -cpu host,vmx=on -cdrom catenary.iso -boot d -serial stdio -serial telnet:127.0.0.1:4444,server,nowait \
+GTK_PATH= qemu-system-x86_64 -enable-kvm -M q35 -m 256M -cpu host,vmx=on -cdrom catenary.iso -boot d -serial stdio -serial telnet:127.0.0.1:4445,server,nowait \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0,romfile= \
     -drive file=/dev/null,format=raw,if=none,id=nvm \
     -device nvme,serial=deadbeef,drive=nvm

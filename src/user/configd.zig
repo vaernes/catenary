@@ -362,8 +362,68 @@ fn handleRegistrySync(page_va: u64) void {
 }
 
 // ---------------------------------------------------------------------------
+// Handle a list_microvms request from windowd — reply with a VmSnapshotListPayload.
+// ---------------------------------------------------------------------------
+
+fn handleListMicrovms(bs: *const BootstrapDescriptor, token: u64, text_phys: u64, req_va: u64) void {
+    // Determine the requesting endpoint so we can route the reply back.
+    const req_hdr: *align(1) const lib.PageHeader = @ptrFromInt(req_va);
+    const reply_ep = req_hdr.src.endpoint;
+    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+
+    // Build the snapshot into the DMA text slot (VA = DMA_TEXT_SLOT, phys = text_phys).
+    const reply_buf: [*]u8 = lib.ptrFrom([*]u8, DMA_TEXT_SLOT);
+
+    // DIPC header
+    const reply_hdr: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(reply_buf));
+    reply_hdr.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
+        .payload_len = @as(u32, @intCast(lib.CONTROL_HEADER_SIZE + @sizeOf(lib.VmSnapshotListPayload))),
+        .auth_tag = 0,
+        .src = .{ .node = local_node, .endpoint = EP_CONFIGD },
+        .dst = .{ .node = local_node, .endpoint = reply_ep },
+    };
+
+    // Control header
+    const reply_ctrl: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(reply_buf) + lib.DIPC_HEADER_SIZE);
+    reply_ctrl.* = .{
+        .op = .list_microvms,
+        .payload_len = @as(u32, @intCast(@sizeOf(lib.VmSnapshotListPayload))),
+    };
+
+    // Payload — convert our simple VmEntry table to VmSnapshotEntry format.
+    const snap: *align(1) lib.VmSnapshotListPayload = @ptrFromInt(@intFromPtr(reply_buf) + lib.DIPC_HEADER_SIZE + lib.CONTROL_HEADER_SIZE);
+    // Zero-initialise
+    @memset(@as([*]u8, @ptrFromInt(@intFromPtr(snap)))[0..@sizeOf(lib.VmSnapshotListPayload)], 0);
+    var count: u32 = 0;
+    for (&vms, 0..) |*v, i| {
+        if (!v.used) continue;
+        if (count >= lib.MAX_VM_SNAPSHOT_ENTRIES) break;
+        snap.entries[count] = .{
+            .instance_id = v.instance_id,
+            .state = 1, // created (we don't track running/stopped here yet)
+            .mem_pages = v.mem_pages,
+            .vcpus = 1,
+            .cpu_cycles = 0,
+            .exit_count = 0,
+            .name = [_]u8{0} ** 32,
+        };
+        // Copy first 3 chars of index as a default name placeholder
+        _ = i;
+        count += 1;
+    }
+    snap.count = count;
+
+    _ = lib.syscall(SYS_SEND_PAGE, text_phys, 0, token);
+    lib.serialWrite("configd: list_microvms reply sent\n");
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
 
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
@@ -389,16 +449,22 @@ pub export fn umain() noreturn {
     // (windowd owns the framebuffer — configd is now a headless data backend)
     lib.serialWrite("configd: started (headless mode, windowd owns UI)\n");
 
-    // Main event loop — receive DIPC messages only; UI is handled by windowd
+    // Main event loop — receive DIPC messages; UI is handled by windowd
     while (true) {
-        // --- Poll DIPC inbox for registry_sync messages ---
+        // --- Poll DIPC inbox ---
         const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
         if (page_phys != 0) {
             const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (recv_va != 0) {
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
-                if (control.op == .registry_sync) {
-                    handleRegistrySync(recv_va);
+                switch (control.op) {
+                    .registry_sync => {
+                        handleRegistrySync(recv_va);
+                    },
+                    .list_microvms => {
+                        handleListMicrovms(bs, token, text_phys, recv_va);
+                    },
+                    else => {},
                 }
                 _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
             } else {

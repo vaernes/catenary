@@ -55,6 +55,7 @@ fn scancodeToAscii(scancode: u8) ?u8 {
         0x1C => '\n',
         0x39 => ' ',
         0x0E => 0x08,
+        0x0F => '\t', // TAB — windowd uses this to cycle form field focus
         else => null,
     };
 }

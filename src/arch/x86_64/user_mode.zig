@@ -566,6 +566,61 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             service_registry.setRecvPage(sid17, page17);
             return RECV_VA;
         },
+        // op=18: SYS_FB_DRAW_COLORED — draw text at (col, row) with explicit fg/bg colors.
+        // arg0 = phys DMA page holding null-terminated text (up to 256 chars).
+        // arg1 = (row << 48) | (col << 32) | (fg_color & 0xFFFF_FFFF) — fg in upper word, bg dropped.
+        // Encoding: bits[63:48]=row, bits[47:32]=col, bits[31:16]=fg(high), bits[15:0]=fg(low).
+        // Actually: arg1 packing = (row << 48) | (col << 32) | fg_color where fg_color is 24-bit.
+        // Simpler ABI used: arg1[63:32] = (row<<16)|col packed as u32, arg1[31:0] = fg color (0x00RRGGBB).
+        // bg color is always ColorSeaGray. Restricted to windowd/dashd.
+        18 => {
+            const sid18 = service_registry.serviceIdForCapability(token) orelse return 0;
+            const kind18 = service_registry.getServiceKind(sid18) orelse return 0;
+            if (kind18 != .windowd and kind18 != .dashd) return 0;
+            const page18 = arg0;
+            if (page18 == 0) return 0;
+            // arg1 high 32 bits: (row16 << 16) | col16
+            const packed18 = @as(u32, @truncate(arg1 >> 32));
+            const row18 = @as(u32, packed18 >> 16);
+            const col18 = @as(u32, packed18 & 0xFFFF);
+            const fg18 = @as(u32, @truncate(arg1 & 0xFFFF_FFFF));
+            const text18: [*]const u8 = @ptrFromInt(page18 + hhdm_offset);
+            const fb18 = @import("../../kernel/fb.zig");
+            var ci18: u32 = 0;
+            while (ci18 < 256) : (ci18 += 1) {
+                const c18 = text18[ci18];
+                if (c18 == 0) break;
+                const px18 = (col18 + ci18) * fb18.CharWidth;
+                const py18 = row18 * fb18.CharHeight;
+                fb18.drawChar(px18, py18, c18, fg18, fb18.ColorSeaGray);
+            }
+            return 0;
+        },
+        // op=19: SYS_FB_FILL_RECT — fill a rectangle with a solid color.
+        // arg0 = (x << 48) | (y << 32) | (w << 16) | h  — all 16-bit fields.
+        // arg1 = color (0x00RRGGBB).
+        // Restricted to windowd.
+        19 => {
+            const sid19 = service_registry.serviceIdForCapability(token) orelse return 0;
+            const kind19 = service_registry.getServiceKind(sid19) orelse return 0;
+            if (kind19 != .windowd) return 0;
+            const x19 = @as(u32, @truncate(arg0 >> 48));
+            const y19 = @as(u32, @truncate((arg0 >> 32) & 0xFFFF));
+            const w19 = @as(u32, @truncate((arg0 >> 16) & 0xFFFF));
+            const h19 = @as(u32, @truncate(arg0 & 0xFFFF));
+            const color19 = @as(u32, @truncate(arg1));
+            const fb19 = @import("../../kernel/fb.zig");
+            fb19.drawRect(x19, y19, w19, h19, color19);
+            return 0;
+        },
+        // op=20: SYS_TRY_RECV — non-blocking receive.
+        // Returns physical page address of the next queued DIPC message, or 0 if none.
+        // Unlike op=3, does NOT park the calling thread.
+        20 => {
+            _ = service_registry.serviceIdForCapability(token) orelse return 0;
+            if (scheduler.receive()) |m| return m;
+            return 0;
+        },
         13, 14 => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;

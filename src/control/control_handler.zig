@@ -45,7 +45,10 @@ fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.C
 }
 
 fn isAuthorizedMicrovmSource(hdr: *const dipc.PageHeader) bool {
-    return hdr.src.endpoint == @intFromEnum(identity.ReservedEndpoint.clusterd);
+    const ep = hdr.src.endpoint;
+    return ep == @intFromEnum(identity.ReservedEndpoint.clusterd) or
+           ep == @intFromEnum(identity.ReservedEndpoint.windowd) or
+           ep == @intFromEnum(identity.ReservedEndpoint.configd);
 }
 
 pub fn handleKernelControlPage(
@@ -241,7 +244,15 @@ pub fn handleKernelControlPage(
         // poll_netd_inbox and assign_node_addr are handled directly in the trap bridge
         // (user_mode.zig) and do not go through the DIPC page path, so the kernel
         // control handler treats them as unrecognised and returns an error to the caller.
-        .poll_netd_inbox, .assign_node_addr, .get_node_addr => return error.BadPayload,
+        .poll_netd_inbox, .assign_node_addr => return error.BadPayload,
+        .get_node_addr => {
+            const res = control_protocol.NodeAddrResult{
+                .addr = node_config.getLocalNode(),
+            };
+            const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            const table_const: *const endpoint_table.EndpointTable = table;
+            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
+        },
         .create_microvm => {
             if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
             if (remaining != @sizeOf(control_protocol.CreateMicrovmPayload)) return error.BadPayload;
@@ -270,24 +281,38 @@ pub fn handleKernelControlPage(
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             if (!microvm_registry.start(p.instance_id)) return error.BadPayload;
         },
-        .stop_microvm, .delete_microvm => return error.BadPayload,
+        .stop_microvm => {
+            if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
+            if (remaining != @sizeOf(control_protocol.StopMicrovmPayload)) return error.BadPayload;
+            const p: *const control_protocol.StopMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
+            const microvm_registry = @import("../vmm/microvm_registry.zig");
+            if (!microvm_registry.stop(p.instance_id)) return error.BadPayload;
+        },
+        .delete_microvm => {
+            if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
+            if (remaining != @sizeOf(control_protocol.DeleteMicrovmPayload)) return error.BadPayload;
+            const p: *const control_protocol.DeleteMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
+            const microvm_registry = @import("../vmm/microvm_registry.zig");
+            if (!microvm_registry.delete(p.instance_id)) return error.BadPayload;
+        },
         .list_microvms => {
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             const instances = microvm_registry.getInstances();
 
-            var res = control_protocol.ListMicrovmsResult{
+            var res = control_protocol.VmSnapshotListPayload{
                 .count = 0,
-                .vms = [_]control_protocol.MicrovmInfo{.{ .instance_id = 0, .state = 0, .mem_pages = 0, .vcpus = 0, .name = [_]u8{0} ** 32 }} ** 64,
             };
 
             for (instances) |inst| {
                 if (inst.in_use) {
-                    if (res.count < 64) {
-                        res.vms[res.count] = .{
+                    if (res.count < control_protocol.MAX_VM_SNAPSHOT_ENTRIES) {
+                        res.entries[res.count] = .{
                             .instance_id = inst.instance_id,
                             .state = @intFromEnum(inst.state),
                             .mem_pages = inst.mem_pages,
                             .vcpus = inst.vcpus,
+                            .cpu_cycles = inst.cpu_cycles,
+                            .exit_count = inst.exit_count,
                             .name = inst.name,
                         };
                         res.count += 1;

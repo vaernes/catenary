@@ -78,6 +78,9 @@ const HW_ACCESS_OPS_LOW: u32 =
 const FB_DRAW_OP: u32 = (1 << 16); // SYS_DRAW_TEXT
 const KBD_OP: u32 = (1 << 8); // SYS_READ_SCANCODE
 const SHELL_HISTORY_OP: u32 = (1 << 21); // SYS_SHELL_HISTORY
+const FB_DRAW_COLORED_OP: u32 = (1 << 18); // SYS_FB_DRAW_COLORED
+const FB_FILL_RECT_OP: u32 = (1 << 19); // SYS_FB_FILL_RECT
+const TRY_RECV_OP: u32 = (1 << 20); // SYS_TRY_RECV
 
 /// Returns the allowed syscall bitmask for a given ServiceKind.
 /// Bit N set = syscall op N is permitted.
@@ -86,7 +89,7 @@ pub fn allowedSyscallMask(kind: ServiceKind) u32 {
         .netd => COMMON_OPS_LOW | HW_ACCESS_OPS_LOW,
         .storaged => COMMON_OPS_LOW | HW_ACCESS_OPS_LOW,
         .dashd => COMMON_OPS_LOW | FB_DRAW_OP,
-        .windowd => COMMON_OPS_LOW | FB_DRAW_OP | KBD_OP | SHELL_HISTORY_OP,
+        .windowd => COMMON_OPS_LOW | FB_DRAW_OP | FB_DRAW_COLORED_OP | FB_FILL_RECT_OP | TRY_RECV_OP | KBD_OP | SHELL_HISTORY_OP,
         .inputd => COMMON_OPS_LOW | KBD_OP,
         .containerd => COMMON_OPS_LOW,
         .clusterd => COMMON_OPS_LOW,
