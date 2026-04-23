@@ -8,6 +8,7 @@ const pmm = @import("../../kernel/pmm.zig");
 const scheduler = @import("../../kernel/scheduler.zig");
 const service_bootstrap = @import("../../services/service_bootstrap.zig");
 const service_registry = @import("../../services/service_registry.zig");
+const abi = @import("syscall_abi");
 
 const endpoint_table = @import("../../ipc/endpoint_table.zig");
 const task_loader = @import("../../services/task_loader.zig");
@@ -258,12 +259,12 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         0x1000...0x1004 => {
             return 0;
         },
-        1 => {
+        abi.SYS_ACTIVATE => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             _ = service_registry.updateServiceState(sid, .active);
             return 0;
         },
-        2 => {
+        abi.SYS_REGISTER => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             const table = @import("../../ipc/manager.zig").endpointTable();
@@ -338,7 +339,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
 
             return 0;
         },
-        3 => {
+        abi.SYS_RECV => {
             _ = service_registry.serviceIdForCapability(token) orelse return 0;
             const msg = scheduler.receive();
             if (msg) |m| return m;
@@ -349,7 +350,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             scheduler.schedule();
             return 0;
         },
-        4 => {
+        abi.SYS_FREE_PAGE => {
             // op=4: free page. If arg0 == DIPC_RECV_VA, unmap the receive window
             // and free the underlying physical page stored in service state.
             const RECV_VA: u64 = 0x0000_7F00_0000_0000;
@@ -378,7 +379,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // op=5: allocate DMA pages (contiguous), map into service DMA window.
         // arg0 = num_pages, arg1 = window_slot_start (0..15).
         // Returns physical base address of the allocation, or 0 on failure.
-        5 => {
+        abi.SYS_ALLOC_DMA => {
             const sid5 = service_registry.serviceIdForCapability(token) orelse {
                 serialWrite("dma_alloc: invalid capability token\n");
                 return 0;
@@ -412,7 +413,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // op=6: send a DIPC page. arg0 = phys base of a DMA page holding a DIPC message.
         // Kernel copies it to a fresh PMM page, re-signs with kernel auth key, and routes.
         // Returns 0 on success, 1 on failure.
-        6 => {
+        abi.SYS_SEND_PAGE => {
             const sid6 = service_registry.serviceIdForCapability(token) orelse {
                 serialWrite("[SEND_PAGE] Invalid capability token\n");
                 return 1;
@@ -491,7 +492,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // op=7: map a physical MMIO range into service IO window (0x7E00_0000_0000).
         // arg0 = phys_base (page-aligned), arg1 = num_pages.
         // Returns IO_WINDOW_VA on success, 0 on failure.
-        7 => {
+        abi.SYS_MAP_MMIO => {
             const sid7 = service_registry.serviceIdForCapability(token) orelse return 0;
             const pml4_7 = service_registry.getTaskBoundAddressSpace(sid7) orelse return 0;
             const phys7 = arg0 & ~@as(u64, 0xFFF);
@@ -516,7 +517,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // arg0 = phys address of destination page.
         // Returns number of bytes copied (clamped to page size).
         // Restricted to windowd.
-        21 => {
+        abi.SYS_GET_VARDE_LOG => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0;
             const kind = service_registry.getServiceKind(sid) orelse return 0;
             if (kind != .windowd) return 0;
@@ -528,7 +529,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             @memcpy(dest[0..len], vsh.history_buf[0..len]);
             return len;
         },
-        16 => {
+        abi.SYS_FB_DRAW => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0;
             const kind = service_registry.getServiceKind(sid) orelse return 0;
             // Only windowd and dashd (for legacy fallback) can draw
@@ -552,7 +553,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // op=17: map a received DIPC page (phys address from op=3) into the service's
         // receive window at VA 0x7F00_0000_0000 and return that VA.
         // arg0 = page_phys.  Returns DIPC_RECV_VA or 0 on failure.
-        17 => {
+        abi.SYS_MAP_RECV => {
             const RECV_VA: u64 = 0x0000_7F00_0000_0000;
             const sid17 = service_registry.serviceIdForCapability(token) orelse return 0;
             const pml4_17 = service_registry.getTaskBoundAddressSpace(sid17) orelse return 0;
@@ -574,12 +575,9 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         },
         // op=18: SYS_FB_DRAW_COLORED — draw text at (col, row) with explicit fg/bg colors.
         // arg0 = phys DMA page holding null-terminated text (up to 256 chars).
-        // arg1 = (row << 48) | (col << 32) | (fg_color & 0xFFFF_FFFF) — fg in upper word, bg dropped.
-        // Encoding: bits[63:48]=row, bits[47:32]=col, bits[31:16]=fg(high), bits[15:0]=fg(low).
-        // Actually: arg1 packing = (row << 48) | (col << 32) | fg_color where fg_color is 24-bit.
-        // Simpler ABI used: arg1[63:32] = (row<<16)|col packed as u32, arg1[31:0] = fg color (0x00RRGGBB).
+        // arg1[63:32] = (row<<16)|col packed as u32, arg1[31:0] = fg color (0x00RRGGBB).
         // bg color is always ColorSeaGray. Restricted to windowd/dashd.
-        18 => {
+        abi.SYS_FB_DRAW_COLORED => {
             const sid18 = service_registry.serviceIdForCapability(token) orelse return 0;
             const kind18 = service_registry.getServiceKind(sid18) orelse return 0;
             if (kind18 != .windowd and kind18 != .dashd) return 0;
@@ -606,7 +604,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // arg0 = (x << 48) | (y << 32) | (w << 16) | h  — all 16-bit fields.
         // arg1 = color (0x00RRGGBB).
         // Restricted to windowd.
-        19 => {
+        abi.SYS_FB_FILL_RECT => {
             const sid19 = service_registry.serviceIdForCapability(token) orelse return 0;
             const kind19 = service_registry.getServiceKind(sid19) orelse return 0;
             if (kind19 != .windowd) return 0;
@@ -621,13 +619,13 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         },
         // op=20: SYS_TRY_RECV — non-blocking receive.
         // Returns physical page address of the next queued DIPC message, or 0 if none.
-        // Unlike op=3, does NOT park the calling thread.
-        20 => {
+        // Unlike SYS_RECV, does NOT park the calling thread.
+        abi.SYS_TRY_RECV => {
             _ = service_registry.serviceIdForCapability(token) orelse return 0;
             if (scheduler.receive()) |m| return m;
             return 0;
         },
-        13, 14 => {
+        abi.SYS_PCI_READ_CONFIG, abi.SYS_PCI_WRITE_CONFIG => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             if (kind != .storaged and kind != .netd) return 0xFFFFFFFF;
@@ -640,7 +638,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const addr = 0x80000000 | (@as(u32, bus) << 16) | (@as(u32, dev) << 11) | (@as(u32, func) << 8) | (off & 0xfc);
             cpu.outl(0xcf8, addr);
             const base_port: u16 = 0xcfc;
-            if (op == 13) {
+            if (op == abi.SYS_PCI_READ_CONFIG) {
                 return switch (size) {
                     1 => @as(u64, cpu.inb(base_port + @as(u16, off & 3))),
                     2 => @as(u64, cpu.inw(base_port + @as(u16, off & 2))),
@@ -657,7 +655,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 return 0;
             }
         },
-        8 => {
+        abi.SYS_GET_KEY => {
             _ = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kbd = @import("keyboard.zig");
             if (kbd.getRawScancode()) |scancode| {
@@ -668,16 +666,15 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             scheduler.schedule();
             return 0xFFFFFFFF;
         },
-        24 => {
+        abi.SYS_YIELD => {
             _ = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             scheduler.schedule();
             return 0;
         },
-        // op=9: SYS_SERIAL_WRITE — atomically write a user-space buffer to
-        // the serial port.  INT gate has IF=0, so this cannot be preempted by
-        // the timer, preventing interleaved output from concurrent services.
+        // SYS_SERIAL_WRITE: atomically write a user-space buffer to COM1.
+        // INT gate has IF=0, so output is non-interleaved across services.
         // arg0 = pointer to buffer (user VA), arg1 = length.
-        9 => {
+        abi.SYS_SERIAL_WRITE => {
             const ptr = arg0;
             const len = arg1;
             if (len <= 4096 and accessOk(ptr, len)) {
@@ -695,7 +692,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             }
             return 0;
         },
-        22, 23 => {
+        abi.SYS_PORT_IN, abi.SYS_PORT_OUT => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             if (kind != .netd and kind != .storaged) return 0xFFFFFFFF;
@@ -703,7 +700,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const size = @as(u8, @truncate(arg1 >> 32));
             const val = @as(u32, @truncate(arg1));
 
-            if (op == 22) { // SYS_PORT_IN
+            if (op == abi.SYS_PORT_IN) {
                 return switch (size) {
                     1 => @as(u64, cpu.inb(port)),
                     2 => @as(u64, cpu.inw(port)),
@@ -720,7 +717,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 return 0;
             }
         },
-        25 => {
+        abi.SYS_VARDE_INJECT => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             if (kind != .windowd) return 0xFFFFFFFF;
@@ -728,10 +725,9 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             vsh.handleChar(@as(u8, @truncate(arg0)));
             return 0;
         },
-        // op=26: SYS_FB_GET_INFO — get framebuffer resolution.
-        // Returns (width << 32) | height.
-        // Restricted to windowd.
-        26 => {
+        // SYS_FB_GET_INFO: get framebuffer resolution.
+        // Returns (width << 32) | height. Restricted to windowd.
+        abi.SYS_FB_GET_INFO => {
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             if (kind != .windowd) return 0xFFFFFFFF;

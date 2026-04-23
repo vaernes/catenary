@@ -20,14 +20,14 @@ fn printHex(n: u64) void {
     }
 }
 
-const SYS_LOG = 1;
-const SYS_REGISTER = 2;
-const SYS_RECV = 3;
-const SYS_FREE_PAGE = 4;
-const SYS_ALLOC_DMA = 5;
-const SYS_SEND_PAGE = 6;
-const SYS_MAP_IO = 7;
-const SYS_MAP_RECV = 17;
+const SYS_LOG = lib.SYS_ACTIVATE;
+const SYS_REGISTER = lib.SYS_REGISTER;
+const SYS_RECV = lib.SYS_RECV;
+const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
+const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
+const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
+const SYS_MAP_IO = lib.SYS_MAP_MMIO;
+const SYS_MAP_RECV = lib.SYS_MAP_RECV;
 
 const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -46,11 +46,11 @@ fn spinPauseWithYield(counter: u32) void {
 // PCI config read/write via kernel lib.syscalls
 fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
     const addr = (@as(u64, bus) << 24) | (@as(u64, dev) << 16) | (@as(u64, func) << 8) | @as(u64, off);
-    return lib.syscall(13, addr, @as(u64, size) << 32, token);
+    return lib.syscall(lib.SYS_PCI_READ_CONFIG, addr, @as(u64, size) << 32, token);
 }
 fn pciWrite(bus: u8, dev: u8, func: u8, off: u8, size: u8, val: u32, token: u64) void {
     const addr = (@as(u64, bus) << 24) | (@as(u64, dev) << 16) | (@as(u64, func) << 8) | @as(u64, off);
-    _ = lib.syscall(14, addr, (@as(u64, size) << 32) | val, token);
+    _ = lib.syscall(lib.SYS_PCI_WRITE_CONFIG, addr, (@as(u64, size) << 32) | val, token);
 }
 
 // ---------------------------------------------------------------------------

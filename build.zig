@@ -49,6 +49,13 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("guest_image_blob", guest_image_blob);
     exe.root_module.addImport("guest_initramfs_blob", guest_initramfs_blob);
 
+    const syscall_abi_mod = b.createModule(.{
+        .root_source_file = b.path("src/syscall_abi.zig"),
+        .target = kernel_target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("syscall_abi", syscall_abi_mod);
+
     if (arch == .x86_64) {
         exe.root_module.single_threaded = true;
         exe.root_module.strip = false;
@@ -84,6 +91,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        user_exe.root_module.addImport("syscall_abi", syscall_abi_mod);
         user_exe.linkage = .static;
         user_exe.pie = false;
         if (arch == .x86_64) {

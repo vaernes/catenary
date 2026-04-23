@@ -1,5 +1,6 @@
 const std = @import("std");
 const dipc = @import("../ipc/dipc.zig");
+const abi = @import("syscall_abi");
 
 pub const DescriptorMagic: u32 = 0x53565442; // 'SVTB'
 pub const DescriptorVersion: u16 = 1;
@@ -100,24 +101,54 @@ pub fn isSyscallAllowed(kind: ServiceKind, op: u64) bool {
 }
 
 fn allowedSyscallMask(kind: ServiceKind) u32 {
-    // Shared IPC and diagnostics ops used across user services.
+    // Helper: turn an op constant into the corresponding bit position.
+    // All op values fit in u5 (0..31); comptime-check enforced by @as.
+    const bit = struct {
+        fn of(op: u64) u32 {
+            return @as(u32, 1) << @as(u5, @intCast(op));
+        }
+    }.of;
+
+    // Shared IPC and diagnostics ops available to all user services.
     const base_mask: u32 =
-        (1 << 2) | // SYS_REGISTER
-        (1 << 3) | // SYS_RECV
-        (1 << 4) | // SYS_FREE_PAGE
-        (1 << 5) | // SYS_ALLOC_DMA
-        (1 << 6) | // SYS_SEND_PAGE
-        (1 << 9) | // SYS_SERIAL_WRITE
-        (1 << 17) | // SYS_MAP_RECV
-        (1 << 24); // SYS_YIELD
+        bit(abi.SYS_REGISTER) |
+        bit(abi.SYS_RECV) |
+        bit(abi.SYS_FREE_PAGE) |
+        bit(abi.SYS_ALLOC_DMA) |
+        bit(abi.SYS_SEND_PAGE) |
+        bit(abi.SYS_SERIAL_WRITE) |
+        bit(abi.SYS_MAP_RECV) |
+        bit(abi.SYS_YIELD);
 
     return switch (kind) {
-        .netd => base_mask | (1 << 7) | (1 << 13) | (1 << 14) | (1 << 22) | (1 << 23), // MMIO, PCI, PORT_IO
-        .storaged => base_mask | (1 << 7) | (1 << 13) | (1 << 14) | (1 << 22) | (1 << 23),
-        .dashd => base_mask | (1 << 16) | (1 << 18) | (1 << 20),
-        .inputd => base_mask | (1 << 8),
-        .windowd => base_mask | (1 << 16) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 25) | (1 << 26), // FB drawing, inbox poll, Varde shell
-        .containerd => base_mask | (1 << 20),
+        .netd => base_mask |
+            bit(abi.SYS_MAP_MMIO) |
+            bit(abi.SYS_PCI_READ_CONFIG) |
+            bit(abi.SYS_PCI_WRITE_CONFIG) |
+            bit(abi.SYS_PORT_IN) |
+            bit(abi.SYS_PORT_OUT),
+        .storaged => base_mask |
+            bit(abi.SYS_MAP_MMIO) |
+            bit(abi.SYS_PCI_READ_CONFIG) |
+            bit(abi.SYS_PCI_WRITE_CONFIG) |
+            bit(abi.SYS_PORT_IN) |
+            bit(abi.SYS_PORT_OUT),
+        .dashd => base_mask |
+            bit(abi.SYS_FB_DRAW) |
+            bit(abi.SYS_FB_DRAW_COLORED) |
+            bit(abi.SYS_TRY_RECV),
+        .inputd => base_mask |
+            bit(abi.SYS_GET_KEY),
+        .windowd => base_mask |
+            bit(abi.SYS_FB_DRAW) |
+            bit(abi.SYS_FB_DRAW_COLORED) |
+            bit(abi.SYS_FB_FILL_RECT) |
+            bit(abi.SYS_TRY_RECV) |
+            bit(abi.SYS_GET_VARDE_LOG) |
+            bit(abi.SYS_VARDE_INJECT) |
+            bit(abi.SYS_FB_GET_INFO),
+        .containerd => base_mask |
+            bit(abi.SYS_TRY_RECV),
         else => base_mask,
     };
 }

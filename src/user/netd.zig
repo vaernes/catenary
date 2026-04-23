@@ -9,8 +9,8 @@ const lib = @import("lib.zig");
 // Low-level I/O helpers
 // ---------------------------------------------------------------------------
 
-const SYS_PORT_IN = 22;
-const SYS_PORT_OUT = 23;
+const SYS_PORT_IN = lib.SYS_PORT_IN;
+const SYS_PORT_OUT = lib.SYS_PORT_OUT;
 
 fn outb(port: u16, val: u8) void {
     _ = lib.syscall(SYS_PORT_OUT, port, (@as(u64, 1) << 32) | val, g_token);

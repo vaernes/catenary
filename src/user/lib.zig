@@ -37,22 +37,31 @@ pub fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
     }
 }
 
-pub const SYS_REGISTER = 2;
-pub const SYS_RECV = 3;
-pub const SYS_FREE_PAGE = 4;
-pub const SYS_ALLOC_DMA = 5;
-pub const SYS_SEND_PAGE = 6;
-pub const SYS_GET_KEY = 8;
-pub const SYS_SERIAL_WRITE = 9;
-pub const SYS_FB_DRAW = 16;
-pub const SYS_MAP_RECV = 17;
-pub const SYS_FB_DRAW_COLORED = 18;
-pub const SYS_FB_FILL_RECT = 19;
-pub const SYS_TRY_RECV = 20;
-pub const SYS_GET_VARDE_LOG = 21;
-pub const SYS_VARDE_INJECT = 25;
-pub const SYS_FB_GET_INFO = 26;
-pub const SYS_YIELD = 24;
+// Syscall opcode constants — canonical definitions live in syscall_abi.zig.
+// Re-exported here so user-space services only need to import lib.zig.
+const abi = @import("syscall_abi");
+pub const SYS_ACTIVATE = abi.SYS_ACTIVATE;
+pub const SYS_REGISTER = abi.SYS_REGISTER;
+pub const SYS_RECV = abi.SYS_RECV;
+pub const SYS_FREE_PAGE = abi.SYS_FREE_PAGE;
+pub const SYS_ALLOC_DMA = abi.SYS_ALLOC_DMA;
+pub const SYS_SEND_PAGE = abi.SYS_SEND_PAGE;
+pub const SYS_MAP_MMIO = abi.SYS_MAP_MMIO;
+pub const SYS_GET_KEY = abi.SYS_GET_KEY;
+pub const SYS_SERIAL_WRITE = abi.SYS_SERIAL_WRITE;
+pub const SYS_FB_DRAW = abi.SYS_FB_DRAW;
+pub const SYS_MAP_RECV = abi.SYS_MAP_RECV;
+pub const SYS_FB_DRAW_COLORED = abi.SYS_FB_DRAW_COLORED;
+pub const SYS_FB_FILL_RECT = abi.SYS_FB_FILL_RECT;
+pub const SYS_TRY_RECV = abi.SYS_TRY_RECV;
+pub const SYS_GET_VARDE_LOG = abi.SYS_GET_VARDE_LOG;
+pub const SYS_PORT_IN = abi.SYS_PORT_IN;
+pub const SYS_PORT_OUT = abi.SYS_PORT_OUT;
+pub const SYS_YIELD = abi.SYS_YIELD;
+pub const SYS_VARDE_INJECT = abi.SYS_VARDE_INJECT;
+pub const SYS_FB_GET_INFO = abi.SYS_FB_GET_INFO;
+pub const SYS_PCI_READ_CONFIG = abi.SYS_PCI_READ_CONFIG;
+pub const SYS_PCI_WRITE_CONFIG = abi.SYS_PCI_WRITE_CONFIG;
 
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
