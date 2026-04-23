@@ -9,7 +9,6 @@
 /// Message format:
 ///   PageHeader         (lib.DIPC_HEADER_SIZE bytes)
 ///   TelemetryUpdate    (sent by the VMM bridge after each vmexit burst)
-
 pub const MAGIC: u32 = 0x44415348; // 'DASH'
 pub const VERSION: u16 = 1;
 

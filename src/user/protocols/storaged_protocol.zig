@@ -9,7 +9,6 @@
 /// Message format:
 ///   PageHeader   (lib.DIPC_HEADER_SIZE bytes)
 ///   BlkRequest   (request) or BlkResponse (reply)
-
 pub const MAGIC: u32 = 0x53544F52; // 'STOR'
 pub const VERSION: u16 = 1;
 

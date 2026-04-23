@@ -17,7 +17,6 @@
 ///   PageHeader          (lib.DIPC_HEADER_SIZE bytes)
 ///   lib.ControlHeader   (op = .registry_sync)
 ///   RegistrySyncPayload
-
 pub const MAGIC: u32 = 0x434F4E46; // 'CONF'
 pub const VERSION: u16 = 1;
 

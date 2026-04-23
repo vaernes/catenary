@@ -14,7 +14,6 @@
 ///   payload        (op-specific)
 ///
 /// Service-to-service messages use ClusterdHeader instead of ControlHeader.
-
 pub const MAGIC: u32 = 0x434C5354; // 'CLST'
 pub const VERSION: u16 = 1;
 

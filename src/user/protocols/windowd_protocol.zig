@@ -13,7 +13,6 @@
 /// Message format (inbound from inputd):
 ///   PageHeader  (lib.DIPC_HEADER_SIZE bytes)
 ///   InputEvent  (8 bytes — see inputd_protocol.InputEvent)
-
 pub const MAGIC: u32 = 0x57494E44; // 'WIND'
 pub const VERSION: u16 = 1;
 

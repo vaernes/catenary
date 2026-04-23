@@ -14,7 +14,6 @@ const lib = @import("lib.zig");
 ///   'l' — Launch a new MicroVM via clusterd (sends create_microvm DIPC)
 ///   'r' — Refresh display
 ///   'q' — Shutdown request (idles)
-
 const configd_proto = @import("protocols/configd_protocol.zig");
 
 // ---------------------------------------------------------------------------

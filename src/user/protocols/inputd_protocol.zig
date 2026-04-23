@@ -9,7 +9,6 @@
 /// Message format (sent FROM inputd to windowd):
 ///   PageHeader    (lib.DIPC_HEADER_SIZE bytes)
 ///   InputEvent    (8 bytes, extern-padded to u64 alignment)
-
 pub const MAGIC: u32 = 0x494E5054; // 'INPT'
 pub const VERSION: u16 = 1;
 

@@ -9,7 +9,6 @@
 ///   PageHeader  (lib.DIPC_HEADER_SIZE bytes)
 ///   NetdHeader  (8 bytes)
 ///   payload     (op-specific, see below)
-
 pub const MAGIC: u32 = 0x4E455444; // 'NETD'
 pub const VERSION: u16 = 1;
 
@@ -61,9 +60,9 @@ pub const NodeAddrReply = extern struct {
 
 /// Op.route_update — insert or remove a route entry from netd's table.
 pub const RouteUpdatePayload = extern struct {
-    prefix: [16]u8,  // IPv6 network prefix
-    prefix_len: u8,  // CIDR prefix length (0–128)
-    action: u8,      // 0 = remove, 1 = add
+    prefix: [16]u8, // IPv6 network prefix
+    prefix_len: u8, // CIDR prefix length (0–128)
+    action: u8, // 0 = remove, 1 = add
     _pad: [6]u8 = [_]u8{0} ** 6,
     next_hop: [16]u8, // IPv6 next-hop (or :: for on-link)
 };
@@ -72,6 +71,6 @@ pub const RouteUpdatePayload = extern struct {
 /// The serialized DIPC page bytes follow immediately after this struct.
 pub const ForwardPayload = extern struct {
     dst_node: [16]u8, // destination IPv6 node address
-    page_len: u32,    // length of the DIPC page that follows
+    page_len: u32, // length of the DIPC page that follows
     _pad: u32 = 0,
 };
