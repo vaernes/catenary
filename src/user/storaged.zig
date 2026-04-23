@@ -460,6 +460,23 @@ fn queryCurrentNode(bs: *const lib.BootstrapDescriptor, token: u64, scratch_phys
     return null;
 }
 
+/// Background I/O watchdog thread (spawned by umain after NVMe init).
+/// Runs as "storaged/1" in the scheduler.  Emits a periodic heartbeat so
+/// operators can confirm the storage service is alive during long I/O drains.
+fn ioWatchdogLoop() noreturn {
+    lib.serialWrite("storaged: io-watchdog starting\n");
+    var tick: u32 = 0;
+    while (true) {
+        tick += 1;
+        if (tick >= 50_000) {
+            tick = 0;
+            lib.serialWrite("storaged: io-watchdog alive\n");
+        }
+        _ = lib.syscall(lib.SYS_YIELD, 0, 0, g_token);
+        asm volatile ("pause");
+    }
+}
+
 pub export fn umain() noreturn {
     const bs_desc: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     if (bs_desc.magic != 0x53565442) while (true) asm volatile ("hlt");
@@ -603,6 +620,23 @@ pub export fn umain() noreturn {
         while (true) asm volatile ("pause");
     }
     lib.serialWrite("storaged: IO queues ready\n");
+
+    // Spawn background I/O watchdog thread using DMA slot 7 as its stack.
+    const wd_stack_phys = lib.syscall(SYS_ALLOC_DMA, 1, 7, g_token);
+    if (wd_stack_phys != 0) {
+        const wd_stack_top: u64 = DMA_BASE_VA + 8 * PAGE_SIZE;
+        const tid = lib.spawnThread(&ioWatchdogLoop, wd_stack_top, g_token);
+        if (tid != 0xFFFFFFFF) {
+            lib.serialWrite("storaged: io-watchdog thread spawned tid=");
+            printHex(tid);
+            lib.serialWrite("\n");
+        } else {
+            lib.serialWrite("storaged: io-watchdog spawn failed\n");
+        }
+    } else {
+        lib.serialWrite("storaged: io-watchdog stack alloc failed\n");
+    }
+
     lib.serialWrite("storaged: entering event loop\n");
 
     // ----- Main event loop -----

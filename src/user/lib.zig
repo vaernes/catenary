@@ -68,6 +68,7 @@ pub const SYS_VARDE_INJECT = abi.SYS_VARDE_INJECT;
 pub const SYS_FB_GET_INFO = abi.SYS_FB_GET_INFO;
 pub const SYS_PCI_READ_CONFIG = abi.SYS_PCI_READ_CONFIG;
 pub const SYS_PCI_WRITE_CONFIG = abi.SYS_PCI_WRITE_CONFIG;
+pub const SYS_SPAWN_THREAD = abi.SYS_SPAWN_THREAD;
 
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -162,6 +163,16 @@ pub fn outb(port: u16, val: u8) void {
 
 pub fn serialWrite(s: []const u8) void {
     _ = syscall(SYS_SERIAL_WRITE, @intFromPtr(s.ptr), s.len, 0);
+}
+
+/// Spawn an additional Ring-3 thread for this service in the same address space.
+/// `entry_fn` must be `noreturn`; it starts with no arguments (arg0 from the
+/// kernel is 0 for extra threads, not a bootstrap-page address).
+/// `stack_top` is the exclusive top of the thread's stack (16-byte aligned).
+/// `token` is the caller's capability token.
+/// Returns the kernel thread ID on success, 0xFFFFFFFF on failure.
+pub fn spawnThread(entry_fn: *const fn () noreturn, stack_top: u64, token: u64) u64 {
+    return syscall(SYS_SPAWN_THREAD, @intFromPtr(entry_fn), stack_top, token);
 }
 
 pub fn printHex(n: u64) void {

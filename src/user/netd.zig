@@ -84,28 +84,25 @@ fn printDec(n: u64) void {
 }
 
 // ---------------------------------------------------------------------------
-// Syscall interface
+// Syscall interface — all constants from lib.zig (which re-exports syscall_abi)
 // ---------------------------------------------------------------------------
 
-const SYS_LOG = 1;
-const SYS_REGISTER = 2;
-const SYS_RECV = 3; // returns page_phys or 0
-const SYS_FREE_PAGE = 4; // arg0=page_phys or DIPC_RECV_VA
-const SYS_ALLOC_DMA = 5; // arg0=num_pages, arg1=slot_start → phys_base
-const SYS_SEND_PAGE = 6; // arg0=dma_phys → route DIPC copy
-const SYS_MAP_IO = 7; // not used by netd (IO BAR => IO ports)
-const SYS_FB_DRAW = 16;
-const SYS_MAP_RECV = 17; // arg0=page_phys → maps at DIPC_RECV_VA, returns it
-const SYS_YIELD = 24;
+const SYS_REGISTER = lib.SYS_REGISTER;
+const SYS_RECV = lib.SYS_RECV;
+const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
+const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
+const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
+const SYS_MAP_RECV = lib.SYS_MAP_RECV;
+const SYS_YIELD = lib.SYS_YIELD;
 
-const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
-const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
-const PAGE_SIZE: u64 = 4096;
+const DIPC_RECV_VA: u64 = lib.DIPC_RECV_VA;
+const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
+const PAGE_SIZE: u64 = lib.PAGE_SIZE;
 
-// PCI config read via kernel lib.syscall 13
+// PCI config read via kernel syscall
 fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
     const addr = (@as(u64, bus) << 24) | (@as(u64, dev) << 16) | (@as(u64, func) << 8) | @as(u64, off);
-    return lib.syscall(13, addr, (@as(u64, size) << 32), token);
+    return lib.syscall(lib.SYS_PCI_READ_CONFIG, addr, (@as(u64, size) << 32), token);
 }
 
 // ---------------------------------------------------------------------------
@@ -773,6 +770,22 @@ fn pollDipc(token: u64) void {
 
 var g_token: u64 = 0;
 
+/// Dedicated NIC RX poller thread (spawned by umain after hardware setup).
+/// Runs as "netd/1" in the scheduler.  Polls the virtio-net ISR and drains
+/// received frames independently of the main DIPC handler.
+fn rxPollerLoop() noreturn {
+    lib.serialWrite("netd: rx-poller starting\n");
+    while (true) {
+        // Read and clear the legacy virtio ISR status register.
+        const isr = inb(g_io_base + VIRTIO_PCI_ISR);
+        if (isr & 1 != 0) {
+            pollRx(g_token);
+        }
+        _ = lib.syscall(SYS_YIELD, 0, 0, g_token);
+        asm volatile ("pause");
+    }
+}
+
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     g_token = bs.capability_token;
@@ -897,23 +910,29 @@ pub export fn umain() noreturn {
     // Pre-fill RX descriptors.
     fillRxQueue();
 
-    lib.serialWrite("netd: NIC ready, entering DIPC/NIC event loop\n");
-
-    // Main event loop.
-    var isr_poll: u32 = 0;
-    while (true) {
-        isr_poll += 1;
-        if (isr_poll >= 1000) {
-            isr_poll = 0;
-            // Poll NIC ISR status (clears on read).
-            const isr = inb(g_io_base + VIRTIO_PCI_ISR);
-            if (isr & 1 != 0) {
-                pollRx(token);
-            }
+    // Allocate one DMA page (slot 8) as the stack for the RX poller thread.
+    // The stack grows down from the page's top boundary.
+    const rx_poller_stack_phys = lib.syscall(SYS_ALLOC_DMA, 1, 8, token);
+    if (rx_poller_stack_phys != 0) {
+        const rx_poller_stack_top: u64 = DMA_BASE_VA + 9 * PAGE_SIZE;
+        const tid = lib.spawnThread(&rxPollerLoop, rx_poller_stack_top, token);
+        if (tid != 0xFFFFFFFF) {
+            lib.serialWrite("netd: rx-poller thread spawned tid=");
+            printHex(tid);
+            lib.serialWrite("\n");
+        } else {
+            lib.serialWrite("netd: rx-poller spawn failed, falling back to single-threaded\n");
         }
+    } else {
+        lib.serialWrite("netd: rx-poller stack alloc failed\n");
+    }
+
+    lib.serialWrite("netd: entering DIPC handler loop\n");
+
+    // Main thread: block on SYS_RECV and handle outbound DIPC routing.
+    // The RX poller thread handles inbound NIC frames independently.
+    while (true) {
         pollDipc(token);
-        _ = lib.syscall(SYS_YIELD, 0, 0, token);
-        asm volatile ("pause");
     }
 }
 

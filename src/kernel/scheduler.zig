@@ -25,6 +25,15 @@ pub const Thread = struct {
     total_tsc: u64 = 0,
     /// Null-terminated ASCII name for debug output (max 15 chars + NUL).
     name: [16]u8 = [_]u8{0} ** 16,
+    /// User-space entry RIP for threads spawned via SYS_SPAWN_THREAD.
+    /// Read by service_extra_thread_trampoline; 0 for primary service threads.
+    user_entry: u64 = 0,
+    /// User-space stack top VA for threads spawned via SYS_SPAWN_THREAD.
+    user_stack_va: u64 = 0,
+    /// When false this thread is not a DIPC receive target.  Extra threads
+    /// spawned via SYS_SPAWN_THREAD set this to false so that sendToService
+    /// always delivers inbound DIPC pages to the primary (blocking) thread.
+    dipc_eligible: bool = true,
 
     pub const State = enum {
         Empty,
@@ -222,9 +231,27 @@ pub fn send(tid: u32, data: u64) bool {
 }
 
 pub fn sendToService(sid: u32, data: u64) bool {
+    // First pass: prefer a Waiting, DIPC-eligible thread so we wake the
+    // primary receive loop rather than a background polling thread.
     for (0..THREAD_TARGET_COUNT) |i| {
-        if (threads[i].state != .Empty and threads[i].sid == sid) {
-            if (threads[i].mailbox.full) continue; // Try next thread if this one is full
+        if (threads[i].state == .Waiting and
+            threads[i].sid == sid and
+            threads[i].dipc_eligible and
+            !threads[i].mailbox.full)
+        {
+            threads[i].mailbox.data = data;
+            threads[i].mailbox.full = true;
+            threads[i].state = .Ready;
+            return true;
+        }
+    }
+    // Second pass: fall back to any DIPC-eligible, non-full thread.
+    for (0..THREAD_TARGET_COUNT) |i| {
+        if (threads[i].state != .Empty and
+            threads[i].sid == sid and
+            threads[i].dipc_eligible and
+            !threads[i].mailbox.full)
+        {
             threads[i].mailbox.data = data;
             threads[i].mailbox.full = true;
             if (threads[i].state == .Waiting) threads[i].state = .Ready;
@@ -232,6 +259,68 @@ pub fn sendToService(sid: u32, data: u64) bool {
         }
     }
     return false;
+}
+
+/// Spawn an additional Ring-3 thread for an existing service (SYS_SPAWN_THREAD).
+/// The new thread shares the service's address space and capability token but
+/// is NOT eligible for inbound DIPC delivery (dipc_eligible = false).
+pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
+    const user_mode = @import("../arch/x86_64/user_mode.zig");
+    const service_registry = @import("../services/service_registry.zig");
+
+    for (0..THREAD_TARGET_COUNT) |i| {
+        if (threads[i].state == .Empty) {
+            const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
+            const stack_top = stack_p + hhdm_offset + 4096;
+
+            // Stack frame consumed by switchContext on first dispatch:
+            //   [rsp+0..40] = callee-saved regs (r15..rbx) — zeroed
+            //   [rsp+48]    = return address → service_extra_thread_trampoline
+            //   [rsp+56]    = dummy alignment word
+            const st: [*]u64 = @ptrFromInt(stack_top - 64);
+            st[0] = 0; // r15
+            st[1] = 0; // r14
+            st[2] = 0; // r13
+            st[3] = 0; // r12
+            st[4] = 0; // rbp
+            st[5] = 0; // rbx (unused for extra threads)
+            st[6] = @intFromPtr(&user_mode.service_extra_thread_trampoline);
+            st[7] = 0; // dummy alignment
+
+            const tid = next_thread_id;
+            next_thread_id += 1;
+
+            threads[i] = Thread{
+                .rsp = stack_top - 64,
+                .id = tid,
+                .sid = sid,
+                .state = .Ready,
+                .user_entry = entry_va,
+                .user_stack_va = stack_va,
+                .dipc_eligible = false,
+            };
+
+            // Name: "service/N" where N is the count of sibling threads.
+            var sibling_count: u32 = 0;
+            for (0..THREAD_TARGET_COUNT) |j| {
+                if (j != i and threads[j].state != .Empty and threads[j].sid == sid) {
+                    sibling_count += 1;
+                }
+            }
+            var name_buf: [16]u8 = [_]u8{0} ** 16;
+            if (service_registry.getServiceKind(sid)) |kind| {
+                const base = serviceKindName(kind);
+                const blen = @min(base.len, 13);
+                @memcpy(name_buf[0..blen], base[0..blen]);
+                name_buf[blen] = '/';
+                name_buf[blen + 1] = '0' + @as(u8, @intCast(@min(sibling_count, 9)));
+            }
+            threads[i].name = name_buf;
+
+            return tid;
+        }
+    }
+    return error.NoEmptySlots;
 }
 
 pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx: u32) !u32 {

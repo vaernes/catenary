@@ -150,3 +150,16 @@ pub const SYS_GET_VARDE_LOG: u64 = 21;
 /// Inject a character into the varde shell input queue.
 /// arg0 = char (u8).  Returns 0.
 pub const SYS_VARDE_INJECT: u64 = 25;
+
+// ---------------------------------------------------------------------------
+// Threading
+// ---------------------------------------------------------------------------
+
+/// Spawn an additional Ring-3 thread for the calling service.
+/// The new thread shares the caller's address space and capability token.
+/// It is NOT eligible to receive inbound DIPC messages (use the primary
+/// service thread for SYS_RECV / SYS_TRY_RECV).
+/// arg0 = user-space entry RIP (must be below the canonical hole).
+/// arg1 = user-space stack top VA (exclusive; must be 16-byte aligned).
+/// Returns the kernel thread ID (u32, non-zero) on success, 0xFFFFFFFF on failure.
+pub const SYS_SPAWN_THREAD: u64 = 27;

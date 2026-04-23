@@ -118,7 +118,8 @@ fn allowedSyscallMask(kind: ServiceKind) u32 {
         bit(abi.SYS_SEND_PAGE) |
         bit(abi.SYS_SERIAL_WRITE) |
         bit(abi.SYS_MAP_RECV) |
-        bit(abi.SYS_YIELD);
+        bit(abi.SYS_YIELD) |
+        bit(abi.SYS_SPAWN_THREAD);
 
     return switch (kind) {
         .netd => base_mask |

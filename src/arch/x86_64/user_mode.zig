@@ -102,6 +102,39 @@ pub fn service_trampoline_bridge() callconv(.c) void {
     enterUserMode(launch.entry_rip, launch.stack_top, launch.bootstrap_page_phys, 0x18, 0x20);
 }
 
+/// Trampoline for Ring-3 threads spawned via SYS_SPAWN_THREAD.
+/// Called by switchContext on the first dispatch of an extra service thread.
+/// Reads entry/stack from the current Thread struct (set by spawnUserThread)
+/// and enters user mode at the service-supplied RIP.
+pub fn service_extra_thread_trampoline() callconv(.c) void {
+    const thread = scheduler.get_current_thread();
+    const sid = thread.sid;
+
+    // Allocate a dedicated kernel interrupt stack for this thread so that
+    // Ring-3 traps (syscalls, faults) land on a private stack, not a shared one.
+    const region = pmm.allocGuardedRegion(16) orelse {
+        serialWrite("extra_thread: kernel interrupt stack alloc failed sid=0x");
+        printHex(sid);
+        serialWrite("\n");
+        while (true) {
+            cpu.cli();
+            cpu.hlt();
+        }
+    };
+    const stack_top_virt = region.data_phys + @as(u64, region.n_pages) * 4096 + hhdm_offset;
+
+    if (service_registry.getTaskBoundAddressSpace(sid)) |pml4_phys| {
+        thread.user_pml4 = pml4_phys;
+        cpu.writeCr3(pml4_phys);
+    }
+    thread.kernel_int_stack_top = stack_top_virt;
+    gdt.setKernelRsp0(stack_top_virt);
+
+    // Enter user mode at the thread's own entry point + stack.
+    // Pass 0 as arg0 (no bootstrap page for extra threads).
+    enterUserMode(thread.user_entry, thread.user_stack_va, 0, 0x18, 0x20);
+}
+
 fn outb(port: u16, val: u8) void {
     cpu.outb(port, val);
 }
@@ -736,6 +769,23 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 return (@as(u64, info.width) << 32) | info.height;
             }
             return 0;
+        },
+        // SYS_SPAWN_THREAD: spawn an additional Ring-3 thread for this service.
+        // arg0 = user-space entry RIP, arg1 = user-space stack top VA.
+        // Returns kernel thread ID on success, 0xFFFFFFFF on failure.
+        abi.SYS_SPAWN_THREAD => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
+            const entry_va = arg0;
+            const stack_va = arg1;
+            if (!accessOk(entry_va, 8) or !accessOk(stack_va, 8)) {
+                serialWrite("[SPAWN_THREAD] bad pointer\n");
+                return 0xFFFFFFFF;
+            }
+            const tid = scheduler.spawnUserThread(sid, entry_va, stack_va) catch {
+                serialWrite("[SPAWN_THREAD] spawnUserThread failed\n");
+                return 0xFFFFFFFF;
+            };
+            return @as(u64, tid);
         },
         else => {},
     }
