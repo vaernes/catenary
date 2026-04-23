@@ -23,6 +23,8 @@ pub const Thread = struct {
     /// 0 = kernel thread, leave CR3 unchanged.
     user_pml4: u64 = 0,
     total_tsc: u64 = 0,
+    /// Null-terminated ASCII name for debug output (max 15 chars + NUL).
+    name: [16]u8 = [_]u8{0} ** 16,
 
     pub const State = enum {
         Empty,
@@ -30,6 +32,18 @@ pub const Thread = struct {
         Running,
         Waiting,
     };
+
+    pub fn setName(self: *Thread, s: []const u8) void {
+        @memset(&self.name, 0);
+        const copy_len = if (s.len < 15) s.len else 15;
+        @memcpy(self.name[0..copy_len], s[0..copy_len]);
+    }
+
+    pub fn nameSlice(self: *const Thread) []const u8 {
+        var len: usize = 0;
+        while (len < self.name.len and self.name[len] != 0) len += 1;
+        return self.name[0..len];
+    }
 };
 
 pub const Message = struct { sender: u32, value: u64 };
@@ -56,12 +70,40 @@ pub fn init(offset: u64) void {
     }
     threads[0].state = .Running;
     threads[0].id = 0;
+    threads[0].setName("kernel/boot");
     current_thread_idx = 0;
     last_tsc_stamp = arch.cpu.rdtsc();
 }
 
+fn serviceKindName(kind: @import("../services/service_bootstrap.zig").ServiceKind) []const u8 {
+    return switch (kind) {
+        .netd => "netd",
+        .vmm => "vmm",
+        .storaged => "storaged",
+        .dashd => "dashd",
+        .containerd => "containerd",
+        .clusterd => "clusterd",
+        .inputd => "inputd",
+        .windowd => "windowd",
+        .configd => "configd",
+    };
+}
+
+fn fmtVmxName(vmid: u32) [16]u8 {
+    var buf: [16]u8 = [_]u8{0} ** 16;
+    buf[0] = 'v';
+    buf[1] = 'm';
+    buf[2] = 'x';
+    buf[3] = '/';
+    const hx = "0123456789ABCDEF";
+    buf[4] = hx[(vmid >> 12) & 0xF];
+    buf[5] = hx[(vmid >> 8) & 0xF];
+    buf[6] = hx[(vmid >> 4) & 0xF];
+    buf[7] = hx[vmid & 0xF];
+    return buf;
+}
+
 pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootstrap.zig").ServiceKind) !u32 {
-    _ = kind;
     arch.cpu.outb(0x3F8, 's');
     for (0..THREAD_TARGET_COUNT) |i| {
         if (threads[i].state == .Empty) {
@@ -106,6 +148,7 @@ pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootst
                 .sid = sid,
                 .state = .Ready,
             };
+            threads[i].setName(serviceKindName(kind));
 
             arch.cpu.outb(0x3F8, '!');
             const hex = "0123456789ABCDEF";
@@ -127,7 +170,7 @@ pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootst
     }
     return error.NoEmptySlots;
 }
-pub fn spawn(entry: *const fn () void) !u32 {
+pub fn spawn(entry: *const fn () void, name: []const u8) !u32 {
     for (0..THREAD_TARGET_COUNT) |i| {
         if (threads[i].state == .Empty) {
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
@@ -145,6 +188,7 @@ pub fn spawn(entry: *const fn () void) !u32 {
                 .id = id,
                 .state = .Ready,
             };
+            threads[i].setName(name);
             return id;
         }
     }
@@ -232,6 +276,11 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
                 .vmid = vmid,
                 .vcpu_idx = vcpu_idx,
             };
+            if (is_vmx) {
+                threads[i].name = fmtVmxName(vmid);
+            } else {
+                threads[i].setName("kernel/task");
+            }
             return id;
         }
     }

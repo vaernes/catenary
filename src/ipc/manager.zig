@@ -26,7 +26,7 @@ pub fn init(offset: u64) void {
     hhdm_offset = offset;
     table.init();
 
-    const control_tid = scheduler.spawn(controlLoop) catch {
+    const control_tid = scheduler.spawn(controlLoop, "ipc/control") catch {
         serialWrite("MANAGER: failed to spawn control loop\n");
         return;
     };

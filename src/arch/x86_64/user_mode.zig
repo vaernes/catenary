@@ -142,8 +142,11 @@ pub export fn userModeGpBridge(error_code: u64, rip: u64, cs: u64, flags: u64, r
     const user_fault = (cs & 0x3) != 0;
     serialWrite("\n[GPF]");
     if (user_fault) {
-        serialWrite(" sid=0x");
-        printHex(scheduler.get_current_thread().sid);
+        const t_gp_info = scheduler.get_current_thread();
+        serialWrite(" [");
+        serialWrite(t_gp_info.nameSlice());
+        serialWrite("] sid=0x");
+        printHex(t_gp_info.sid);
     }
     serialWrite(" err=0x");
     printHex(error_code);
@@ -193,8 +196,11 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
     const user_fault = (cs & 0x3) != 0;
     serialWrite("\n[PF]");
     if (user_fault) {
-        serialWrite(" sid=0x");
-        printHex(scheduler.get_current_thread().sid);
+        const t_pf_info = scheduler.get_current_thread();
+        serialWrite(" [");
+        serialWrite(t_pf_info.nameSlice());
+        serialWrite("] sid=0x");
+        printHex(t_pf_info.sid);
     }
     serialWrite(" addr=0x");
     printHex(cr2);

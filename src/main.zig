@@ -482,13 +482,13 @@ pub export fn _kernel_main() callconv(.c) noreturn {
 
     if (!build_options.vmm_active) {
         bootLog("Scheduler: starting demo worker threads.\n");
-        thread_a_id = scheduler.spawn(threadA) catch |err| {
+        thread_a_id = scheduler.spawn(threadA, "kernel/threadA") catch |err| {
             bootLog("Spawn A failed: ");
             bootLog(@errorName(err));
             bootLog("\n");
             while (true) arch.cpu.halt();
         };
-        _ = scheduler.spawn(threadB) catch |err| {
+        _ = scheduler.spawn(threadB, "kernel/threadB") catch |err| {
             bootLog("Spawn B failed: ");
             bootLog(@errorName(err));
             bootLog("\n");
