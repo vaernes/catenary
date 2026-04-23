@@ -46,3 +46,4 @@ generate_*.py
 *.swo
 .DS_Store
 Thumbs.db
+build_log.txt

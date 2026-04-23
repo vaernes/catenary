@@ -96,6 +96,7 @@ const SYS_SEND_PAGE = 6; // arg0=dma_phys → route DIPC copy
 const SYS_MAP_IO = 7; // not used by netd (IO BAR => IO ports)
 const SYS_FB_DRAW = 16;
 const SYS_MAP_RECV = 17; // arg0=page_phys → maps at DIPC_RECV_VA, returns it
+const SYS_YIELD = 24;
 
 const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -911,6 +912,7 @@ pub export fn umain() noreturn {
             }
         }
         pollDipc(token);
+        _ = lib.syscall(SYS_YIELD, 0, 0, token);
         asm volatile ("pause");
     }
 }

@@ -74,6 +74,18 @@ pub const ReservedEndpoint = enum(u64) {
     configd        = 10,
 };
 
+pub const ServiceKind = enum(u16) {
+    netd = 1,
+    vmm = 2,
+    storaged = 3,
+    dashd = 4,
+    containerd = 5,
+    clusterd = 6,
+    inputd = 7,
+    windowd = 8,
+    configd = 9,
+};
+
 pub const BootstrapDescriptor = extern struct {
     magic: u32,
     version: u16,
@@ -101,6 +113,11 @@ pub const BootstrapDescriptor = extern struct {
     reserved_router_endpoint: u64,
     reserved_storaged_endpoint: u64,
     reserved_dashd_endpoint: u64,
+    reserved_containerd_endpoint: u64,
+    reserved_clusterd_endpoint: u64,
+    reserved_inputd_endpoint: u64,
+    reserved_windowd_endpoint: u64,
+    reserved_configd_endpoint: u64,
     microvm_ingress_magic: u32,
     microvm_ingress_version: u16,
     microvm_ingress_len: u16,
@@ -411,4 +428,102 @@ pub fn getFramebufferInfo() ?struct { width: u32, height: u32 } {
         .width  = @as(u32, @truncate(res >> 32)),
         .height = @as(u32, @truncate(res & 0xFFFF_FFFF)),
     };
+}
+
+// --- TUI Helpers ---
+
+pub fn fillRect(x: u32, y: u32, w: u32, h: u32, color: u32, token: u64) void {
+    const arg0 = (@as(u64, x) << 48) | (@as(u64, y) << 32) | (@as(u64, w) << 16) | @as(u64, h);
+    _ = syscall(SYS_FB_FILL_RECT, arg0, color, token);
+}
+
+pub fn drawText(dma_phys: u64, dma_va: u64, row: u32, col: u32, fg: u32, text: []const u8, token: u64) void {
+    const len = @min(text.len, 255);
+    if (len == 0) return;
+    const buf: [*]u8 = ptrFrom([*]u8, dma_va);
+    @memcpy(buf[0..len], text[0..len]);
+    buf[len] = 0;
+    const arg1 = (@as(u64, row) << 48) | (@as(u64, col) << 32) | fg;
+    _ = syscall(SYS_FB_DRAW_COLORED, dma_phys, arg1, token);
+}
+
+// --- DIPC Helpers ---
+
+fn controlSourceEndpoint(bs: *const BootstrapDescriptor) EndpointId {
+    return switch (bs.service_kind) {
+        @intFromEnum(ServiceKind.netd) => bs.reserved_netd_endpoint,
+        @intFromEnum(ServiceKind.storaged) => bs.reserved_storaged_endpoint,
+        @intFromEnum(ServiceKind.dashd) => bs.reserved_dashd_endpoint,
+        @intFromEnum(ServiceKind.containerd) => bs.reserved_containerd_endpoint,
+        @intFromEnum(ServiceKind.clusterd) => bs.reserved_clusterd_endpoint,
+        @intFromEnum(ServiceKind.inputd) => bs.reserved_inputd_endpoint,
+        @intFromEnum(ServiceKind.windowd) => bs.reserved_windowd_endpoint,
+        @intFromEnum(ServiceKind.configd) => bs.reserved_configd_endpoint,
+        else => bs.service_id,
+    };
+}
+
+pub fn sendControl(
+    bs: *const BootstrapDescriptor,
+    dma_phys: u64,
+    dma_va: u64,
+    token: u64,
+    op: ControlOp,
+    extra_payload: []const u8,
+) void {
+    const scratch: [*]u8 = ptrFrom([*]u8, dma_va);
+    const local_node = Ipv6Addr{ .bytes = bs.local_node };
+
+    const total_payload: u32 = @as(u32, @intCast(CONTROL_HEADER_SIZE + extra_payload.len));
+    const head: *align(1) PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    head.* = .{
+        .magic      = WireMagic,
+        .version    = WireVersion,
+        .header_len = @as(u16, @intCast(DIPC_HEADER_SIZE)),
+        .payload_len = total_payload,
+        .auth_tag   = 0,
+        .src = .{ .node = local_node, .endpoint = controlSourceEndpoint(bs) },
+        .dst = .{ .node = local_node, .endpoint = @intFromEnum(ReservedEndpoint.kernel_control) },
+    };
+    const ctrl: *align(1) ControlHeader = @ptrFromInt(@intFromPtr(scratch) + DIPC_HEADER_SIZE);
+    ctrl.* = .{ .op = op, .payload_len = @as(u32, @intCast(extra_payload.len)) };
+
+    if (extra_payload.len > 0) {
+        const dst: [*]u8 = @ptrFromInt(@intFromPtr(scratch) + DIPC_HEADER_SIZE + CONTROL_HEADER_SIZE);
+        @memcpy(dst[0..extra_payload.len], extra_payload);
+    }
+    _ = syscall(SYS_SEND_PAGE, dma_phys, 0, token);
+}
+
+// --- Utility Helpers ---
+
+pub fn formatU32(n: u32) [8]u8 {
+    var buf: [8]u8 = [_]u8{' '} ** 8;
+    if (n == 0) {
+        buf[7] = '0';
+        return buf;
+    }
+    var v = n;
+    var i: usize = 8;
+    while (v > 0 and i > 0) {
+        i -= 1;
+        buf[i] = @as(u8, @intCast(v % 10)) + '0';
+        v /= 10;
+    }
+    return buf;
+}
+
+pub fn parseDecimal(bytes: []const u8) u32 {
+    var val: u32 = 0;
+    for (bytes) |c| {
+        if (c < '0' or c > '9') break;
+        val = val * 10 + (c - '0');
+    }
+    return val;
+}
+
+pub fn nameLen(name: []const u8) usize {
+    var l: usize = 0;
+    while (l < name.len and name[l] != 0) : (l += 1) {}
+    return l;
 }

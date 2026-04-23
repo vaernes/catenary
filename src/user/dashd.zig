@@ -6,28 +6,13 @@ const std = @import("std");
 const lib = @import("lib.zig");
 
 // ---------------------------------------------------------------------------
-// Syscall + serial helpers
-// ---------------------------------------------------------------------------
-
-const SYS_LOG = 1;
-const SYS_REGISTER = 2;
-const SYS_RECV = 3;
-const SYS_FREE_PAGE = 4;
-const SYS_ALLOC_DMA = 5;
-const SYS_FB_DRAW = 16;
-const SYS_MAP_RECV = 17;
-
-const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
-const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
-const PAGE_SIZE: u64 = 4096;
-
-// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
 const BootstrapDescriptor = lib.BootstrapDescriptor;
-
-const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
+const USER_BOOTSTRAP_VADDR: usize = lib.USER_BOOTSTRAP_VADDR;
+const DIPC_RECV_VA: u64 = lib.DIPC_RECV_VA;
+const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
 
 // ---------------------------------------------------------------------------
 // Telemetry message layout (mirrors microvm_bridge TelemetryUpdatePayload)
@@ -48,63 +33,6 @@ const VmStats = struct {
 var vm_table: [MAX_VMS]VmStats = [_]VmStats{.{}} ** MAX_VMS;
 
 // ---------------------------------------------------------------------------
-// Small text helpers (write null-terminated string into DMA page)
-// ---------------------------------------------------------------------------
-
-fn appendByte(buf: [*]u8, pos: *usize, b: u8) void {
-    buf[pos.*] = b;
-    pos.* += 1;
-}
-
-fn appendStr(buf: [*]u8, pos: *usize, s: []const u8) void {
-    for (s) |c| appendByte(buf, pos, c);
-}
-
-fn appendHex16(buf: [*]u8, pos: *usize, v: u64, digits: u8) void {
-    const hexdig = "0123456789ABCDEF";
-    var i: u8 = digits;
-    while (i > 0) : (i -= 1) {
-        const shift: u6 = @intCast((@as(u8, i) - 1) * 4);
-        const nibble: usize = @intCast((v >> shift) & 0xF);
-        appendByte(buf, pos, hexdig[nibble]);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Render dashboard rows onto the framebuffer via SYS_FB_DRAW.
-// Each VM takes one text row; we allocate one DMA page as our text buffer.
-// ---------------------------------------------------------------------------
-
-fn renderDashboard(text_phys: u64, token: u64) void {
-    const text_buf: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA); // slot 0 VA
-    var row: u32 = 0;
-
-    // Header row (row 0)
-    {
-        var pos: usize = 0;
-        appendStr(text_buf, &pos, "VM    CPU CYCLES         EXIT COUNT");
-        appendByte(text_buf, &pos, 0); // null terminate
-        _ = lib.syscall(SYS_FB_DRAW, text_phys, @as(u64, 0) << 32, token);
-        row = 1;
-    }
-
-    // Per-VM rows
-    for (&vm_table) |*s| {
-        if (!s.used) continue;
-        var pos: usize = 0;
-        appendStr(text_buf, &pos, "VM");
-        appendHex16(text_buf, &pos, s.id, 4);
-        appendByte(text_buf, &pos, ' ');
-        appendHex16(text_buf, &pos, s.cpu_cycles, 16);
-        appendByte(text_buf, &pos, ' ');
-        appendHex16(text_buf, &pos, s.exit_count, 16);
-        appendByte(text_buf, &pos, 0);
-        _ = lib.syscall(SYS_FB_DRAW, text_phys, @as(u64, row) << 32, token);
-        row += 1;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -114,31 +42,28 @@ pub export fn umain() noreturn {
     const token = bs.capability_token;
 
     lib.serialWrite("dashd: starting\n");
-    _ = lib.syscall(SYS_REGISTER, 0, bs.reserved_dashd_endpoint, token);
+    _ = lib.syscall(lib.SYS_REGISTER, 0, bs.reserved_dashd_endpoint, token);
     lib.serialWrite("dashd: registered\n");
 
     // Allocate one DMA page as a text scratch buffer.
-    const text_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, token);
+    const text_phys = lib.syscall(lib.SYS_ALLOC_DMA, 1, 0, token);
     if (text_phys == 0) {
         lib.serialWrite("dashd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
     }
 
-    // Draw empty dashboard once at startup.
-    // (windowd owns the framebuffer — dashd only tracks stats in memory)
-    _ = &text_phys; // DMA page allocated but rendering delegated to windowd
-
     // Main event loop.
     while (true) {
-        const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
+        const page_phys = lib.syscall(lib.SYS_TRY_RECV, 0, 0, token);
         if (page_phys == 0) {
+            _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
             asm volatile ("pause");
             continue;
         }
 
-        const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
+        const recv_va = lib.syscall(lib.SYS_MAP_RECV, page_phys, 0, token);
         if (recv_va == 0) {
-            _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            _ = lib.syscall(lib.SYS_FREE_PAGE, page_phys, 0, token);
             continue;
         }
 
@@ -170,10 +95,8 @@ pub export fn umain() noreturn {
         }
 
         // Stats updated — windowd will query via list_vms.
-        // (renderDashboard removed; windowd owns the framebuffer)
-
         // Free the received DIPC page.
-        _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
+        _ = lib.syscall(lib.SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
     }
 }
 

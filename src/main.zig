@@ -245,6 +245,13 @@ export fn memset(dest: [*]u8, c: u8, n: usize) [*]u8 {
 }
 
 export fn memcpy(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
+    if (@intFromPtr(dest) == 0) {
+        serialWrite("memcpy: FATAL NULL dest! n=0x");
+        printHex(n);
+        serialWrite(" src=0x");
+        printHex(@intFromPtr(src));
+        serialWrite("\n");
+    }
     for (0..n) |i| {
         dest[i] = src[i];
     }
@@ -410,6 +417,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                     bootLog("\n");
                 };
             }
+            manager.init(hhdm.offset);
             if (build_options.services_active) {
                 service_manager.bootAll(hhdm.offset, node_config.getLocalNode()) catch |err| {
                     bootLog("Service Manager bootAll failed: ");
@@ -451,7 +459,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 bootLog("W^X: kernel mappings clean\n");
             }
 
-            manager.init(hhdm.offset);
             if (comptime builtin.cpu.arch == .x86_64) {
                 if (build_options.vmm_active) {
                     timer.init();
@@ -505,13 +512,20 @@ pub export fn _kernel_main() callconv(.c) noreturn {
     while (true) {
         varde_shell.poll();
         scheduler.schedule();
-        vmm_bridge.broadcastTelemetry(hhdm_offset_global, manager.endpointTable());
-        if (build_options.services_active) {
-            _ = @import("services/service_registry.zig");
+        
+        // Only broadcast telemetry periodically to save cycles
+        const current_tsc = arch.cpu.rdtsc();
+        const tsc_diff = current_tsc -% last_telemetry_tsc;
+        if (tsc_diff > 200_000_000) { // Approx every 100ms at 2GHz
+            vmm_bridge.broadcastTelemetry(hhdm_offset_global, manager.endpointTable());
+            last_telemetry_tsc = current_tsc;
         }
-        arch.cpu.pause();
+
+        arch.cpu.halt();
     }
 }
+
+var last_telemetry_tsc: u64 = 0;
 
 pub export var limine_base_revision: [3]u64 = .{
     0xf9562b2d5c95a6c8,

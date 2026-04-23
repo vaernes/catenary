@@ -134,7 +134,8 @@ pub export fn umain() noreturn {
             }
         }
 
-        for (0..100000) |_| asm volatile ("pause");
+        _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
+        asm volatile ("pause");
     }
 }
 

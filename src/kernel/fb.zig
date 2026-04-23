@@ -18,13 +18,16 @@ pub fn init(request: *limine.FramebufferRequest, serialWrite: fn ([]const u8) vo
 
 pub fn drawRect(x: u32, y: u32, w: u32, h: u32, color: u32) void {
     const fb = framebuffer orelse return;
+    const fb_addr = @intFromPtr(fb.address);
+    const stride = @as(usize, @truncate(fb.pitch)) / 4;
 
     var dy: u32 = 0;
     while (dy < h) : (dy += 1) {
+        const row_offset = @as(usize, y + dy) * stride + x;
+        const row_ptr: [*]u32 = @ptrFromInt(fb_addr + row_offset * 4);
         var dx: u32 = 0;
         while (dx < w) : (dx += 1) {
-            const offset = (y + dy) * (@as(u32, @truncate(fb.pitch)) / 4) + (x + dx);
-            @as(*u32, @ptrFromInt(@intFromPtr(fb.address) + offset * 4)).* = color;
+            row_ptr[dx] = color;
         }
     }
 }
@@ -60,15 +63,18 @@ pub fn drawChar(x: u32, y: u32, c: u8, fg: u32, bg: u32) void {
     if (x + CharWidth > fb_ptr.width or y + CharHeight > fb_ptr.height) return;
 
     const glyph = font.font8x8[if (c < 128) c else 0];
+    const fb_addr = @intFromPtr(fb_ptr.address);
+    const stride = @as(usize, @truncate(fb_ptr.pitch)) / 4;
 
     var dy: u32 = 0;
     while (dy < CharHeight) : (dy += 1) {
         const row = glyph[dy];
+        const row_offset = @as(usize, y + dy) * stride + x;
+        const row_ptr: [*]u32 = @ptrFromInt(fb_addr + row_offset * 4);
+        
         var dx: u32 = 0;
         while (dx < CharWidth) : (dx += 1) {
-            const pixel_color = if ((row & (@as(u8, 1) << @as(u3, @intCast(dx)))) != 0) fg else bg;
-            const offset = (y + dy) * (@as(u32, @truncate(fb_ptr.pitch)) / 4) + (x + dx);
-            @as(*u32, @ptrFromInt(@intFromPtr(fb_ptr.address) + offset * 4)).* = pixel_color;
+            row_ptr[dx] = if ((row & (@as(u8, 1) << @as(u3, @intCast(dx)))) != 0) fg else bg;
         }
     }
 }

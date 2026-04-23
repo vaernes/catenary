@@ -124,7 +124,7 @@ pub fn allocNetdLaunchWithToken(
     const page_phys = pmm.allocPage() orelse return error.OutOfMemory;
     errdefer pmm.freePage(page_phys);
 
-    const bootstrap = service_bootstrap.forNetd(local_node, service_id, runtime_mode, capability_token);
+    const bootstrap = service_bootstrap.forNetd(local_node, service_id, .core, runtime_mode, capability_token);
 
     const page_virt = page_phys + hhdm_offset;
     const dst: *service_bootstrap.Descriptor = @ptrFromInt(page_virt);
@@ -157,7 +157,7 @@ pub fn allocVmmLaunch(
 
     const registry = @import("service_registry.zig");
     const token = registry.getCapabilityToken(service_id);
-    const bootstrap = service_bootstrap.forVmm(local_node, service_id, token);
+    const bootstrap = service_bootstrap.forVmm(local_node, service_id, .vm_deployer, token);
 
     const page_virt = page_phys + hhdm_offset;
     const dst: *service_bootstrap.Descriptor = @ptrFromInt(page_virt);

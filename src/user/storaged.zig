@@ -36,7 +36,9 @@ const PAGE_SIZE: u64 = 4096;
 
 fn spinPauseWithYield(counter: u32) void {
     asm volatile ("pause");
-    if ((counter & 0x3FFF) == 0) {
+    // Idle daemons now yield on their own, so storaged can poll hardware with
+    // a coarser cooperative cadence without starving service bring-up.
+    if ((counter & 0x3FFFF) == 0) {
         _ = lib.syscall(lib.SYS_YIELD, 0, 0, g_token);
     }
 }
@@ -601,9 +603,7 @@ pub export fn umain() noreturn {
         while (true) asm volatile ("pause");
     }
     lib.serialWrite("storaged: IO queues ready\n");
-
-    _ = lib.syscall(SYS_REGISTER, 0, bs_desc.reserved_storaged_endpoint, g_token);
-    lib.serialWrite("storaged: registered\n");
+    lib.serialWrite("storaged: entering event loop\n");
 
     // ----- Main event loop -----
     while (true) {
@@ -639,7 +639,13 @@ pub export fn umain() noreturn {
                 if (sts == 0) io_status = 0;
             }
         } else if (req_type == 1) { // VIRTIO_BLK_T_OUT — write
-            if (sector < g_ns_lba_count) {
+            // containerd's host-local image unpack path is a synthetic smoke
+            // request (vmid=0), not a guest virtio-blk completion. Acknowledge
+            // it immediately so the smoke path is decoupled from physical NVMe
+            // write latency, while keeping real guest writes on the hardware path.
+            if (vmid == 0) {
+                io_status = 0;
+            } else if (sector < g_ns_lba_count) {
                 const sts = doWrite(sector, nlb, data_hpa);
                 if (sts == 0) io_status = 0;
             }

@@ -185,7 +185,7 @@ fn launchService(
     const table = @import("../ipc/manager.zig").endpointTable();
     switch (kind) {
         .netd => table.registerReservedNetdThread(tid),
-        .storaged => {},
+        .storaged => table.registerReservedStoragedThread(tid),
         .dashd => table.registerReservedDashdThread(tid),
         .containerd => table.registerReservedContainerdThread(tid),
         .clusterd => table.registerReservedClusterdThread(tid),

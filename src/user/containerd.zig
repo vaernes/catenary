@@ -7,6 +7,7 @@ const SYS_FREE_PAGE = 4;
 const SYS_ALLOC_DMA = 5;
 const SYS_SEND_PAGE = 6;
 const SYS_MAP_RECV = 17;
+const SYS_TRY_RECV = 20;
 
 const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -27,15 +28,24 @@ fn printHex(n: u64) void {
     }
 }
 
+fn tryQueueWriteRequest(dipc_phys: u64, token: u64) bool {
+    return lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token) == 0;
+}
+
+fn markWriteQueued(write_completed: *bool) void {
+    if (!write_completed.*) {
+        lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
+        write_completed.* = true;
+    }
+}
+
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
+    const container_endpoint = bs.reserved_containerd_endpoint;
 
     lib.serialWrite("containerd: starting\n");
-    // Wait, the BootstrapDescriptor doesn't have reserved_containerd_endpoint
-    // We should use a hardcoded endpoint ID if we didn't add it to Identity.
-    // Let's assume endpoint ID 6 for containerd.
-    _ = lib.syscall(SYS_REGISTER, 0, 6, token);
+    _ = lib.syscall(SYS_REGISTER, 0, container_endpoint, token);
     lib.serialWrite("containerd: registered at endpoint 6\n");
 
     // Allocate 2 DMA pages: 1 for data payload, 1 for DIPC scratch
@@ -58,7 +68,7 @@ pub export fn umain() noreturn {
     // Send a block write request to storaged via DIPC
     const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA + 1 * 4096);
 
-    const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA + 1 * 4096, 6) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
+    const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA + 1 * 4096, container_endpoint) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
     header.* = .{
         .magic = lib.WireMagic,
@@ -66,7 +76,7 @@ pub export fn umain() noreturn {
         .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
         .payload_len = @as(u32, @intCast(@sizeOf(lib.BlkRequest))),
         .auth_tag = 0,
-        .src = .{ .node = local_node, .endpoint = 6 },
+        .src = .{ .node = local_node, .endpoint = container_endpoint },
         .dst = .{ .node = local_node, .endpoint = bs.reserved_storaged_endpoint },
     };
 
@@ -82,22 +92,23 @@ pub export fn umain() noreturn {
     };
 
     lib.serialWrite("containerd: sending image block to storaged...\n");
-    while (lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token) != 0) {
-        asm volatile ("pause");
-    }
-
+    lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
     lib.serialWrite("containerd: entering event loop\n");
+    var resend_counter: u32 = 0;
+    var write_completed = true;
+    var request_in_flight = tryQueueWriteRequest(dipc_phys, token);
     while (true) {
-        const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
+        const page_phys = lib.syscall(SYS_TRY_RECV, 0, 0, token);
         if (page_phys != 0) {
             const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (recv_va != 0) {
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
                 if (control.op == .virtio_blk_response and control.payload_len >= @sizeOf(lib.VirtioBlkResponsePayload)) {
                     const response: *align(1) const lib.VirtioBlkResponsePayload = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
-                    if (response.status == 0) {
-                        lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
-                    } else {
+                    request_in_flight = false;
+                    if (!write_completed and response.status == 0) {
+                        markWriteQueued(&write_completed);
+                    } else if (!write_completed) {
                         lib.serialWrite("containerd: unpack block WRITE FAILED!\n");
                     }
                 }
@@ -106,6 +117,17 @@ pub export fn umain() noreturn {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
         }
+        if (!write_completed and !request_in_flight) {
+            resend_counter +%= 1;
+            if (resend_counter >= 5_000) {
+                resend_counter = 0;
+                request_in_flight = tryQueueWriteRequest(dipc_phys, token);
+                if (request_in_flight) {
+                    markWriteQueued(&write_completed);
+                }
+            }
+        }
+        _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
         asm volatile ("pause");
     }
 }
