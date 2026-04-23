@@ -55,12 +55,8 @@ var microvm_count: usize = 0;
 var needs_vm_refresh: bool = true;
 var needs_redraw: bool = true;
 
-const InputEventPayload = extern struct {
-    event_type: u8,
-    ascii: u8,
-    scancode: u8,
-    _reserved: [5]u8 = [_]u8{0} ** 5,
-};
+const proto_inputd = @import("protocols/inputd_protocol.zig");
+const InputEventPayload = proto_inputd.InputEvent;
 
 // --- Main ────────────────────────────────────────────────────────────────────
 

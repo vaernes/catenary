@@ -15,28 +15,29 @@ const lib = @import("lib.zig");
 ///   'r' — Refresh display
 ///   'q' — Shutdown request (idles)
 
+const configd_proto = @import("protocols/configd_protocol.zig");
+
 // ---------------------------------------------------------------------------
 // Syscall shim
 // ---------------------------------------------------------------------------
 
-const SYS_LOG = 1;
-const SYS_REGISTER = 2;
-const SYS_RECV = 3;
-const SYS_FREE_PAGE = 4;
-const SYS_ALLOC_DMA = 5;
-const SYS_SEND_PAGE = 6;
-const SYS_GET_KEY = 8;
-const SYS_FB_DRAW = 16;
-const SYS_MAP_RECV = 17;
+const SYS_REGISTER = lib.SYS_REGISTER;
+const SYS_RECV = lib.SYS_RECV;
+const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
+const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
+const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
+const SYS_GET_KEY = lib.SYS_GET_KEY;
+const SYS_FB_DRAW = lib.SYS_FB_DRAW;
+const SYS_MAP_RECV = lib.SYS_MAP_RECV;
 
 // ---------------------------------------------------------------------------
 // Memory layout constants
 // ---------------------------------------------------------------------------
 
-const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
-const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
-const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
-const PAGE_SIZE: u64 = 4096;
+const USER_BOOTSTRAP_VADDR: usize = lib.USER_BOOTSTRAP_VADDR;
+const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
+const DIPC_RECV_VA: u64 = lib.DIPC_RECV_VA;
+const PAGE_SIZE: u64 = lib.PAGE_SIZE;
 
 // DMA slot layout (each slot is one 4 KiB page):
 //   slot 0: framebuffer text scratch (send via SYS_FB_DRAW)

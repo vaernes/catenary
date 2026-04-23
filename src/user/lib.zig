@@ -1,6 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Protocol modules — canonical per-service message definitions.
+const storaged_proto = @import("protocols/storaged_protocol.zig");
+const dashd_proto = @import("protocols/dashd_protocol.zig");
+const configd_proto = @import("protocols/configd_protocol.zig");
+const inputd_proto = @import("protocols/inputd_protocol.zig");
+
 pub fn ptrFrom(comptime T: type, addr: u64) T {
     switch (builtin.cpu.arch) {
         .x86_64, .aarch64 => {
@@ -288,29 +294,16 @@ pub const NodeAddrResult = extern struct {
     addr: Ipv6Addr,
 };
 
-pub const TelemetryUpdatePayload = extern struct {
-    instance_id: u32,
-    _reserved: u32 = 0,
-    cpu_cycles: u64,
-    exit_count: u64,
-};
+/// Per-VM telemetry update.  Re-exported from dashd_protocol.
+pub const TelemetryUpdatePayload = dashd_proto.TelemetryUpdate;
 
-pub const RegistrySyncPayload = extern struct {
-    service_id: u32,
-    service_kind: u16,
-    state: u8,
-    _pad: u8 = 0,
-};
+/// Cluster node / service registry sync payload.  Re-exported from configd_protocol.
+pub const RegistrySyncPayload = configd_proto.RegistrySyncPayload;
+/// Canonical block I/O request type.  Re-exported from storaged_protocol.
+pub const BlkRequest = storaged_proto.BlkRequest;
 
-pub const BlkRequest = extern struct {
-    req_type: u32,
-    _reserved: u32,
-    sector: u64,
-    vmid: u32,
-    chain_head: u16,
-    data_len: u16,
-    data_hpa: u64,
-};
+/// Block I/O completion.  Re-exported from storaged_protocol.
+pub const BlkResponse = storaged_proto.BlkResponse;
 
 pub const VirtioBlkResponsePayload = extern struct {
     vmid: u32,

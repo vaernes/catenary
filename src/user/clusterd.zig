@@ -1,14 +1,15 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const clusterd_proto = @import("protocols/clusterd_protocol.zig");
 
-const SYS_REGISTER = 2;
-const SYS_RECV = 3;
-const SYS_FREE_PAGE = 4;
-const SYS_ALLOC_DMA = 5;
-const SYS_SEND_PAGE = 6;
-const SYS_MAP_RECV = 17;
+const SYS_REGISTER = lib.SYS_REGISTER;
+const SYS_RECV = lib.SYS_RECV;
+const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
+const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
+const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
+const SYS_MAP_RECV = lib.SYS_MAP_RECV;
 
-const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
+const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
 
 const BootstrapDescriptor = lib.BootstrapDescriptor;
 

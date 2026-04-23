@@ -1,17 +1,17 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const proto = @import("protocols/inputd_protocol.zig");
 
-const SYS_REGISTER = 2;
-const SYS_ALLOC_DMA = 5;
-const SYS_SEND_PAGE = 6;
-const SYS_GET_KEY = 8; // Custom lib.syscall to pop a scancode
+const SYS_REGISTER = lib.SYS_REGISTER;
+const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
+const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
+const SYS_GET_KEY = lib.SYS_GET_KEY;
 
-const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
-const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
+const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
 
 const BootstrapDescriptor = lib.BootstrapDescriptor;
 
-const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
+const USER_BOOTSTRAP_VADDR: usize = lib.USER_BOOTSTRAP_VADDR;
 
 // Map scancodes to simple ASCII
 fn scancodeToAscii(scancode: u8) ?u8 {
@@ -60,12 +60,7 @@ fn scancodeToAscii(scancode: u8) ?u8 {
     };
 }
 
-const InputEventPayload = extern struct {
-    event_type: u8,
-    ascii: u8,
-    scancode: u8,
-    _reserved: [5]u8 = [_]u8{0} ** 5,
-};
+const InputEventPayload = proto.InputEvent;
 
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
@@ -105,7 +100,7 @@ pub export fn umain() noreturn {
 
                     const payload: *align(1) InputEventPayload = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
                     payload.* = .{
-                        .event_type = 1,
+                        .event_type = .key_press,
                         .ascii = c,
                         .scancode = scancode,
                     };
