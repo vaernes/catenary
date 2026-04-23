@@ -62,16 +62,16 @@ pub const PAGE_SIZE: u64 = 4096;
 
 // Mirror of identity.ReservedEndpoint for user-space use.
 pub const ReservedEndpoint = enum(u64) {
-    netd           = 1,
+    netd = 1,
     kernel_control = 2,
-    router         = 3,
-    storaged       = 4,
-    dashd          = 5,
-    containerd     = 6,
-    clusterd       = 7,
-    inputd         = 8,
-    windowd        = 9,
-    configd        = 10,
+    router = 3,
+    storaged = 4,
+    dashd = 5,
+    containerd = 6,
+    clusterd = 7,
+    inputd = 8,
+    windowd = 9,
+    configd = 10,
 };
 
 pub const ServiceKind = enum(u16) {
@@ -425,7 +425,7 @@ pub fn getFramebufferInfo() ?struct { width: u32, height: u32 } {
     const res = syscall(SYS_FB_GET_INFO, 0, 0, 0);
     if (res == 0 or res == 0xFFFFFFFF) return null;
     return .{
-        .width  = @as(u32, @truncate(res >> 32)),
+        .width = @as(u32, @truncate(res >> 32)),
         .height = @as(u32, @truncate(res & 0xFFFF_FFFF)),
     };
 }
@@ -477,11 +477,11 @@ pub fn sendControl(
     const total_payload: u32 = @as(u32, @intCast(CONTROL_HEADER_SIZE + extra_payload.len));
     const head: *align(1) PageHeader = @ptrFromInt(@intFromPtr(scratch));
     head.* = .{
-        .magic      = WireMagic,
-        .version    = WireVersion,
+        .magic = WireMagic,
+        .version = WireVersion,
         .header_len = @as(u16, @intCast(DIPC_HEADER_SIZE)),
         .payload_len = total_payload,
-        .auth_tag   = 0,
+        .auth_tag = 0,
         .src = .{ .node = local_node, .endpoint = controlSourceEndpoint(bs) },
         .dst = .{ .node = local_node, .endpoint = @intFromEnum(ReservedEndpoint.kernel_control) },
     };

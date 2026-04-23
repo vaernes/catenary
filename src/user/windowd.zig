@@ -1,26 +1,26 @@
 const lib = @import("lib.zig");
 
 // Syscall ops (mirrors lib.zig constants)
-const SYS_REGISTER        = lib.SYS_REGISTER;
-const SYS_TRY_RECV        = lib.SYS_TRY_RECV;
-const SYS_MAP_RECV        = lib.SYS_MAP_RECV;
-const SYS_FREE_PAGE       = lib.SYS_FREE_PAGE;
-const SYS_ALLOC_DMA       = lib.SYS_ALLOC_DMA;
-const SYS_SEND_PAGE       = lib.SYS_SEND_PAGE;
+const SYS_REGISTER = lib.SYS_REGISTER;
+const SYS_TRY_RECV = lib.SYS_TRY_RECV;
+const SYS_MAP_RECV = lib.SYS_MAP_RECV;
+const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
+const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
+const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
 const SYS_FB_DRAW_COLORED = lib.SYS_FB_DRAW_COLORED;
-const SYS_FB_FILL_RECT    = lib.SYS_FB_FILL_RECT;
-const SYS_GET_VARDE_LOG   = lib.SYS_GET_VARDE_LOG;
-const SYS_VARDE_INJECT    = lib.SYS_VARDE_INJECT;
-const SYS_FB_GET_INFO     = lib.SYS_FB_GET_INFO;
+const SYS_FB_FILL_RECT = lib.SYS_FB_FILL_RECT;
+const SYS_GET_VARDE_LOG = lib.SYS_GET_VARDE_LOG;
+const SYS_VARDE_INJECT = lib.SYS_VARDE_INJECT;
+const SYS_FB_GET_INFO = lib.SYS_FB_GET_INFO;
 
 const USER_BOOTSTRAP_VADDR: usize = lib.USER_BOOTSTRAP_VADDR;
-const DMA_BASE_VA: u64            = lib.DMA_BASE_VA;
+const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
 
 // DMA page layout (each slot = 4096 bytes)
-const DMA_TEXT_SLOT:    u64 = 0;
-const DMA_LOG_SLOT:     u64 = 1;
+const DMA_TEXT_SLOT: u64 = 0;
+const DMA_LOG_SLOT: u64 = 1;
 const DMA_SCRATCH_SLOT: u64 = 2;
-const DMA_NUM_PAGES:    u64 = 4;
+const DMA_NUM_PAGES: u64 = 4;
 
 var COLS: usize = 100;
 var ROWS: usize = 75;
@@ -28,32 +28,32 @@ var SCREEN_WIDTH: u32 = 800;
 var SCREEN_HEIGHT: u32 = 600;
 
 // Branding palette
-const COLOR_SEA_GRAY:      u32 = 0x004A4E69;
-const COLOR_TERRACOTTA:    u32 = 0x00E2725B;
+const COLOR_SEA_GRAY: u32 = 0x004A4E69;
+const COLOR_TERRACOTTA: u32 = 0x00E2725B;
 const COLOR_GOLDEN_YELLOW: u32 = 0x00FFC300;
-const COLOR_WHITE:         u32 = 0x00FFFFFF;
-const COLOR_GREEN:         u32 = 0x0000CC44;
-const COLOR_RED:           u32 = 0x00FF4444;
-const COLOR_HIGHLIGHT:     u32 = 0x005BC0EB;
-const COLOR_DIM:           u32 = 0x00888888;
+const COLOR_WHITE: u32 = 0x00FFFFFF;
+const COLOR_GREEN: u32 = 0x0000CC44;
+const COLOR_RED: u32 = 0x00FF4444;
+const COLOR_HIGHLIGHT: u32 = 0x005BC0EB;
+const COLOR_DIM: u32 = 0x00888888;
 
 // --- UI State ---
-var focused_pane:       u8    = 0; // 0=VM Manager, 1=New VM Form, 2=Shell
-var focused_form_field: u8    = 0; // 0=name, 1=vcpus, 2=mem
-var form_name:          [32]u8 = [_]u8{0} ** 32;
-var form_name_len:      usize  = 0;
-var form_container:     [32]u8 = [_]u8{0} ** 32;
-var form_container_len: usize  = 0;
-var form_vcpus:         [4]u8  = "1   ".* ;
-var form_vcpus_len:     usize  = 1;
-var form_mem:           [10]u8 = "16384     ".* ;
-var form_mem_len:       usize  = 5;
-var form_error:         []const u8 = "";
+var focused_pane: u8 = 0; // 0=VM Manager, 1=New VM Form, 2=Shell
+var focused_form_field: u8 = 0; // 0=name, 1=vcpus, 2=mem
+var form_name: [32]u8 = [_]u8{0} ** 32;
+var form_name_len: usize = 0;
+var form_container: [32]u8 = [_]u8{0} ** 32;
+var form_container_len: usize = 0;
+var form_vcpus: [4]u8 = "1   ".*;
+var form_vcpus_len: usize = 1;
+var form_mem: [10]u8 = "16384     ".*;
+var form_mem_len: usize = 5;
+var form_error: []const u8 = "";
 
-var microvm_list:       [16]struct { name: [32]u8, status: []const u8, id: u32 } = undefined;
-var microvm_count:      usize = 0;
-var needs_vm_refresh:   bool  = true;
-var needs_redraw:       bool  = true;
+var microvm_list: [16]struct { name: [32]u8, status: []const u8, id: u32 } = undefined;
+var microvm_count: usize = 0;
+var needs_vm_refresh: bool = true;
+var needs_redraw: bool = true;
 
 const InputEventPayload = extern struct {
     event_type: u8,
@@ -198,7 +198,7 @@ fn handleMessage(page_va: u64, token: u64) void {
 
 fn drawTui(dma_phys: u64, token: u64) void {
     const text_phys = dma_phys + DMA_TEXT_SLOT * 4096;
-    const text_va   = DMA_BASE_VA + DMA_TEXT_SLOT * 4096;
+    const text_va = DMA_BASE_VA + DMA_TEXT_SLOT * 4096;
 
     // Header bar
     lib.fillRect(0, 0, SCREEN_WIDTH, 20, COLOR_TERRACOTTA, token);

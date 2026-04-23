@@ -425,7 +425,6 @@ fn handleListMicrovms(bs: *const BootstrapDescriptor, token: u64, text_phys: u64
 // Entry point
 // ---------------------------------------------------------------------------
 
-
 pub export fn umain() noreturn {
     const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;

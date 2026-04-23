@@ -375,15 +375,21 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 outb(0x3F8, hex[b & 0xF]);
             }
             bootLog("\n");
-            
+
             if (build_options.expected_kernel_hash) |expected_hex| {
                 bootLog("SECURE BOOT: Verifying kernel integrity...\n");
                 var expected_bytes: [32]u8 = [_]u8{0} ** 32;
                 var ok = true;
                 if (expected_hex.len == 64) {
                     for (0..32) |idx| {
-                        const h = std.fmt.charToDigit(expected_hex[idx * 2], 16) catch { ok = false; break; };
-                        const l = std.fmt.charToDigit(expected_hex[idx * 2 + 1], 16) catch { ok = false; break; };
+                        const h = std.fmt.charToDigit(expected_hex[idx * 2], 16) catch {
+                            ok = false;
+                            break;
+                        };
+                        const l = std.fmt.charToDigit(expected_hex[idx * 2 + 1], 16) catch {
+                            ok = false;
+                            break;
+                        };
                         expected_bytes[idx] = @as(u8, @intCast(h << 4 | l));
                     }
                 } else {
@@ -512,7 +518,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
     while (true) {
         varde_shell.poll();
         scheduler.schedule();
-        
+
         // Only broadcast telemetry periodically to save cycles
         const current_tsc = arch.cpu.rdtsc();
         const tsc_diff = current_tsc -% last_telemetry_tsc;
