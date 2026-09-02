@@ -55,10 +55,33 @@ pub const Thread = struct {
     }
 };
 
-pub const Message = struct { sender: u32, value: u64 };
+pub const MAILBOX_CAPACITY: usize = 16;
+
 pub const Mailbox = struct {
-    data: u64 = 0,
-    full: bool = false,
+    slots: [MAILBOX_CAPACITY]u64 = [_]u64{0} ** MAILBOX_CAPACITY,
+    head: usize = 0,
+    tail: usize = 0,
+    count: usize = 0,
+
+    pub fn push(self: *Mailbox, data: u64) bool {
+        if (self.count >= MAILBOX_CAPACITY) return false;
+        self.slots[self.tail] = data;
+        self.tail = (self.tail + 1) % MAILBOX_CAPACITY;
+        self.count += 1;
+        return true;
+    }
+
+    pub fn pop(self: *Mailbox) ?u64 {
+        if (self.count == 0) return null;
+        const data = self.slots[self.head];
+        self.head = (self.head + 1) % MAILBOX_CAPACITY;
+        self.count -= 1;
+        return data;
+    }
+
+    pub fn isFull(self: *const Mailbox) bool {
+        return self.count >= MAILBOX_CAPACITY;
+    }
 };
 
 var threads_pool: [THREAD_TARGET_COUNT]Thread align(16) linksection(".data") = undefined;
@@ -119,7 +142,6 @@ pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootst
             arch.cpu.outb(0x3F8, 'S');
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
             const stack_top = stack_p + hhdm_offset + 4096;
-            var rsp = stack_top;
 
             // Corrected Stack Layout for switchContext:
             // When switchContext runs the first time for a new thread, it pops 6 regs and then RETS.
@@ -145,17 +167,16 @@ pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootst
             st[4] = 0xEEEEEEEEEEEEEEEE; // rbp
             st[5] = bootstrap_addr; // rbx (this is top-24)
             st[6] = @intFromPtr(&user_mode.service_trampoline_bridge);
-            st[7] = 0x2222222222222222; // dummy alignment for call @ top-8
-
-            rsp = stack_top - 64;
+            const pml4 = service_registry.getTaskBoundAddressSpace(sid) orelse 0;
 
             const tid = next_thread_id;
             next_thread_id += 1;
             threads[i] = Thread{
-                .rsp = rsp,
+                .rsp = stack_top - 64,
                 .id = tid,
                 .sid = sid,
                 .state = .Ready,
+                .user_pml4 = pml4,
             };
             threads[i].setName(serviceKindName(kind));
 
@@ -210,21 +231,17 @@ pub fn get_current_thread() *Thread {
 
 pub fn receive() ?u64 {
     const thread = get_current_thread();
-    if (thread.mailbox.full) {
-        thread.mailbox.full = false;
-        return thread.mailbox.data;
-    }
-    return null;
+    return thread.mailbox.pop();
 }
 
 pub fn send(tid: u32, data: u64) bool {
     for (0..THREAD_TARGET_COUNT) |i| {
         if (threads[i].state != .Empty and threads[i].id == tid) {
-            if (threads[i].mailbox.full) return false;
-            threads[i].mailbox.data = data;
-            threads[i].mailbox.full = true;
-            if (threads[i].state == .Waiting) threads[i].state = .Ready;
-            return true;
+            if (threads[i].mailbox.isFull()) return false;
+            if (threads[i].mailbox.push(data)) {
+                if (threads[i].state == .Waiting) threads[i].state = .Ready;
+                return true;
+            }
         }
     }
     return false;
@@ -237,12 +254,12 @@ pub fn sendToService(sid: u32, data: u64) bool {
         if (threads[i].state == .Waiting and
             threads[i].sid == sid and
             threads[i].dipc_eligible and
-            !threads[i].mailbox.full)
+            !threads[i].mailbox.isFull())
         {
-            threads[i].mailbox.data = data;
-            threads[i].mailbox.full = true;
-            threads[i].state = .Ready;
-            return true;
+            if (threads[i].mailbox.push(data)) {
+                threads[i].state = .Ready;
+                return true;
+            }
         }
     }
     // Second pass: fall back to any DIPC-eligible, non-full thread.
@@ -250,12 +267,12 @@ pub fn sendToService(sid: u32, data: u64) bool {
         if (threads[i].state != .Empty and
             threads[i].sid == sid and
             threads[i].dipc_eligible and
-            !threads[i].mailbox.full)
+            !threads[i].mailbox.isFull())
         {
-            threads[i].mailbox.data = data;
-            threads[i].mailbox.full = true;
-            if (threads[i].state == .Waiting) threads[i].state = .Ready;
-            return true;
+            if (threads[i].mailbox.push(data)) {
+                if (threads[i].state == .Waiting) threads[i].state = .Ready;
+                return true;
+            }
         }
     }
     return false;
@@ -287,6 +304,8 @@ pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
             st[6] = @intFromPtr(&user_mode.service_extra_thread_trampoline);
             st[7] = 0; // dummy alignment
 
+            const pml4 = service_registry.getTaskBoundAddressSpace(sid) orelse 0;
+
             const tid = next_thread_id;
             next_thread_id += 1;
 
@@ -297,6 +316,7 @@ pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
                 .state = .Ready,
                 .user_entry = entry_va,
                 .user_stack_va = stack_va,
+                .user_pml4 = pml4,
                 .dipc_eligible = false,
             };
 

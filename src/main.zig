@@ -23,6 +23,7 @@ const service_manager = @import("services/service_manager.zig");
 const keyboard = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/keyboard.zig") else struct {};
 const user_mode = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/user_mode.zig") else struct {};
 const hvm = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/hvm.zig") else struct {};
+const smp = if (builtin.cpu.arch == .x86_64) @import("arch/x86_64/smp.zig") else struct {};
 const stack_protector = @import("kernel/stack_protector.zig");
 const wx_enforce = @import("kernel/wx_enforce.zig");
 
@@ -466,6 +467,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
             }
 
             if (comptime builtin.cpu.arch == .x86_64) {
+                smp.init();
                 if (build_options.vmm_active) {
                     timer.init();
                     bootLog("Timer initialized.\n");

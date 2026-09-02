@@ -30,12 +30,8 @@ pub const LoadError = error{
 };
 
 pub fn mapPageInAddressSpace(cr3: u64, hhdm_offset: u64, virt: u64, phys: u64, flags: u64) LoadError!void {
-    const old_cr3 = cpu.readCr3();
-    cpu.writeCr3(cr3);
-    defer cpu.writeCr3(old_cr3);
-
-    paging.map(hhdm_offset, virt, phys, flags) catch |err| {
-        main.serialWrite("task_loader: paging.map failed: ");
+    paging.mapUserPage(hhdm_offset, cr3, virt, phys, flags) catch |err| {
+        main.serialWrite("task_loader: paging.mapUserPage failed: ");
         if (err == error.AlreadyMapped) {
             main.serialWrite("AlreadyMapped\n");
         } else if (err == error.InvalidAddress) {
@@ -87,14 +83,17 @@ pub fn loadElfIntoNewSpace(elf_bytes: []const u8, hhdm_offset: u64) LoadError!Lo
 
             var vaddr = start_vaddr;
             while (vaddr < end_vaddr) : (vaddr += PAGE_SIZE) {
-                const user_frame = pmm.allocPage() orelse return error.OutOfMemory;
+                var user_frame: u64 = 0;
+                if (paging.translateInAddressSpace(hhdm_offset, pml4_phys, vaddr)) |existing_frame| {
+                    user_frame = existing_frame & ~(PAGE_SIZE - 1);
+                } else {
+                    user_frame = pmm.allocPage() orelse return error.OutOfMemory;
+                    paging.mapUserPage(hhdm_offset, pml4_phys, vaddr, user_frame, USER_PAGE_FLAGS) catch return error.MappingFailed;
+                    const frame_ptr: [*]u8 = @ptrFromInt(user_frame + hhdm_offset);
+                    for (0..4096) |byte_idx| frame_ptr[byte_idx] = 0;
+                }
 
-                // Map the frame into the new address space with USER | WRITE | PRESENT bits.
-                paging.map(hhdm_offset, vaddr, user_frame, USER_PAGE_FLAGS) catch return error.MappingFailed;
-
-                // Zero the frame first
                 const frame_ptr: [*]u8 = @ptrFromInt(user_frame + hhdm_offset);
-                for (0..4096) |byte_idx| frame_ptr[byte_idx] = 0;
 
                 // Copy data if within filesz
                 if (vaddr < ph.p_vaddr + ph.p_filesz) {
@@ -109,6 +108,23 @@ pub fn loadElfIntoNewSpace(elf_bytes: []const u8, hhdm_offset: u64) LoadError!Lo
                         frame_ptr[dest_offset + j] = elf_bytes[src_offset + j];
                     }
                 }
+
+                // Zero BSS if within memsz and past filesz
+                if (ph.p_memsz > ph.p_filesz) {
+                    const filesz_end = ph.p_vaddr + ph.p_filesz;
+                    const memsz_end = ph.p_vaddr + ph.p_memsz;
+                    if (vaddr + PAGE_SIZE > filesz_end and vaddr < memsz_end) {
+                        const bss_start = if (vaddr < filesz_end) filesz_end else vaddr;
+                        const bss_end = if (vaddr + PAGE_SIZE > memsz_end) memsz_end else vaddr + PAGE_SIZE;
+                        if (bss_end > bss_start) {
+                            const bss_len = bss_end - bss_start;
+                            const bss_dest_offset = bss_start - vaddr;
+                            for (0..bss_len) |j| {
+                                frame_ptr[bss_dest_offset + j] = 0;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -119,7 +135,7 @@ pub fn loadElfIntoNewSpace(elf_bytes: []const u8, hhdm_offset: u64) LoadError!Lo
     for (0..stack_pages) |i| {
         const stack_frame = pmm.allocPage() orelse return error.OutOfMemory;
         const vaddr = stack_top_vaddr - ((i + 1) * PAGE_SIZE);
-        paging.map(hhdm_offset, vaddr, stack_frame, USER_PAGE_FLAGS) catch {
+        paging.mapUserPage(hhdm_offset, pml4_phys, vaddr, stack_frame, USER_PAGE_FLAGS) catch {
             main.serialWrite("task_loader: stack map failed\n");
             return error.MappingFailed;
         };

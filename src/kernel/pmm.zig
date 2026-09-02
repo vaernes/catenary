@@ -158,28 +158,38 @@ pub fn allocContiguousAligned(n_pages: u64, alignment_pages: u64) ?u64 {
     if (n_pages == 0) return null;
     if (alignment_pages == 0) return null;
 
-    var page: usize = 1;
-    while (page + n_pages <= highest_page) {
-        // Find next aligned page
-        const aligned_page = (page + alignment_pages - 1) & ~(alignment_pages - 1);
-        if (aligned_page + n_pages > highest_page) break;
+    var pass: u8 = 0;
+    var page: usize = next_search_page;
 
-        var found = true;
-        var i: usize = 0;
-        while (i < n_pages) : (i += 1) {
-            if (testBit(aligned_page + i)) {
-                found = false;
-                page = aligned_page + i + 1;
-                break;
-            }
-        }
-        if (found) {
-            i = 0;
+    while (pass < 2) {
+        while (page + n_pages <= highest_page) {
+            // Find next aligned page
+            const aligned_page = (page + alignment_pages - 1) & ~(alignment_pages - 1);
+            if (aligned_page + n_pages > highest_page) break;
+
+            var found = true;
+            var i: usize = 0;
             while (i < n_pages) : (i += 1) {
-                setBit(aligned_page + i);
+                if (testBit(aligned_page + i)) {
+                    found = false;
+                    page = aligned_page + i + 1;
+                    break;
+                }
             }
-            return @as(u64, aligned_page) * PAGE_SIZE;
+            if (found) {
+                i = 0;
+                while (i < n_pages) : (i += 1) {
+                    setBit(aligned_page + i);
+                }
+                next_search_page = aligned_page + n_pages;
+                if (next_search_page >= highest_page) {
+                    next_search_page = 1;
+                }
+                return @as(u64, aligned_page) * PAGE_SIZE;
+            }
         }
+        pass += 1;
+        page = 1;
     }
     return null;
 }

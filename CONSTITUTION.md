@@ -2,7 +2,7 @@
 
 ## 1. Project Identity & Vision
 
-**Catenary OS** is a hobby project exploring the limits of AI-assisted bare-metal programming, structured as a modern, distributed microkernel and bare-metal Type-1 hypervisor. A catenary is the precise mathematical curve a cable forms under its own weight — a perfect load-bearing arc that distributes massive tension into pure compression. Catenary OS is designed to distribute the weight of isolated MicroVMs and containers across an IPv6 network of bare-metal nodes into a seamless, load-bearing orchestration fabric.
+**Catenary OS** is a hobby project embracing flexible, unconstrained AI-assisted bare-metal programming, structured as a modern, distributed microkernel and bare-metal Type-1 hypervisor. A catenary is the precise mathematical curve a cable forms under its own weight — a perfect load-bearing arc that distributes massive tension into pure compression. Catenary OS is designed to distribute the weight of isolated MicroVMs and containers across an IPv6 network of bare-metal nodes into a seamless, load-bearing orchestration fabric.
 
 The project discards legacy monolithic designs and in-kernel POSIX compliance. Instead, it natively orchestrates OCI (Docker) containers by running them securely inside hardware-isolated MicroVMs, connected via an IPv6-first distributed message-passing network.
 

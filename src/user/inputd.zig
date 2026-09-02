@@ -109,9 +109,8 @@ pub export fn umain() noreturn {
                 }
             }
         } else {
-            // Wait briefly before polling again
-            _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
-            asm volatile ("pause");
+            // Wait for incoming DIPC page / input interrupt signal
+            _ = lib.syscall(lib.SYS_RECV, 0, 0, token);
         }
     }
 }

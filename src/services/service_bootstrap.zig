@@ -113,6 +113,7 @@ fn allowedSyscallMask(kind: ServiceKind) u32 {
     const base_mask: u32 =
         bit(abi.SYS_REGISTER) |
         bit(abi.SYS_RECV) |
+        bit(abi.SYS_TRY_RECV) |
         bit(abi.SYS_FREE_PAGE) |
         bit(abi.SYS_ALLOC_DMA) |
         bit(abi.SYS_SEND_PAGE) |

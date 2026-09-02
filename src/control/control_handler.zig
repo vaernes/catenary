@@ -8,6 +8,10 @@ const control_protocol = @import("control_protocol.zig");
 const pmm = @import("../kernel/pmm.zig");
 const router = @import("../ipc/router.zig");
 const arch_cpu = @import("../arch/x86_64/cpu.zig");
+const trust = @import("../kernel/trust.zig");
+const service_bootstrap = @import("../services/service_bootstrap.zig");
+
+const KERNEL_MANIFEST_MAGIC: u64 = 0x4341544D414E4946;
 
 pub const HandleError = (error{
     BadHeader,
@@ -31,6 +35,115 @@ fn payloadBase(hhdm_offset: u64, page_phys: u64) [*]const u8 {
     return @ptrFromInt(page_phys + hhdm_offset + dipc.HEADER_SIZE);
 }
 
+fn sendControlReply(
+    comptime T: type,
+    hhdm_offset: u64,
+    table: *const endpoint_table.EndpointTable,
+    request_hdr: *const dipc.PageHeader,
+    op: control_protocol.ControlOp,
+    result: T,
+) HandleError!void {
+    var payload: [@sizeOf(control_protocol.ControlHeader) + @sizeOf(T)]u8 = undefined;
+    const reply_hdr: *align(1) control_protocol.ControlHeader = @ptrCast(&payload);
+    reply_hdr.* = .{
+        .op = op,
+        .payload_len = @as(u32, @intCast(@sizeOf(T))),
+    };
+
+    var result_copy = result;
+    std.mem.copyForwards(
+        u8,
+        payload[@sizeOf(control_protocol.ControlHeader)..],
+        std.mem.asBytes(&result_copy),
+    );
+
+    const msg_page = try dipc.allocPageMessage(hhdm_offset, request_hdr.dst, request_hdr.src, payload[0..]);
+    _ = try router.routePageWithLocalNode(hhdm_offset, table, msg_page);
+}
+
+fn countManifestServiceHashes(manifest: *const trust.KernelManifest) u16 {
+    var count: u16 = 0;
+    for (manifest.service_hashes) |entry| {
+        if (entry.is_valid) count += 1;
+    }
+    return count;
+}
+
+fn computeNodeIdentityTrustTag(manifest: *const trust.KernelManifest, addr: dipc.Ipv6Addr) u64 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("Catenary-Node-Identity-V1");
+    hasher.update(std.mem.asBytes(&addr));
+    hasher.update(&manifest.kernel_hash);
+    hasher.update(std.mem.asBytes(&manifest.capability_seed));
+
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+
+    const a = std.mem.readInt(u64, digest[0..8], .little);
+    const b = std.mem.readInt(u64, digest[24..32], .little);
+    return a ^ b;
+}
+
+fn serviceMaskFor(table: *const endpoint_table.EndpointTable) u32 {
+    var mask: u32 = 0;
+
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.netd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.netd)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.storaged)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.storaged)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.dashd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.dashd)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.containerd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.containerd)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.clusterd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.clusterd)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.inputd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.inputd)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.windowd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.windowd)));
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.configd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.configd)));
+    }
+
+    return mask;
+}
+
+fn nodeFlagsFor(table: *const endpoint_table.EndpointTable) u32 {
+    var flags: u32 = 0;
+
+    if (node_config.isNodeAddrConfigured(node_config.getLocalNode())) {
+        flags |= control_protocol.NODE_FLAG_NODE_ADDR_CONFIGURED;
+    }
+    flags |= control_protocol.NODE_FLAG_CLUSTER_CAPABLE;
+    if (build_options.vmm_active) flags |= control_protocol.NODE_FLAG_VMM_ACTIVE;
+
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.netd)) != null) {
+        flags |= control_protocol.NODE_FLAG_NETD_REGISTERED;
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.storaged)) != null) {
+        flags |= control_protocol.NODE_FLAG_STORAGE_REGISTERED;
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.dashd)) != null) {
+        flags |= control_protocol.NODE_FLAG_DASHD_REGISTERED;
+        flags |= control_protocol.NODE_FLAG_TELEMETRY_AVAILABLE;
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.clusterd)) != null) {
+        flags |= control_protocol.NODE_FLAG_CLUSTERD_REGISTERED;
+    }
+    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.configd)) != null) {
+        flags |= control_protocol.NODE_FLAG_CONFIGD_REGISTERED;
+    }
+
+    return flags;
+}
+
 fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.ControlOp) bool {
     const dipc_local = node_config.getLocalNode();
     if (op != .set_node_addr and !dipc.Ipv6Addr.eql(hdr.src.node, dipc_local)) {
@@ -47,8 +160,8 @@ fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.C
 fn isAuthorizedMicrovmSource(hdr: *const dipc.PageHeader) bool {
     const ep = hdr.src.endpoint;
     return ep == @intFromEnum(identity.ReservedEndpoint.clusterd) or
-           ep == @intFromEnum(identity.ReservedEndpoint.windowd) or
-           ep == @intFromEnum(identity.ReservedEndpoint.configd);
+        ep == @intFromEnum(identity.ReservedEndpoint.windowd) or
+        ep == @intFromEnum(identity.ReservedEndpoint.configd);
 }
 
 pub fn handleKernelControlPage(
@@ -253,16 +366,41 @@ pub fn handleKernelControlPage(
             const table_const: *const endpoint_table.EndpointTable = table;
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
+        .get_node_identity => {
+            const manifest = trust.global_manifest_ptr;
+            const manifest_valid = manifest.magic == KERNEL_MANIFEST_MAGIC;
+            const addr = node_config.getLocalNode();
+
+            const res = control_protocol.NodeIdentityResult{
+                .addr = addr,
+                .manifest_version = if (manifest_valid) manifest.version else 0,
+                .service_hash_count = if (manifest_valid) countManifestServiceHashes(manifest) else 0,
+                .flags = nodeFlagsFor(table),
+                .kernel_hash = if (manifest_valid) manifest.kernel_hash else [_]u8{0} ** 32,
+                .trust_tag = if (manifest_valid) computeNodeIdentityTrustTag(manifest, addr) else 0,
+            };
+
+            const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            const table_const: *const endpoint_table.EndpointTable = table;
+            _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
+        },
         .create_microvm => {
             if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
             if (remaining != @sizeOf(control_protocol.CreateMicrovmPayload)) return error.BadPayload;
             const p: *const control_protocol.CreateMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
+            var reply = control_protocol.CreateMicrovmResult{
+                .status = .internal_error,
+                .instance_id = 0,
+            };
+            const table_const: *const endpoint_table.EndpointTable = table;
 
             if (build_options.vmm_active and build_options.services_active) {
                 const vmx = @import("../arch/x86_64/vmx.zig");
                 if (vmx.launchStagedInstance()) |id| {
                     serialWrite("kernel_control: staged MicroVM launched via DIPC\n");
-                    _ = id;
+                    reply.status = .ok;
+                    reply.instance_id = id;
+                    try sendControlReply(control_protocol.CreateMicrovmResult, hhdm_offset, table_const, hdr, .create_microvm, reply);
                     return;
                 } else |_| {}
             }
@@ -270,10 +408,13 @@ pub fn handleKernelControlPage(
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             if (microvm_registry.create(p.name, p.container, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
                 serialWrite("configd: MicroVM created via DIPC\n");
-                _ = id;
+                reply.status = .ok;
+                reply.instance_id = id;
             } else {
-                return error.BadPayload;
+                reply.status = .no_capacity;
             }
+
+            try sendControlReply(control_protocol.CreateMicrovmResult, hhdm_offset, table_const, hdr, .create_microvm, reply);
         },
         .start_microvm => {
             if (remaining != @sizeOf(control_protocol.StartMicrovmPayload)) return error.BadPayload;
@@ -326,16 +467,26 @@ pub fn handleKernelControlPage(
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
         .get_node_status => {
+            const logical_cpu_total: u32 = 1;
             var res = control_protocol.NodeStatusResult{
                 .total_mem_pages = @intCast(pmm.getTotalPages()),
                 .free_mem_pages = @intCast(pmm.getFreePages()),
                 .active_vms = 0,
+                .logical_cpu_total = logical_cpu_total,
+                .logical_cpu_available = logical_cpu_total,
+                .service_mask = serviceMaskFor(table),
+                .flags = nodeFlagsFor(table),
             };
 
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             const instances = microvm_registry.getInstances();
             for (instances) |inst| {
                 if (inst.in_use) res.active_vms += 1;
+            }
+            if (res.active_vms >= logical_cpu_total) {
+                res.logical_cpu_available = 0;
+            } else {
+                res.logical_cpu_available = logical_cpu_total - res.active_vms;
             }
 
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));

@@ -1,15 +1,16 @@
 # Contributing to Catenary OS
 
-Thank you for your interest in contributing to Catenary OS. This is a passion project and hobby OS primarily built to stress-test AI coding agents in a bare-metal environment. These guidelines keep contributions consistent with the project's architecture and bring-up discipline.
+Thank you for your interest in contributing to Catenary OS. This is a passion project and hobby OS embracing flexible, unconstrained AI coding agents in a bare-metal environment. These guidelines keep contributions consistent with the project's architecture and bring-up discipline while empowering AI-assisted workflows.
 
 ## Architecture Constraints
 
 Catenary OS is a freestanding x86_64 microkernel and Type-1 hypervisor. All contributions must respect the boundaries defined in [CONSTITUTION.md](CONSTITUTION.md):
 
 - **Ring 0** is limited to physical memory allocation, CPU scheduling, Intel VT-x management, and local IPC. Device drivers, network stacks, and POSIX abstractions belong in user space.
-- **Interface-first**: define or refine Zig types, constants, and memory layout invariants before writing implementation code.
-- **Minimal, reversible changes**: kernel and hypervisor work should move in small steps with one major variable changed at a time.
-- **No guessing at hardware faults**: diagnose triple faults and VMX failures from serial output and QEMU register state, not by trial and error.
+- **AI-Assisted Development**: AI agents and human contributors are encouraged to rapidly prototype, implement features end-to-end, and refactor across kernel and user-space boundaries.
+- **Interface-First**: define or refine Zig types, constants, and memory layout invariants alongside implementation plumbing.
+- **Iterative Progress**: move in clear, verifiable steps, validating changes with build and smoke test scripts.
+- **Evidence-Driven Debugging**: diagnose triple faults and VMX failures using serial output, logs, and register dumps.
 
 ## Development Environment
 

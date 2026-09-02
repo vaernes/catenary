@@ -221,6 +221,32 @@ pub fn mapUserPage(hhdm_offset: u64, pml4_phys: u64, virt: u64, phys: u64, flags
     invlpg(virt);
 }
 
+pub fn unmapUserPage(hhdm_offset: u64, target_cr3: u64, virt: u64) UpdateError!void {
+    if (!isCanonical(virt)) return error.InvalidAddress;
+
+    const pml4 = tablePtr(target_cr3, hhdm_offset);
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pml4e = pml4[@as(usize, @intCast(pml4_idx))];
+    if ((pml4e & ENTRY_PRESENT) == 0) return;
+
+    const pdpt = tablePtr(pml4e, hhdm_offset);
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pdpte = pdpt[@as(usize, @intCast(pdpt_idx))];
+    if ((pdpte & ENTRY_PRESENT) == 0) return;
+
+    const pd = tablePtr(pdpte, hhdm_offset);
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pde = pd[@as(usize, @intCast(pd_idx))];
+    if ((pde & ENTRY_PRESENT) == 0) return;
+
+    const pt = tablePtr(pde, hhdm_offset);
+    const pt_idx = (virt >> 12) & 0x1FF;
+    const pte = &pt[@as(usize, @intCast(pt_idx))];
+
+    pte.* = 0;
+    invlpg(virt);
+}
+
 pub fn map(hhdm_offset: u64, virt: u64, phys: u64, flags: u64) UpdateError!void {
     if (!isCanonical(virt)) return error.InvalidAddress;
     const is_user = (flags & ENTRY_USER) != 0;
@@ -251,6 +277,34 @@ pub fn translate(hhdm_offset: u64, virt: u64) ?u64 {
     if (!isCanonical(virt)) return null;
 
     const pml4 = tablePtr(cpu.readCr3(), hhdm_offset);
+    const pml4_idx = (virt >> 39) & 0x1FF;
+    const pml4e = pml4[@as(usize, @intCast(pml4_idx))];
+    if ((pml4e & 1) == 0) return null;
+
+    const pdpt = tablePtr(pml4e, hhdm_offset);
+    const pdpt_idx = (virt >> 30) & 0x1FF;
+    const pdpte = pdpt[@as(usize, @intCast(pdpt_idx))];
+    if ((pdpte & 1) == 0) return null;
+    if ((pdpte & ENTRY_LARGE) != 0) return translate1GiBLargePage(pdpte, virt);
+
+    const pd = tablePtr(pdpte, hhdm_offset);
+    const pd_idx = (virt >> 21) & 0x1FF;
+    const pde = pd[@as(usize, @intCast(pd_idx))];
+    if ((pde & 1) == 0) return null;
+    if ((pde & ENTRY_LARGE) != 0) return translate2MiBLargePage(pde, virt);
+
+    const pt = tablePtr(pde, hhdm_offset);
+    const pt_idx = (virt >> 12) & 0x1FF;
+    const pte = pt[@as(usize, @intCast(pt_idx))];
+    if ((pte & 1) == 0) return null;
+
+    return (pte & PAGE_MASK) | (virt & 0xFFF);
+}
+
+pub fn translateInAddressSpace(hhdm_offset: u64, pml4_phys: u64, virt: u64) ?u64 {
+    if (!isCanonical(virt)) return null;
+
+    const pml4 = tablePtr(pml4_phys, hhdm_offset);
     const pml4_idx = (virt >> 39) & 0x1FF;
     const pml4e = pml4[@as(usize, @intCast(pml4_idx))];
     if ((pml4e & 1) == 0) return null;

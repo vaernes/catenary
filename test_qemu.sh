@@ -10,7 +10,7 @@ TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
 SMOKE_PROFILE=${SMOKE_PROFILE:-default}
 
-DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true"
+DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false"
 DEFAULT_CORE_PATTERNS=""
 DEFAULT_VMX_EPT_PATTERNS=""
 DEFAULT_VMX_LINUX_PATTERNS=""
@@ -99,7 +99,8 @@ GTK_PATH= qemu-system-x86_64 \
     -M q35 -m 1G \
     -cpu "${CPU}" -accel "${ACCEL}" \
     -cdrom catenary.iso -boot d \
-    -serial file:qemu_serial.log \
+    -chardev file,id=s0,path=qemu_serial.log \
+    -serial chardev:s0 \
     -display none \
     -pidfile qemu.pid \
     -no-reboot \

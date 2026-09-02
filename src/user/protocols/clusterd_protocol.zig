@@ -37,6 +37,18 @@ pub const Op = enum(u16) {
     /// Reply to vm_list_request.
     /// Payload: VmListReply.
     vm_list_reply = 4,
+
+    /// Broadcast current node resource availability to peer clusterd instances.
+    /// Payload: ResourceAdvertisement.
+    resource_advertisement = 5,
+
+    /// Request a point-in-time resource snapshot from a peer.
+    /// Payload: ResourceSnapshotRequest. Reply op: resource_snapshot_reply.
+    resource_snapshot_request = 6,
+
+    /// Reply to resource_snapshot_request.
+    /// Payload: ResourceSnapshotReply.
+    resource_snapshot_reply = 7,
 };
 
 /// Header for clusterd service-to-service messages (not kernel_control messages).
@@ -52,8 +64,21 @@ pub const ClusterdHeader = extern struct {
 // Per-op payloads
 // ---------------------------------------------------------------------------
 
+pub const LaunchVmStatus = enum(u32) {
+    ok = 0,
+    rejected = 1,
+    no_capacity = 2,
+    invalid_payload = 3,
+    busy = 4,
+    unauthorized = 5,
+    internal_error = 6,
+};
+
 /// Op.launch_vm_request — ask a remote node to create and start a MicroVM.
 pub const LaunchVmRequest = extern struct {
+    request_id: u64,
+    flags: u32 = 0,
+    _pad0: u32 = 0,
     /// Requested memory in 4 KiB pages.
     mem_pages: u32,
     /// Requested vCPU count.
@@ -72,10 +97,53 @@ pub const LaunchVmRequest = extern struct {
 
 /// Op.launch_vm_ack — response from the target clusterd.
 pub const LaunchVmAck = extern struct {
+    request_id: u64,
     /// Instance ID assigned by the remote kernel (0 on failure).
     instance_id: u32,
-    /// 0 = success, non-zero = error code.
-    status: u32,
+    /// Result status for the request.
+    status: LaunchVmStatus,
+};
+
+pub const ResourceAdvertisement = extern struct {
+    generation: u64,
+    total_mem_pages: u32,
+    free_mem_pages: u32,
+    logical_cpu_total: u32,
+    logical_cpu_available: u32,
+    active_vms: u32,
+    service_mask: u32,
+    flags: u32,
+    _pad0: u32 = 0,
+};
+
+pub const ResourceSnapshotRequest = extern struct {
+    flags: u32 = 0,
+    _pad: u32 = 0,
+};
+
+pub const ResourceSnapshotEntry = extern struct {
+    node_addr: [16]u8,
+    resources: ResourceAdvertisement,
+};
+
+pub const MAX_RESOURCE_SNAPSHOT_ENTRIES: usize = 16;
+
+pub const ResourceSnapshotReply = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    entries: [MAX_RESOURCE_SNAPSHOT_ENTRIES]ResourceSnapshotEntry = [_]ResourceSnapshotEntry{.{
+        .node_addr = [_]u8{0} ** 16,
+        .resources = .{
+            .generation = 0,
+            .total_mem_pages = 0,
+            .free_mem_pages = 0,
+            .logical_cpu_total = 0,
+            .logical_cpu_available = 0,
+            .active_vms = 0,
+            .service_mask = 0,
+            .flags = 0,
+        },
+    }} ** MAX_RESOURCE_SNAPSHOT_ENTRIES,
 };
 
 /// Op.vm_list_reply — compact VM snapshot list for dashboard queries.

@@ -12,6 +12,28 @@
 pub const MAGIC: u32 = 0x44415348; // 'DASH'
 pub const VERSION: u16 = 1;
 
+pub const Op = enum(u16) {
+    /// Request a telemetry summary snapshot from dashd.
+    /// Payload: TelemetrySummaryRequest. Reply op: telemetry_summary_reply.
+    telemetry_summary_request = 1,
+
+    /// Reply to telemetry_summary_request.
+    /// Payload: TelemetrySummaryReply.
+    telemetry_summary_reply = 2,
+
+    /// Forwarded cross-node telemetry sample.
+    /// Payload: ClusterTelemetryUpdate.
+    cluster_telemetry_update = 3,
+};
+
+pub const DashdHeader = extern struct {
+    magic: u32 = MAGIC,
+    version: u16 = VERSION,
+    op: Op,
+    payload_len: u32,
+    _pad: u32 = 0,
+};
+
 // ---------------------------------------------------------------------------
 // Messages sent TO dashd
 // ---------------------------------------------------------------------------
@@ -28,6 +50,20 @@ pub const TelemetryUpdate = extern struct {
     exit_count: u64,
 };
 
+pub const ClusterTelemetryUpdate = extern struct {
+    sample_tsc: u64,
+    node_addr: [16]u8,
+    instance_id: u32,
+    _reserved: u32 = 0,
+    cpu_cycles: u64,
+    exit_count: u64,
+};
+
+pub const TelemetrySummaryRequest = extern struct {
+    flags: u32 = 0,
+    _pad: u32 = 0,
+};
+
 // ---------------------------------------------------------------------------
 // Messages sent FROM dashd (replies)
 // ---------------------------------------------------------------------------
@@ -40,4 +76,25 @@ pub const VmStatsSummary = extern struct {
     _pad: u32 = 0,
     cpu_cycles: u64,
     exit_count: u64,
+};
+
+pub const TelemetrySummaryEntry = extern struct {
+    node_addr: [16]u8,
+    instance_id: u32,
+    _pad: u32 = 0,
+    cpu_cycles: u64,
+    exit_count: u64,
+};
+
+pub const MAX_TELEMETRY_SUMMARY_ENTRIES: usize = 32;
+
+pub const TelemetrySummaryReply = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    entries: [MAX_TELEMETRY_SUMMARY_ENTRIES]TelemetrySummaryEntry = [_]TelemetrySummaryEntry{.{
+        .node_addr = [_]u8{0} ** 16,
+        .instance_id = 0,
+        .cpu_cycles = 0,
+        .exit_count = 0,
+    }} ** MAX_TELEMETRY_SUMMARY_ENTRIES,
 };

@@ -37,7 +37,17 @@ pub fn timerInterrupt() callconv(.naked) void {
         \\pushq %r13
         \\pushq %r14
         \\pushq %r15
+        \\
+        \\pushq %rbp
+        \\movq %rsp, %rbp
+        \\andq $-16, %rsp
+        \\subq $512, %rsp
+        \\fxsave64 (%rsp)
         \\callq catenary_timerInterruptBridge
+        \\fxrstor64 (%rsp)
+        \\movq %rbp, %rsp
+        \\popq %rbp
+        \\
         \\popq %r15
         \\popq %r14
         \\popq %r13

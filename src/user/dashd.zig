@@ -4,6 +4,7 @@
 /// renders per-VM stats onto the framebuffer via the SYS_FB_DRAW lib.syscall.
 const std = @import("std");
 const lib = @import("lib.zig");
+const dashd_proto = @import("protocols/dashd_protocol.zig");
 
 // ---------------------------------------------------------------------------
 // Bootstrap
@@ -54,10 +55,8 @@ pub export fn umain() noreturn {
 
     // Main event loop.
     while (true) {
-        const page_phys = lib.syscall(lib.SYS_TRY_RECV, 0, 0, token);
+        const page_phys = lib.syscall(lib.SYS_RECV, 0, 0, token);
         if (page_phys == 0) {
-            _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
-            asm volatile ("pause");
             continue;
         }
 
@@ -67,31 +66,62 @@ pub export fn umain() noreturn {
             continue;
         }
 
-        // Telemetry is sent as a raw DIPC payload by microvm_bridge.
-        const telem: *align(1) const TelemetryPayload = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+        const hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+        const payload_ptr: [*]const u8 = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+        const payload_len = @as(usize, hdr.payload_len);
 
-        // Update VM stats table.
-        const vid = telem.instance_id;
-        var slot: ?*VmStats = null;
-        for (&vm_table) |*s| {
-            if (s.used and s.id == vid) {
-                slot = s;
-                break;
+        if (payload_len >= @sizeOf(dashd_proto.DashdHeader)) {
+            const dash_hdr: *align(1) const dashd_proto.DashdHeader = @ptrCast(payload_ptr);
+            if (dash_hdr.magic == dashd_proto.MAGIC and dash_hdr.op == .cluster_telemetry_update) {
+                const sample: *align(1) const dashd_proto.ClusterTelemetryUpdate = @ptrCast(payload_ptr + @sizeOf(dashd_proto.DashdHeader));
+                const vid = sample.instance_id;
+                var slot: ?*VmStats = null;
+                for (&vm_table) |*s| {
+                    if (s.used and s.id == vid) {
+                        slot = s;
+                        break;
+                    }
+                }
+                if (slot == null) {
+                    for (&vm_table) |*s| {
+                        if (!s.used) {
+                            s.used = true;
+                            s.id = vid;
+                            slot = s;
+                            break;
+                        }
+                    }
+                }
+                if (slot) |s| {
+                    s.cpu_cycles = sample.cpu_cycles;
+                    s.exit_count = sample.exit_count;
+                }
             }
-        }
-        if (slot == null) {
+        } else if (payload_len >= @sizeOf(TelemetryPayload)) {
+            // Raw telemetry from local microvm_bridge
+            const telem: *align(1) const TelemetryPayload = @ptrCast(payload_ptr);
+            const vid = telem.instance_id;
+            var slot: ?*VmStats = null;
             for (&vm_table) |*s| {
-                if (!s.used) {
-                    s.used = true;
-                    s.id = vid;
+                if (s.used and s.id == vid) {
                     slot = s;
                     break;
                 }
             }
-        }
-        if (slot) |s| {
-            s.cpu_cycles = telem.cpu_cycles;
-            s.exit_count = telem.exit_count;
+            if (slot == null) {
+                for (&vm_table) |*s| {
+                    if (!s.used) {
+                        s.used = true;
+                        s.id = vid;
+                        slot = s;
+                        break;
+                    }
+                }
+            }
+            if (slot) |s| {
+                s.cpu_cycles = telem.cpu_cycles;
+                s.exit_count = telem.exit_count;
+            }
         }
 
         // Stats updated — windowd will query via list_vms.

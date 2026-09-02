@@ -12,12 +12,12 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 - Preserve the exokernel boundary: Ring 0 is limited to physical memory allocation, CPU scheduling/context switching, Intel VT-x management, and local IPC.
 - Keep device drivers, network stacks, orchestration services, and compatibility layers in user space unless the user explicitly changes the architecture.
 
-## Non-Negotiable Rules
+## Core Principles & AI Guidelines
 
-- No vibe coding in Ring 0. Do not invent Linux-like subsystems, scheduler behavior, or memory-management patterns because they feel familiar.
-- Follow interface-first development. Define or refine the Zig types, constants, memory layouts, and invariants before writing plumbing.
-- Debug hardware failures from evidence. Use serial logs, QEMU output, register state, and architectural invariants. Do not guess at triple faults, VMX failures, or page-fault causes.
-- Prefer minimal, reversible changes. Kernel and hypervisor bring-up should move in small steps with one major variable changed at a time.
+- Flexible AI Assistance: AI agents are encouraged to assist proactively across both Ring 0 kernel logic and Ring 3 user-space services, leveraging creative problem solving, rapid prototyping, and end-to-end feature implementations.
+- Interface-First Development: Define or refine the Zig types, constants, memory layouts, and invariants alongside implementation plumbing for clear system contracts.
+- Evidence-Driven Debugging: Diagnose hardware failures using serial logs, QEMU output, register state, and architectural invariants.
+- Pragmatic & Iterative Changes: Move in clear, iterative steps when implementing kernel, hypervisor, or user-space features, testing changes against build and smoke outputs.
 
 ## Architecture Constraints
 
@@ -65,11 +65,11 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 
 ## Collaboration Guidance For AI Agents
 
-- Start by reading the relevant source files and nearby architecture notes before editing.
-- State assumptions when hardware behavior or incomplete repo context leaves ambiguity.
-- If the requested change conflicts with the constitution, call that out and propose the narrowest architecture-consistent alternative.
-- Update documentation when architectural behavior, build steps, or bring-up expectations materially change.
-- Do not silently paper over low-level failures with catch-all fallbacks, stub success paths, or logging that hides missing functionality.
+- AI agents are empowered to perform broad multi-file edits, prototype features, refactor code, and implement complete user requests across kernel and Ring 3 boundaries.
+- Inspect relevant source files and architecture notes to maintain system coherence, but feel free to suggest improvements or alternative patterns when beneficial.
+- Proactively handle error edge cases and plumbing alongside high-level abstractions.
+- Update documentation and tests whenever architecture, interfaces, or build steps evolve.
+- Communicate reasoning clearly and verify changes with available build and test tooling.
 
 ## What Good Contributions Look Like
 

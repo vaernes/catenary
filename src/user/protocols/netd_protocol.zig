@@ -32,6 +32,18 @@ pub const Op = enum(u16) {
     /// Request netd to forward an already-built DIPC frame to a remote node.
     /// Payload: ForwardPayload followed by the DIPC page bytes.
     forward_dipc = 5,
+
+    /// Announce a discovered peer and its transport-relevant properties.
+    /// Payload: PeerAnnouncementPayload.
+    peer_announce = 6,
+
+    /// Request a snapshot of the currently known peer table.
+    /// Payload: PeerSnapshotRequest. Reply op: peer_snapshot_reply.
+    peer_snapshot_request = 7,
+
+    /// Reply to peer_snapshot_request.
+    /// Payload: PeerSnapshotReply.
+    peer_snapshot_reply = 8,
 };
 
 /// Header prepended to every netd DIPC message (after the PageHeader).
@@ -73,4 +85,47 @@ pub const ForwardPayload = extern struct {
     dst_node: [16]u8, // destination IPv6 node address
     page_len: u32, // length of the DIPC page that follows
     _pad: u32 = 0,
+};
+
+pub const PEER_FLAG_LINK_LOCAL_ONLY: u16 = 1 << 0;
+pub const PEER_FLAG_TRUSTED: u16 = 1 << 1;
+pub const PEER_FLAG_ROUTE_DIRECT: u16 = 1 << 2;
+pub const PEER_FLAG_HAS_NETD: u16 = 1 << 3;
+
+/// Op.peer_announce — advertise a discovered cluster peer.
+pub const PeerAnnouncementPayload = extern struct {
+    node_addr: [16]u8,
+    service_mask: u32,
+    mtu: u16,
+    flags: u16,
+    mac: [6]u8,
+    _pad: [2]u8 = [_]u8{0} ** 2,
+};
+
+pub const PeerSnapshotRequest = extern struct {
+    flags: u32 = 0,
+    _pad: u32 = 0,
+};
+
+pub const PeerSnapshotEntry = extern struct {
+    node_addr: [16]u8,
+    service_mask: u32,
+    mtu: u16,
+    flags: u16,
+    mac: [6]u8,
+    _pad: [2]u8 = [_]u8{0} ** 2,
+};
+
+pub const MAX_PEER_SNAPSHOT_ENTRIES: usize = 16;
+
+pub const PeerSnapshotReply = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    entries: [MAX_PEER_SNAPSHOT_ENTRIES]PeerSnapshotEntry = [_]PeerSnapshotEntry{.{
+        .node_addr = [_]u8{0} ** 16,
+        .service_mask = 0,
+        .mtu = 0,
+        .flags = 0,
+        .mac = [_]u8{0} ** 6,
+    }} ** MAX_PEER_SNAPSHOT_ENTRIES,
 };

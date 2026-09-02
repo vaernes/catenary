@@ -5,6 +5,8 @@ const builtin = @import("builtin");
 const storaged_proto = @import("protocols/storaged_protocol.zig");
 const dashd_proto = @import("protocols/dashd_protocol.zig");
 const configd_proto = @import("protocols/configd_protocol.zig");
+const netd_proto = @import("protocols/netd_protocol.zig");
+const clusterd_proto = @import("protocols/clusterd_protocol.zig");
 const inputd_proto = @import("protocols/inputd_protocol.zig");
 
 pub fn ptrFrom(comptime T: type, addr: u64) T {
@@ -19,7 +21,7 @@ pub fn ptrFrom(comptime T: type, addr: u64) T {
     }
 }
 
-pub fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
+pub inline fn syscall(op: u64, arg0: u64, arg1: u64, token: u64) u64 {
     switch (builtin.cpu.arch) {
         .x86_64 => {
             return asm volatile ("int $0x80"
@@ -240,6 +242,7 @@ pub const ControlOp = enum(u16) {
     list_microvms = 19,
     get_node_status = 20,
     get_node_addr = 21,
+    get_node_identity = 22,
 };
 
 pub const ControlHeader = extern struct {
@@ -294,22 +297,76 @@ pub const ListMicrovmsResult = extern struct {
     vms: [64]MicrovmInfo,
 };
 
+pub const ControlStatus = enum(u32) {
+    ok = 0,
+    unsupported = 1,
+    unauthorized = 2,
+    invalid_payload = 3,
+    busy = 4,
+    not_found = 5,
+    invalid_state = 6,
+    no_capacity = 7,
+    internal_error = 8,
+};
+
+pub const NODE_FLAG_NODE_ADDR_CONFIGURED: u32 = 1 << 0;
+pub const NODE_FLAG_CLUSTER_CAPABLE: u32 = 1 << 1;
+pub const NODE_FLAG_VMM_ACTIVE: u32 = 1 << 2;
+pub const NODE_FLAG_TELEMETRY_AVAILABLE: u32 = 1 << 3;
+pub const NODE_FLAG_NETD_REGISTERED: u32 = 1 << 4;
+pub const NODE_FLAG_STORAGE_REGISTERED: u32 = 1 << 5;
+pub const NODE_FLAG_DASHD_REGISTERED: u32 = 1 << 6;
+pub const NODE_FLAG_CLUSTERD_REGISTERED: u32 = 1 << 7;
+pub const NODE_FLAG_CONFIGD_REGISTERED: u32 = 1 << 8;
+
 pub const NodeStatusResult = extern struct {
     total_mem_pages: u32,
     free_mem_pages: u32,
     active_vms: u32,
-    _pad: u32 = 0,
+    logical_cpu_total: u32,
+    logical_cpu_available: u32,
+    service_mask: u32,
+    flags: u32,
 };
 
 pub const NodeAddrResult = extern struct {
     addr: Ipv6Addr,
 };
 
+pub const CreateMicrovmResult = extern struct {
+    status: ControlStatus,
+    instance_id: u32,
+};
+
+pub const MicrovmCommandResult = extern struct {
+    status: ControlStatus,
+    instance_id: u32,
+    previous_state: u32,
+    current_state: u32,
+};
+
+pub const NodeIdentityResult = extern struct {
+    addr: Ipv6Addr,
+    manifest_version: u32,
+    service_hash_count: u16,
+    _pad0: u16 = 0,
+    flags: u32,
+    kernel_hash: [32]u8,
+    trust_tag: u64,
+};
+
 /// Per-VM telemetry update.  Re-exported from dashd_protocol.
 pub const TelemetryUpdatePayload = dashd_proto.TelemetryUpdate;
+pub const ClusterTelemetryUpdatePayload = dashd_proto.ClusterTelemetryUpdate;
+pub const TelemetrySummaryRequest = dashd_proto.TelemetrySummaryRequest;
+pub const TelemetrySummaryReply = dashd_proto.TelemetrySummaryReply;
+pub const DashdHeader = dashd_proto.DashdHeader;
 
 /// Cluster node / service registry sync payload.  Re-exported from configd_protocol.
 pub const RegistrySyncPayload = configd_proto.RegistrySyncPayload;
+pub const ConfigNodeJoinPayload = configd_proto.NodeJoinPayload;
+pub const ConfigNodeResourcePayload = configd_proto.NodeResourcePayload;
+pub const ConfigRegistrySnapshotReply = configd_proto.RegistrySnapshotReply;
 /// Canonical block I/O request type.  Re-exported from storaged_protocol.
 pub const BlkRequest = storaged_proto.BlkRequest;
 
@@ -322,6 +379,15 @@ pub const VirtioBlkResponsePayload = extern struct {
     status: u8,
     _pad: u8 = 0,
 };
+
+pub const NetdHeader = netd_proto.NetdHeader;
+pub const NetdPeerAnnouncementPayload = netd_proto.PeerAnnouncementPayload;
+pub const NetdPeerSnapshotReply = netd_proto.PeerSnapshotReply;
+pub const ClusterdHeader = clusterd_proto.ClusterdHeader;
+pub const LaunchVmRequest = clusterd_proto.LaunchVmRequest;
+pub const LaunchVmAck = clusterd_proto.LaunchVmAck;
+pub const ResourceAdvertisement = clusterd_proto.ResourceAdvertisement;
+pub const ResourceSnapshotReply = clusterd_proto.ResourceSnapshotReply;
 
 // --- Interactive GUI protocol (mirrors control_protocol.zig) ---
 

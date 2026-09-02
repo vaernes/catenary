@@ -119,8 +119,7 @@ pub export fn umain() noreturn {
         }
 
         last_poll += 1;
-        _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
-        asm volatile ("pause");
+        _ = lib.syscall(lib.SYS_RECV, 0, 0, token);
     }
 }
 

@@ -57,6 +57,18 @@ pub const Op = enum(u16) {
     /// Propagate a config key/value update to all cluster nodes.
     /// Payload: ConfigUpdatePayload.
     config_update = 3,
+
+    /// Publish a node's current resources and service mask.
+    /// Payload: NodeResourcePayload.
+    node_resource = 4,
+
+    /// Request the current cluster registry snapshot.
+    /// Payload: RegistrySnapshotRequest. Reply op: registry_snapshot_reply.
+    registry_snapshot_request = 5,
+
+    /// Reply to registry_snapshot_request.
+    /// Payload: RegistrySnapshotReply.
+    registry_snapshot_reply = 6,
 };
 
 pub const ConfigdHeader = extern struct {
@@ -71,14 +83,18 @@ pub const ConfigdHeader = extern struct {
 pub const NodeJoinPayload = extern struct {
     /// IPv6 address of the newly-joined node.
     node_addr: [16]u8,
+    /// Monotonic sender generation for deduplicating announcements.
+    generation: u64,
     /// Bitmask of services running on that node (bit i = ServiceKind(i)).
-    service_mask: u16,
-    _pad: [6]u8 = [_]u8{0} ** 6,
+    service_mask: u32,
+    /// Node capability flags.
+    flags: u32,
 };
 
 /// Op.node_left — a previously-seen node has gone away.
 pub const NodeLeavePayload = extern struct {
     node_addr: [16]u8,
+    generation: u64,
     reason: u8, // 0 = timeout, 1 = graceful shutdown
     _pad: [7]u8 = [_]u8{0} ** 7,
 };
@@ -87,4 +103,42 @@ pub const NodeLeavePayload = extern struct {
 pub const ConfigUpdatePayload = extern struct {
     key: [32]u8,
     value: [64]u8,
+};
+
+pub const NodeResourcePayload = extern struct {
+    node_addr: [16]u8,
+    generation: u64,
+    total_mem_pages: u32,
+    free_mem_pages: u32,
+    logical_cpu_total: u32,
+    logical_cpu_available: u32,
+    active_vms: u32,
+    service_mask: u32,
+    flags: u32,
+    _pad: u32 = 0,
+};
+
+pub const RegistrySnapshotRequest = extern struct {
+    flags: u32 = 0,
+    _pad: u32 = 0,
+};
+
+pub const NodeRecord = extern struct {
+    node_addr: [16]u8,
+    generation: u64,
+    service_mask: u32,
+    flags: u32,
+};
+
+pub const MAX_NODE_RECORDS: usize = 16;
+
+pub const RegistrySnapshotReply = extern struct {
+    count: u32,
+    _pad: u32 = 0,
+    nodes: [MAX_NODE_RECORDS]NodeRecord = [_]NodeRecord{.{
+        .node_addr = [_]u8{0} ** 16,
+        .generation = 0,
+        .service_mask = 0,
+        .flags = 0,
+    }} ** MAX_NODE_RECORDS,
 };

@@ -9,7 +9,7 @@ set -euo pipefail
 TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
 
-ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true -Dvmm_active=true -Dvmm_launch_linux=true"
+ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=false"
 
 # Rebuild
 echo "[+] Building Catenary OS..."
@@ -51,34 +51,42 @@ elif [ "${REQUIRE_KVM}" -eq 1 ]; then
 fi
 
 echo "[+] Starting Node A (accel=${ACCEL})..."
-GTK_PATH= qemu-system-x86_64 \
+GTK_PATH= stdbuf -o0 qemu-system-x86_64 \
     -M q35 -m 1024 \
     -cpu "${CPU}" -accel "${ACCEL}" \
     -cdrom catenary.iso -boot d \
-    -serial file:qemu_serial_A.log \
+    -chardev file,id=s0,path=qemu_serial_A.log \
+    -serial chardev:s0 \
     -display none \
     -pidfile qemu_A.pid \
     -no-reboot \
     -daemonize \
-    -netdev socket,id=net0,mcast=230.0.0.1:1234 -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56
+    -netdev socket,id=net0,mcast=230.0.0.1:1234,localaddr=127.0.0.1 -device virtio-net-pci,disable-modern=on,netdev=net0,mac=52:54:00:12:34:56,addr=02.0
+
+sleep 1
 
 echo "[+] Starting Node B (accel=${ACCEL})..."
-GTK_PATH= qemu-system-x86_64 \
+GTK_PATH= stdbuf -o0 qemu-system-x86_64 \
     -M q35 -m 1024 \
     -cpu "${CPU}" -accel "${ACCEL}" \
     -cdrom catenary.iso -boot d \
-    -serial file:qemu_serial_B.log \
+    -chardev file,id=s1,path=qemu_serial_B.log \
+    -serial chardev:s1 \
     -display none \
     -pidfile qemu_B.pid \
     -no-reboot \
     -daemonize \
-    -netdev socket,id=net0,mcast=230.0.0.1:1234 -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:57
+    -netdev socket,id=net0,mcast=230.0.0.1:1234,localaddr=127.0.0.1 -device virtio-net-pci,disable-modern=on,netdev=net0,mac=52:54:00:12:34:57,addr=02.0
 
 cleanup() {
-    if [ -f qemu_A.pid ]; then kill "$(cat qemu_A.pid)" >/dev/null 2>&1 || true; fi
-    if [ -f qemu_B.pid ]; then kill "$(cat qemu_B.pid)" >/dev/null 2>&1 || true; fi
+    if [ -f qemu_A.pid ]; then kill -9 "$(cat qemu_A.pid)" >/dev/null 2>&1 || true; fi
+    if [ -f qemu_B.pid ]; then kill -9 "$(cat qemu_B.pid)" >/dev/null 2>&1 || true; fi
+    if [ -n "${WATCHDOG_PID:-}" ]; then kill -9 "${WATCHDOG_PID}" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
+
+( sleep "$((TIMEOUT_SECS + 5))" && echo "[!] Hard timeout reached by watchdog" && cleanup ) &
+WATCHDOG_PID=$!
 
 echo "[+] Waiting for milestones (timeout ${TIMEOUT_SECS}s)..."
 

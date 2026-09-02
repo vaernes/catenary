@@ -1,6 +1,6 @@
 # Catenary OS Architecture
 
-Catenary OS is a hobby project pushing the limits of AI-assisted systems programming, built as a distributed microkernel and Type-1 hypervisor designed to orchestrate isolated MicroVMs across an IPv6 fabric. It follows an **Exokernel** philosophy, minimizing Ring 0 responsibilities while delegating complex system logic to Ring 3 services.
+Catenary OS is a hobby project embracing flexible, unconstrained AI-assisted systems programming, built as a distributed microkernel and Type-1 hypervisor designed to orchestrate isolated MicroVMs across an IPv6 fabric. It follows an **Exokernel** philosophy, minimizing Ring 0 responsibilities while delegating complex system logic to Ring 3 services.
 
 ---
 

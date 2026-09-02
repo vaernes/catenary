@@ -104,7 +104,11 @@ pub fn keyboardInterrupt() callconv(.naked) void {
         \\pushq %r13
         \\pushq %r14
         \\pushq %r15
+        \\subq $512, %rsp
+        \\fxsave64 (%rsp)
         \\callq catenary_keyboardInterruptBridge
+        \\fxrstor64 (%rsp)
+        \\addq $512, %rsp
         \\popq %r15
         \\popq %r14
         \\popq %r13

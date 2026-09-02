@@ -92,12 +92,20 @@ pub export fn umain() noreturn {
     };
 
     lib.serialWrite("containerd: sending image block to storaged...\n");
-    lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
+    var write_completed = false;
+    var send_ok = tryQueueWriteRequest(dipc_phys, token);
+    if (!send_ok) {
+        lib.serialWrite("containerd: initial DIPC send failed, will retry\n");
+    }
     lib.serialWrite("containerd: entering event loop\n");
-    var resend_counter: u32 = 0;
-    var write_completed = true;
-    var request_in_flight = tryQueueWriteRequest(dipc_phys, token);
     while (true) {
+        // Retry send if it failed initially (storaged may not have registered yet)
+        if (!send_ok and !write_completed) {
+            if (tryQueueWriteRequest(dipc_phys, token)) {
+                send_ok = true;
+            }
+        }
+
         const page_phys = lib.syscall(SYS_TRY_RECV, 0, 0, token);
         if (page_phys != 0) {
             const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
@@ -105,7 +113,6 @@ pub export fn umain() noreturn {
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
                 if (control.op == .virtio_blk_response and control.payload_len >= @sizeOf(lib.VirtioBlkResponsePayload)) {
                     const response: *align(1) const lib.VirtioBlkResponsePayload = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
-                    request_in_flight = false;
                     if (!write_completed and response.status == 0) {
                         markWriteQueued(&write_completed);
                     } else if (!write_completed) {
@@ -117,18 +124,12 @@ pub export fn umain() noreturn {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
         }
-        if (!write_completed and !request_in_flight) {
-            resend_counter +%= 1;
-            if (resend_counter >= 5_000) {
-                resend_counter = 0;
-                request_in_flight = tryQueueWriteRequest(dipc_phys, token);
-                if (request_in_flight) {
-                    markWriteQueued(&write_completed);
-                }
-            }
+        if (write_completed) {
+            _ = lib.syscall(lib.SYS_RECV, 0, 0, token);
+        } else {
+            _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
+            asm volatile ("pause");
         }
-        _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
-        asm volatile ("pause");
     }
 }
 

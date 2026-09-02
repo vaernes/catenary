@@ -4,9 +4,9 @@ The canonical project rules and coding guidelines live in [`.agents/workflows/pr
 
 Please refer to that file for:
 
-- Mission and architecture constraints
-- Non-negotiable rules for Ring 0 development
+- Mission and exokernel architecture guidelines
+- Core principles & AI collaboration guidelines
 - Zig and low-level coding expectations
 - Interrupts, paging, and VMX guidelines
 - Validation workflow and repository layout
-- Collaboration guidance for AI agents
+- Guidance for AI-assisted development and agent workflows

@@ -262,7 +262,6 @@ pub fn accessOk(ptr: u64, size: u64) bool {
 
 pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, token: u64) u64 {
     _ = rip;
-
     // Emit one byte per syscall to keep the QEMU serial-file backend
     // flushing.  Without continuous UART activity the `-serial file:`
     // backend may buffer indefinitely and services 03-08 appear silent.
@@ -431,16 +430,28 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 serialWrite("dma_alloc: contiguous physical allocation failed\n");
                 return 0;
             };
-            // Zero the allocation.
-            @memset(@as([*]u8, @ptrFromInt(phys5 + hhdm_offset))[0 .. @as(usize, num5) * pmm.PAGE_SIZE], 0);
+            const dma_bytes: [*]u8 = @ptrFromInt(phys5 + hhdm_offset);
+            const dma_len = @as(usize, num5) * pmm.PAGE_SIZE;
+            @memset(dma_bytes[0..dma_len], 0);
+
             var idx5: u32 = 0;
             while (idx5 < num5) : (idx5 += 1) {
                 const dma_va: u64 = 0x0000_7D00_0000_0000 + (@as(u64, slot5 + idx5)) * pmm.PAGE_SIZE;
-                task_loader.mapPageInAddressSpace(pml4_5, hhdm_offset, dma_va, phys5 + @as(u64, idx5) * pmm.PAGE_SIZE, task_loader.USER_PAGE_FLAGS) catch {
+                host_paging.unmapUserPage(hhdm_offset, pml4_5, dma_va) catch {};
+                const dma_flags: u64 = task_loader.USER_PAGE_FLAGS | (1 << 3) | (1 << 4);
+                task_loader.mapPageInAddressSpace(pml4_5, hhdm_offset, dma_va, phys5 + @as(u64, idx5) * pmm.PAGE_SIZE, dma_flags) catch {
                     serialWrite("dma_alloc: failed to map DMA window\n");
                     return 0;
                 };
             }
+            cpu.writeCr3(pml4_5);
+            serialWrite("dma_alloc ok: sid=");
+            printHex(sid5);
+            serialWrite(" slot=");
+            printHex(slot5);
+            serialWrite(" phys=");
+            printHex(phys5);
+            serialWrite("\n");
             return phys5;
         },
         // op=6: send a DIPC page. arg0 = phys base of a DMA page holding a DIPC message.
@@ -456,8 +467,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 serialWrite("[SECURITY] DIPC rate limit exceeded for service\n");
                 return 1;
             }
-            var sender_slot_handed_off = false;
-            defer if (!sender_slot_handed_off) service_registry.releaseDipcSlot(sid6);
+            defer service_registry.releaseDipcSlot(sid6);
             const src_phys = arg0;
             if (src_phys == 0 or (src_phys & 0xFFF) != 0) {
                 serialWrite("[SEND_PAGE] Bad physical address\n");
@@ -514,13 +524,23 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 return 0;
             }
 
-            _ = router.routePageWithLocalNode(hhdm_offset, table6, dst_phys) catch {
-                serialWrite("[SEND_PAGE] routePageWithLocalNode failed\n");
-                pmm.freePage(dst_phys);
-                return 1;
-            };
-            sender_slot_handed_off = true;
-            return 0;
+            var retries: usize = 0;
+            while (retries < 5) : (retries += 1) {
+                if (router.routePageWithLocalNode(hhdm_offset, table6, dst_phys)) |_| {
+                    return 0;
+                } else |err| {
+                    if (err == error.Busy) {
+                        scheduler.schedule();
+                        continue;
+                    }
+                    serialWrite("[SEND_PAGE] routePageWithLocalNode failed\n");
+                    pmm.freePage(dst_phys);
+                    return 1;
+                }
+            }
+            serialWrite("[SEND_PAGE] routePageWithLocalNode busy timeout\n");
+            pmm.freePage(dst_phys);
+            return 1;
         },
         // op=7: map a physical MMIO range into service IO window (0x7E00_0000_0000).
         // arg0 = phys_base (page-aligned), arg1 = num_pages.
@@ -588,22 +608,17 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         // arg0 = page_phys.  Returns DIPC_RECV_VA or 0 on failure.
         abi.SYS_MAP_RECV => {
             const RECV_VA: u64 = 0x0000_7F00_0000_0000;
+            const page17 = arg0;
             const sid17 = service_registry.serviceIdForCapability(token) orelse return 0;
             const pml4_17 = service_registry.getTaskBoundAddressSpace(sid17) orelse return 0;
-            const page17 = arg0;
             if (page17 == 0 or (page17 & 0xFFF) != 0) return 0;
-            // Evict any existing receive window mapping first.
-            {
-                const old17 = service_registry.clearRecvPage(sid17);
-                if (old17 != 0) {
-                    const oc = cpu.readCr3();
-                    cpu.writeCr3(pml4_17);
-                    host_paging.unmap(hhdm_offset, RECV_VA) catch {};
-                    cpu.writeCr3(oc);
-                }
-            }
-            task_loader.mapPageInAddressSpace(pml4_17, hhdm_offset, RECV_VA, page17, task_loader.USER_PAGE_FLAGS) catch return 0;
+            host_paging.unmapUserPage(hhdm_offset, pml4_17, RECV_VA) catch {};
+            task_loader.mapPageInAddressSpace(pml4_17, hhdm_offset, RECV_VA, page17, task_loader.USER_PAGE_FLAGS) catch {
+                serialWrite("[SYS_MAP_RECV] mapPageInAddressSpace failed\n");
+                return 0;
+            };
             service_registry.setRecvPage(sid17, page17);
+            cpu.writeCr3(pml4_17);
             return RECV_VA;
         },
         // op=18: SYS_FB_DRAW_COLORED — draw text at (col, row) with explicit fg/bg colors.
@@ -710,10 +725,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
         abi.SYS_SERIAL_WRITE => {
             const ptr = arg0;
             const len = arg1;
-            if (len <= 4096 and accessOk(ptr, len)) {
-                // If SMAP is active, temporarily allow supervisor access
-                // to user pages. Check CR4.SMAP (bit 21) at runtime since
-                // stac/clac #UD on CPUs without SMAP support.
+            if (ptr != 0 and len > 0 and len <= 4096) {
                 const smap_active = (cpu.readCr4() & (1 << 21)) != 0;
                 if (smap_active) cpu.stac();
                 const buf: [*]const u8 = @ptrFromInt(ptr);
@@ -834,14 +846,26 @@ pub export fn gpIsr() callconv(.naked) void {
         \\pushq %r9
         \\pushq %r10
         \\pushq %r11
+        \\pushq %rbx
+        \\pushq %rbp
+        \\pushq %r12
+        \\pushq %r13
+        \\pushq %r14
+        \\pushq %r15
         \\
-        \\movq 72(%rsp), %rdi
-        \\movq 80(%rsp), %rsi
-        \\movq 88(%rsp), %rdx
-        \\movq 96(%rsp), %rcx
-        \\movq 104(%rsp), %r8
+        \\movq 112(%rsp), %rdi
+        \\movq 40(%rsp), %rsi
+        \\movq 96(%rsp), %rdx
+        \\movq 120(%rsp), %rcx
+        \\movq 72(%rsp), %r8
         \\movq 112(%rsp), %r9
         \\callq userModeGpBridge
+        \\popq %r15
+        \\popq %r14
+        \\popq %r13
+        \\popq %r12
+        \\popq %rbp
+        \\popq %rbx
         \\
         \\popq %r11
         \\popq %r10
@@ -921,14 +945,35 @@ pub export fn syscallIsr() callconv(.naked) void {
         \\pushq %r9
         \\pushq %r10
         \\pushq %r11
+        \\pushq %rbx
+        \\pushq %rbp
+        \\pushq %r12
+        \\pushq %r13
+        \\pushq %r14
+        \\pushq %r15
         \\
-        \\movq 64(%rsp), %rdi
-        \\movq %rbx, %rsi
-        \\movq 48(%rsp), %rdx
-        \\movq 72(%rsp), %rcx
-        \\movq 24(%rsp), %r8
+        \\movq 112(%rsp), %rdi
+        \\movq 40(%rsp), %rsi
+        \\movq 96(%rsp), %rdx
+        \\movq 120(%rsp), %rcx
+        \\movq 72(%rsp), %r8
+        \\
+        \\pushq %rbp
+        \\movq %rsp, %rbp
+        \\andq $-16, %rsp
+        \\subq $512, %rsp
+        \\fxsave64 (%rsp)
         \\callq userModeSyscallBridge
+        \\fxrstor64 (%rsp)
+        \\movq %rbp, %rsp
+        \\popq %rbp
         \\
+        \\popq %r15
+        \\popq %r14
+        \\popq %r13
+        \\popq %r12
+        \\popq %rbp
+        \\popq %rbx
         \\popq %r11
         \\popq %r10
         \\popq %r9
@@ -939,11 +984,13 @@ pub export fn syscallIsr() callconv(.naked) void {
         \\popq %rcx
         \\addq $8, %rsp
         \\
-        \\movl $0x23, %ecx
+        \\pushq %rcx
+        \\movw $0x23, %cx
         \\movw %cx, %ds
         \\movw %cx, %es
         \\movw %cx, %fs
         \\movw %cx, %gs
+        \\popq %rcx
         \\
         \\iretq
     );
