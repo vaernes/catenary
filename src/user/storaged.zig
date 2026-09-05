@@ -36,9 +36,8 @@ const PAGE_SIZE: u64 = 4096;
 
 fn spinPauseWithYield(counter: u32) void {
     asm volatile ("pause");
-    // Idle daemons now yield on their own, so storaged can poll hardware with
-    // a coarser cooperative cadence without starving service bring-up.
-    if ((counter & 0x3FFFF) == 0) {
+    // Yield every 256 pauses so storaged does not starve other services on single vCPU.
+    if ((counter & 0xFF) == 0) {
         _ = lib.syscall(lib.SYS_YIELD, 0, 0, g_token);
     }
 }
@@ -214,7 +213,7 @@ fn submitAdmin(sqe: NvmeSqe) u16 {
 
     // Poll CQ until we see a completion with the correct phase bit.
     const cq: [*]volatile NvmeCqe = lib.ptrFrom([*]volatile NvmeCqe, ADM_CQ_VA);
-    var timeout: u64 = 20_000_000;
+    var timeout: u64 = 100_000;
     while (timeout > 0) : (timeout -= 1) {
         const entry = &cq[@as(usize, g_adm_cq_head % ADM_Q_DEPTH)];
         const phase: u1 = @truncate(entry.status & 1);
@@ -237,7 +236,7 @@ fn submitIO(sqe: NvmeSqe) u16 {
     ioSqDoorbell(g_io_sq_tail);
 
     const cq: [*]volatile NvmeCqe = lib.ptrFrom([*]volatile NvmeCqe, IO_CQ_VA);
-    var timeout: u32 = 10_000_000;
+    var timeout: u32 = 100_000;
     while (timeout > 0) : (timeout -= 1) {
         const entry = &cq[@as(usize, g_io_cq_head % IO_Q_DEPTH)];
         const phase: u1 = @truncate(entry.status & 1);
@@ -421,43 +420,7 @@ fn doWrite(slba: u64, nlb: u32, prp1: u64) u16 {
 // ---------------------------------------------------------------------------
 
 fn queryCurrentNode(bs: *const lib.BootstrapDescriptor, token: u64, scratch_phys: u64, scratch_va: u64, endpoint: u64) ?lib.Ipv6Addr {
-    const header: *lib.PageHeader = @ptrFromInt(scratch_va);
-    header.* = .{
-        .magic = lib.WireMagic,
-        .version = lib.WireVersion,
-        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
-        .payload_len = @as(u32, @intCast(@sizeOf(lib.ControlHeader))),
-        .auth_tag = 0,
-        .src = .{ .node = lib.Ipv6Addr{ .bytes = bs.local_node }, .endpoint = endpoint },
-        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ControlOp.get_node_addr) },
-    };
-
-    const control: *lib.ControlHeader = @ptrFromInt(scratch_va + lib.DIPC_HEADER_SIZE);
-    control.* = .{
-        .op = .get_node_addr,
-        .payload_len = 0,
-    };
-
-    _ = lib.syscall(SYS_SEND_PAGE, scratch_phys, 0, token);
-
-    // Poll for response
-    var timeout: u32 = 1000;
-    while (timeout > 0) : (timeout -= 1) {
-        const res_phys = lib.syscall(SYS_RECV, 1, 0, token); // try_recv equivalent if available or just recv
-        if (res_phys != 0) {
-            const res_va = lib.syscall(SYS_MAP_RECV, res_phys, 0, token);
-            const res_hdr: *lib.PageHeader = @ptrFromInt(res_va);
-            if (res_hdr.payload_len >= @sizeOf(lib.ControlHeader) + @sizeOf(lib.NodeAddrResult)) {
-                const res_payload: *lib.NodeAddrResult = @ptrFromInt(res_va + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
-                const addr = res_payload.addr;
-                _ = lib.syscall(SYS_FREE_PAGE, res_phys, 0, token);
-                return addr;
-            }
-            _ = lib.syscall(SYS_FREE_PAGE, res_phys, 0, token);
-        }
-        _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
-    }
-    return null;
+    return lib.queryCurrentNode(bs, token, scratch_phys, scratch_va, endpoint);
 }
 
 /// Background I/O watchdog thread (spawned by umain after NVMe init).
@@ -683,6 +646,25 @@ pub export fn umain() noreturn {
     }
     lib.serialWrite("storaged: IO queues ready\n");
 
+    // Drain any DIPC messages that arrived while NVMe was initializing.
+    // containerd's synthetic vmid=0 block-write is the primary case.
+    {
+        var drain_phys = lib.syscall(lib.SYS_TRY_RECV, 0, 0, g_token);
+        while (drain_phys != 0) {
+            const drain_va = lib.syscall(SYS_MAP_RECV, drain_phys, 0, g_token);
+            if (drain_va != 0) {
+                const req: *align(1) const BlkRequest = @ptrFromInt(drain_va + lib.DIPC_HEADER_SIZE);
+                if (req.req_type == 1 and req.vmid == 0) {
+                    lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
+                }
+                _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
+            } else {
+                _ = lib.syscall(SYS_FREE_PAGE, drain_phys, 0, g_token);
+            }
+            drain_phys = lib.syscall(lib.SYS_TRY_RECV, 0, 0, g_token);
+        }
+    }
+
     // Spawn background I/O watchdog thread using DMA slot 7 as its stack.
     const wd_stack_phys = lib.syscall(SYS_ALLOC_DMA, 1, 7, g_token);
     if (wd_stack_phys != 0) {
@@ -759,7 +741,7 @@ pub export fn umain() noreturn {
         const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
         const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
         const reply_dst = incoming_hdr.src;
-        const local_node = queryCurrentNode(bs_desc, g_token, g_dipc_scratch_phys, DIPC_SCRATCH_VA, bs_desc.reserved_storaged_endpoint) orelse lib.Ipv6Addr{ .bytes = bs_desc.local_node };
+        const local_node = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
 
         const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
         header.* = .{

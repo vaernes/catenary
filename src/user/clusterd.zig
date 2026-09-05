@@ -415,9 +415,9 @@ fn maybeRequestRemoteLaunch(
             }
         }
         if (!has_remote_peers) {
-            // Wait a short window (8 ticks = 40 main-loop iters) for peer
+            // Wait a short window (3 ticks = 15 main-loop iters) for peer
             // discovery before falling back to a local MicroVM launch.
-            if (g_discovery_ticks < 8) {
+            if (g_discovery_ticks < 3) {
                 g_discovery_ticks += 1;
                 return;
             }
@@ -511,7 +511,11 @@ fn handleNetdProtocol(
             const req = netd_proto.PeerSnapshotRequest{};
             _ = sendNetdMessage(scratch_phys, scratch_va, token, .peer_snapshot_request, std.mem.asBytes(&req));
             g_netd_peer_snapshot_sent = true;
-            maybeRequestRemoteLaunch(bs, scratch_phys, scratch_va, token);
+            // Fast-path single-node boot: if no remote peers are known at the
+            // time we get our own address, try local launch immediately.
+            // If remote peers later respond, g_remote_launch_complete will
+            // prevent a duplicate launch.
+            maybeRequestLocalLaunch(bs, scratch_phys, scratch_va, token);
         },
         .peer_snapshot_reply => {
             if (msg_payload_len != @sizeOf(netd_proto.PeerSnapshotReply)) return;
@@ -706,7 +710,9 @@ pub export fn umain() noreturn {
         while (true) asm volatile ("pause");
     }
 
-    g_local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    // Initialize to loopback so isLoopback() guards fire correctly until we
+    // receive a real link-local address via node_addr_reply from netd.
+    g_local_node = lib.Ipv6Addr.loopback();
     seedLocalResources();
 
     // Send initial query to netd immediately

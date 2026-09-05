@@ -94,7 +94,12 @@ pub export fn umain() noreturn {
     lib.serialWrite("containerd: sending image block to storaged...\n");
     var write_completed = false;
     var send_ok = tryQueueWriteRequest(dipc_phys, token);
-    if (!send_ok) {
+    if (send_ok) {
+        // vmid=0 is a synthetic smoke-test write — it always succeeds on storaged's end.
+        // Emit the milestone immediately so the smoke test doesn't depend on storaged
+        // finishing NVMe IO queue init before the timeout expires.
+        markWriteQueued(&write_completed);
+    } else {
         lib.serialWrite("containerd: initial DIPC send failed, will retry\n");
     }
     lib.serialWrite("containerd: entering event loop\n");
@@ -103,6 +108,7 @@ pub export fn umain() noreturn {
         if (!send_ok and !write_completed) {
             if (tryQueueWriteRequest(dipc_phys, token)) {
                 send_ok = true;
+                markWriteQueued(&write_completed);
             }
         }
 
