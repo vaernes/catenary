@@ -44,6 +44,46 @@ pub const Op = enum(u16) {
     /// Reply to peer_snapshot_request.
     /// Payload: PeerSnapshotReply.
     peer_snapshot_reply = 8,
+
+    /// Request netd to start listening for TCP connections on a port.
+    /// Payload: TcpListenPayload. Reply op: tcp_listen_ack.
+    tcp_listen = 9,
+
+    /// Acknowledge a tcp_listen request.
+    /// Payload: TcpListenAckPayload.
+    tcp_listen_ack = 10,
+
+    /// Initiate an active TCP connection to a remote IPv6 node/port.
+    /// Payload: TcpConnectPayload. Reply op: tcp_connect_ack.
+    tcp_connect = 11,
+
+    /// Acknowledge an active TCP connection attempt.
+    /// Payload: TcpConnectAckPayload.
+    tcp_connect_ack = 12,
+
+    /// Transmit TCP data on an established connection.
+    /// Payload: TcpSendPayload followed by data bytes.
+    tcp_send = 13,
+
+    /// Receive TCP data delivered from netd to the owning endpoint.
+    /// Payload: TcpRecvPayload followed by data bytes.
+    tcp_recv = 14,
+
+    /// Request closing of a TCP socket.
+    /// Payload: TcpClosePayload.
+    tcp_close = 15,
+
+    /// Notification that a TCP socket was closed by peer or teardown completed.
+    /// Payload: TcpClosedPayload.
+    tcp_closed = 16,
+
+    /// Query TCP socket status.
+    /// Payload: TcpStatusPayload. Reply op: tcp_status_reply.
+    tcp_status = 17,
+
+    /// Reply with TCP socket status.
+    /// Payload: TcpStatusReplyPayload.
+    tcp_status_reply = 18,
 };
 
 /// Header prepended to every netd DIPC message (after the PageHeader).
@@ -129,3 +169,94 @@ pub const PeerSnapshotReply = extern struct {
         .mac = [_]u8{0} ** 6,
     }} ** MAX_PEER_SNAPSHOT_ENTRIES,
 };
+
+// ---------------------------------------------------------------------------
+// TCP socket management (ops: tcp_listen through tcp_status_reply)
+// ---------------------------------------------------------------------------
+
+/// Op.tcp_listen — request netd to start listening for TCP connections on a port.
+pub const TcpListenPayload = extern struct {
+    port: u16,
+    _pad: u16 = 0,
+    backlog: u32 = 4,
+};
+
+/// Backward-compatible alias for TcpListenPayload.
+pub const TcpListenRequest = extern struct {
+    port: u16,
+    _pad: u16 = 0,
+    notify_endpoint: u64 = 0,
+};
+
+/// Op.tcp_listen_ack — acknowledgement from netd for a tcp_listen request.
+pub const TcpListenAckPayload = extern struct {
+    port: u16,
+    status: u16, // 0 = ok, 1 = error/in-use, 2 = no capacity
+    socket_id: u32,
+};
+
+/// Backward-compatible alias for TcpListenAckPayload.
+pub const TcpListenAck = extern struct {
+    port: u16,
+    status: u8,
+    _pad: u8 = 0,
+};
+
+/// Op.tcp_connect — request netd to establish a TCP connection to a remote IPv6 peer.
+pub const TcpConnectPayload = extern struct {
+    remote_ip: [16]u8,
+    remote_port: u16,
+    local_port: u16 = 0, // 0 = auto ephemeral
+};
+
+/// Op.tcp_connect_ack — response to a tcp_connect request.
+pub const TcpConnectAckPayload = extern struct {
+    socket_id: u32,
+    status: u16, // 0 = success, 1 = refused, 2 = timeout
+    local_port: u16,
+};
+
+/// Op.tcp_send — transmit TCP payload data over an established connection.
+/// The raw payload bytes follow immediately after this struct in the page.
+pub const TcpSendPayload = extern struct {
+    socket_id: u32,
+    data_len: u16,
+    _pad: u16 = 0,
+};
+
+/// Op.tcp_recv — received TCP data delivered to the socket owner.
+/// The raw payload bytes follow immediately after this struct in the page.
+pub const TcpRecvPayload = extern struct {
+    socket_id: u32,
+    data_len: u16,
+    _pad: u16 = 0,
+};
+
+/// Op.tcp_close — request graceful or immediate teardown of a TCP socket.
+pub const TcpClosePayload = extern struct {
+    socket_id: u32,
+};
+
+/// Op.tcp_closed — notification that a TCP connection is closed.
+pub const TcpClosedPayload = extern struct {
+    socket_id: u32,
+    reason: u16, // 0 = clean FIN close, 1 = RST, 2 = timeout
+    _pad: u16 = 0,
+};
+
+/// Op.tcp_status — query the state of a TCP socket.
+pub const TcpStatusPayload = extern struct {
+    socket_id: u32,
+};
+
+/// Op.tcp_status_reply — status reply for a TCP socket.
+pub const TcpStatusReplyPayload = extern struct {
+    socket_id: u32,
+    state: u8,
+    _pad: [3]u8 = [_]u8{0} ** 3,
+    local_port: u16,
+    remote_port: u16,
+    remote_ip: [16]u8 = [_]u8{0} ** 16,
+    rx_buffered: u32 = 0,
+};
+

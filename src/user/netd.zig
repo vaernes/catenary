@@ -5,6 +5,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const netd_proto = @import("protocols/netd_protocol.zig");
+const tcp = @import("protocols/tcp.zig");
 
 // ---------------------------------------------------------------------------
 // Low-level I/O helpers
@@ -278,7 +279,7 @@ fn isLinkLocalIpv6(addr: *const [16]u8) bool {
 }
 
 fn isLocalNode(addr: *const [16]u8) bool {
-    return ipv6Eq(addr, &g_our_ipv6) or isLoopbackIpv6(addr);
+    return ipv6Eq(addr, &g_our_ipv6) or isLoopbackIpv6(addr) or isUnspecifiedIpv6(addr);
 }
 
 fn isZeroMac(mac: *const [6]u8) bool {
@@ -621,6 +622,29 @@ fn handleLocalNetdMessage(page_hdr: *align(1) const lib.PageHeader, recv_va: u64
             sendPeerSnapshotReply(&page_hdr.src.node.bytes, page_hdr.src.endpoint);
         },
         .node_addr_reply, .peer_snapshot_reply => {},
+        .tcp_listen => {
+            if (msg_payload_len >= 2) {
+                const port = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(@alignCast(@as([*]const u8, @ptrFromInt(msg_payload_va))[0..2]))), .native);
+                handleTcpListen(page_hdr, port);
+            }
+        },
+        .tcp_listen_ack => {},
+        .tcp_connect => {
+            handleTcpConnect(page_hdr, msg_payload_va, msg_payload_len);
+        },
+        .tcp_connect_ack => {},
+        .tcp_send => {
+            handleTcpSend(page_hdr, msg_payload_va, msg_payload_len);
+        },
+        .tcp_recv => {},
+        .tcp_close => {
+            handleTcpClose(page_hdr, msg_payload_va, msg_payload_len);
+        },
+        .tcp_closed => {},
+        .tcp_status => {
+            handleTcpStatus(page_hdr, msg_payload_va, msg_payload_len);
+        },
+        .tcp_status_reply => {},
     }
 }
 
@@ -711,6 +735,9 @@ fn txFrame(frame: []const u8) void {
 
 fn be16(b: []const u8) u16 {
     return (@as(u16, b[0]) << 8) | b[1];
+}
+fn be32(b: []const u8) u32 {
+    return (@as(u32, b[0]) << 24) | (@as(u32, b[1]) << 16) | (@as(u32, b[2]) << 8) | b[3];
 }
 fn put_be16(b: []u8, v: u16) void {
     b[0] = @as(u8, @truncate(v >> 8));
@@ -933,6 +960,602 @@ fn publishKernelNodeAddress(bs: *const BootstrapDescriptor, token: u64) bool {
 }
 
 // ---------------------------------------------------------------------------
+// TCP state machine & connection management
+// ---------------------------------------------------------------------------
+
+pub const TCP_MAX_SOCKETS: usize = 16;
+
+pub const Socket = struct {
+    id: u32 = 0,
+    in_use: bool = false,
+    state: tcp.State = .closed,
+    local_port: u16 = 0,
+    remote_port: u16 = 0,
+    remote_ip: [16]u8 = [_]u8{0} ** 16,
+    remote_mac: [6]u8 = [_]u8{0} ** 6,
+    iss: u32 = 0,
+    snd_una: u32 = 0,
+    snd_nxt: u32 = 0,
+    snd_wnd: u16 = tcp.DEFAULT_WINDOW_SIZE,
+    irs: u32 = 0,
+    rcv_nxt: u32 = 0,
+    rcv_wnd: u16 = tcp.DEFAULT_WINDOW_SIZE,
+    owner_endpoint: u64 = 0,
+    owner_node: [16]u8 = [_]u8{0} ** 16,
+    rx_buf: [2048]u8 = [_]u8{0} ** 2048,
+    rx_len: usize = 0,
+};
+
+var g_tcp_sockets: [TCP_MAX_SOCKETS]Socket = [_]Socket{.{}} ** TCP_MAX_SOCKETS;
+var g_tcp_next_id: u32 = 1;
+var g_tcp_ephemeral_port: u16 = 49152;
+var g_isn_seed: u32 = 0x51A7_8C3D;
+var g_tcp_tx_frame: [1514]u8 = undefined;
+
+fn nextIsn() u32 {
+    g_isn_seed ^= g_isn_seed << 13;
+    g_isn_seed ^= g_isn_seed >> 17;
+    g_isn_seed ^= g_isn_seed << 5;
+    return g_isn_seed;
+}
+
+fn allocEphemeralPort() u16 {
+    const p = g_tcp_ephemeral_port;
+    g_tcp_ephemeral_port = if (g_tcp_ephemeral_port >= 65000) 49152 else g_tcp_ephemeral_port + 1;
+    return p;
+}
+
+fn initTcpStack() void {
+    for (&g_tcp_sockets) |*s| {
+        s.* = Socket{};
+    }
+}
+
+fn findTcpSocketById(id: u32) ?*Socket {
+    if (id == 0) return null;
+    for (&g_tcp_sockets) |*s| {
+        if (s.in_use and s.id == id) return s;
+    }
+    return null;
+}
+
+fn findTcpListener(local_port: u16) ?*Socket {
+    for (&g_tcp_sockets) |*s| {
+        if (s.in_use and s.state == .listen and s.local_port == local_port) return s;
+    }
+    return null;
+}
+
+fn findTcpConnection(local_port: u16, remote_port: u16, remote_ip: *const [16]u8) ?*Socket {
+    for (&g_tcp_sockets) |*s| {
+        if (s.in_use and s.state != .listen and s.local_port == local_port and s.remote_port == remote_port and
+            ipv6Eq(&s.remote_ip, remote_ip))
+        {
+            return s;
+        }
+    }
+    return null;
+}
+
+fn allocTcpSocket() ?*Socket {
+    for (&g_tcp_sockets) |*s| {
+        if (!s.in_use or s.state == .closed) {
+            s.* = Socket{};
+            s.id = g_tcp_next_id;
+            g_tcp_next_id +%= 1;
+            if (g_tcp_next_id == 0) g_tcp_next_id = 1;
+            s.in_use = true;
+            return s;
+        }
+    }
+    return null;
+}
+
+fn sendTcpSegment(
+    dst_mac: *const [6]u8,
+    dst_ip: *const [16]u8,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: []const u8,
+) void {
+    const total_tcp_len = tcp.TCP_HEADER_MIN_SIZE + payload.len;
+    const total_eth_len = 14 + 40 + total_tcp_len;
+    if (total_eth_len > g_tcp_tx_frame.len) return;
+
+    const frame = g_tcp_tx_frame[0..total_eth_len];
+
+    var target_mac: [6]u8 = dst_mac.*;
+    if (isZeroMac(&target_mac)) {
+        if (lookupNeighbor(dst_ip)) |cached_mac| {
+            target_mac = cached_mac;
+        } else {
+            target_mac = [_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
+        }
+    }
+
+    // Ethernet header
+    @memcpy(frame[0..6], &target_mac);
+    @memcpy(frame[6..12], &g_our_mac);
+    frame[12] = 0x86;
+    frame[13] = 0xDD;
+
+    // IPv6 header
+    frame[14] = 0x60;
+    frame[15] = 0;
+    frame[16] = 0;
+    frame[17] = 0;
+    put_be16(frame[18..20], @as(u16, @intCast(total_tcp_len)));
+    frame[20] = tcp.TCP_PROTOCOL_NUMBER;
+    frame[21] = 64;
+    @memcpy(frame[22..38], &g_our_ipv6);
+    @memcpy(frame[38..54], dst_ip);
+
+    // TCP header (20 bytes)
+    put_be16(frame[54..56], src_port);
+    put_be16(frame[56..58], dst_port);
+    put_be32(frame[58..62], seq);
+    put_be32(frame[62..66], ack);
+    frame[66] = (5 << 4); // Data offset = 5 words (20 bytes)
+    frame[67] = flags;
+    put_be16(frame[68..70], window);
+    put_be16(frame[70..72], 0); // Checksum placeholder
+    put_be16(frame[72..74], 0); // Urgent pointer
+
+    // Payload
+    if (payload.len > 0) {
+        @memcpy(frame[74 .. 74 + payload.len], payload);
+    }
+
+    // Checksum
+    const cksum = tcp.computeChecksum(&g_our_ipv6, dst_ip, frame[54..total_eth_len]);
+    put_be16(frame[70..72], cksum);
+
+    txFrame(frame);
+}
+
+fn sendTcpRst(
+    dst_mac: *const [6]u8,
+    dst_ip: *const [16]u8,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+) void {
+    sendTcpSegment(dst_mac, dst_ip, src_port, dst_port, seq, ack, flags, 0, &[_]u8{});
+}
+
+fn sendTcpConnectAckToOwner(sock: *Socket, status: u16) void {
+    if (sock.owner_endpoint == 0) return;
+    const reply = netd_proto.TcpConnectAckPayload{
+        .socket_id = sock.id,
+        .status = status,
+        .local_port = sock.local_port,
+    };
+    _ = sendNetdMessage(&sock.owner_node, sock.owner_endpoint, .tcp_connect_ack, std.mem.asBytes(&reply));
+}
+
+fn sendTcpRecvToOwner(sock: *Socket, data: []const u8) void {
+    if (sock.owner_endpoint == 0 or g_control_outbox_phys == 0) return;
+    const total_len = @sizeOf(netd_proto.TcpRecvPayload) + data.len;
+    if (total_len > 1024) return;
+
+    var buf: [1024]u8 = undefined;
+    const payload: *align(1) netd_proto.TcpRecvPayload = @ptrCast(&buf);
+    payload.* = .{
+        .socket_id = sock.id,
+        .data_len = @as(u16, @intCast(data.len)),
+        ._pad = 0,
+    };
+    @memcpy(buf[@sizeOf(netd_proto.TcpRecvPayload) .. total_len], data);
+    _ = sendNetdMessage(&sock.owner_node, sock.owner_endpoint, .tcp_recv, buf[0..total_len]);
+}
+
+fn sendTcpClosedToOwner(sock: *Socket, reason: u16) void {
+    if (sock.owner_endpoint == 0) return;
+    const payload = netd_proto.TcpClosedPayload{
+        .socket_id = sock.id,
+        .reason = reason,
+        ._pad = 0,
+    };
+    _ = sendNetdMessage(&sock.owner_node, sock.owner_endpoint, .tcp_closed, std.mem.asBytes(&payload));
+}
+
+fn handleTcpListen(page_hdr: *align(1) const lib.PageHeader, port: u16) void {
+    lib.serialWrite("netd: TCP listen on port ");
+    printDec(port);
+    lib.serialWrite(" acknowledged\n");
+
+    var ack = netd_proto.TcpListenAckPayload{
+        .port = port,
+        .status = 0,
+        .socket_id = 0,
+    };
+
+    if (findTcpListener(port)) |existing| {
+        ack.status = 1; // already in use
+        ack.socket_id = existing.id;
+    } else {
+        if (allocTcpSocket()) |sock| {
+            sock.state = .listen;
+            sock.local_port = port;
+            sock.owner_endpoint = page_hdr.src.endpoint;
+            @memcpy(&sock.owner_node, &page_hdr.src.node.bytes);
+            ack.status = 0;
+            ack.socket_id = sock.id;
+        } else {
+            ack.status = 2; // table full
+        }
+    }
+
+    _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_listen_ack, std.mem.asBytes(&ack));
+}
+
+fn handleTcpConnect(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    if (payload_len < @sizeOf(netd_proto.TcpConnectPayload)) return;
+    const req: *align(1) const netd_proto.TcpConnectPayload = @ptrFromInt(payload_va);
+
+    var ack = netd_proto.TcpConnectAckPayload{
+        .socket_id = 0,
+        .status = 1,
+        .local_port = 0,
+    };
+
+    const sock = allocTcpSocket() orelse {
+        ack.status = 2; // table full
+        _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_connect_ack, std.mem.asBytes(&ack));
+        return;
+    };
+
+    const lport = if (req.local_port != 0) req.local_port else allocEphemeralPort();
+    sock.state = .syn_sent;
+    sock.local_port = lport;
+    sock.remote_port = req.remote_port;
+    @memcpy(&sock.remote_ip, &req.remote_ip);
+    sock.owner_endpoint = page_hdr.src.endpoint;
+    @memcpy(&sock.owner_node, &page_hdr.src.node.bytes);
+
+    sock.iss = nextIsn();
+    sock.snd_nxt = sock.iss +% 1;
+    sock.snd_una = sock.iss;
+    sock.rcv_nxt = 0;
+    sock.snd_wnd = tcp.DEFAULT_WINDOW_SIZE;
+    sock.rcv_wnd = tcp.DEFAULT_WINDOW_SIZE;
+
+    if (lookupNeighbor(&sock.remote_ip)) |mac| {
+        @memcpy(&sock.remote_mac, &mac);
+    } else {
+        @memcpy(&sock.remote_mac, &[_]u8{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 });
+    }
+
+    ack.socket_id = sock.id;
+    ack.status = 0;
+    ack.local_port = lport;
+
+    sendTcpSegment(
+        &sock.remote_mac,
+        &sock.remote_ip,
+        sock.local_port,
+        sock.remote_port,
+        sock.iss,
+        0,
+        tcp.Flags.SYN,
+        sock.rcv_wnd,
+        &[_]u8{},
+    );
+
+    _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_connect_ack, std.mem.asBytes(&ack));
+}
+
+fn handleTcpSend(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    _ = page_hdr;
+    if (payload_len < @sizeOf(netd_proto.TcpSendPayload)) return;
+    const req: *align(1) const netd_proto.TcpSendPayload = @ptrFromInt(payload_va);
+    const data_len = @as(usize, req.data_len);
+    const data_offset = payload_va + @sizeOf(netd_proto.TcpSendPayload);
+    if (@sizeOf(netd_proto.TcpSendPayload) + data_len > payload_len) return;
+    const data: [*]const u8 = @ptrFromInt(data_offset);
+
+    const sock = findTcpSocketById(req.socket_id) orelse return;
+    if (sock.state != .established and sock.state != .close_wait) return;
+
+    sendTcpSegment(
+        &sock.remote_mac,
+        &sock.remote_ip,
+        sock.local_port,
+        sock.remote_port,
+        sock.snd_nxt,
+        sock.rcv_nxt,
+        tcp.Flags.ACK | tcp.Flags.PSH,
+        sock.rcv_wnd,
+        data[0..data_len],
+    );
+    sock.snd_nxt +%= @as(u32, @intCast(data_len));
+}
+
+fn handleTcpClose(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    _ = page_hdr;
+    if (payload_len < @sizeOf(netd_proto.TcpClosePayload)) return;
+    const req: *align(1) const netd_proto.TcpClosePayload = @ptrFromInt(payload_va);
+
+    const sock = findTcpSocketById(req.socket_id) orelse return;
+
+    if (sock.state == .established) {
+        sendTcpSegment(
+            &sock.remote_mac,
+            &sock.remote_ip,
+            sock.local_port,
+            sock.remote_port,
+            sock.snd_nxt,
+            sock.rcv_nxt,
+            tcp.Flags.FIN | tcp.Flags.ACK,
+            sock.rcv_wnd,
+            &[_]u8{},
+        );
+        sock.snd_nxt +%= 1;
+        sock.state = .fin_wait_1;
+    } else if (sock.state == .close_wait) {
+        sendTcpSegment(
+            &sock.remote_mac,
+            &sock.remote_ip,
+            sock.local_port,
+            sock.remote_port,
+            sock.snd_nxt,
+            sock.rcv_nxt,
+            tcp.Flags.FIN | tcp.Flags.ACK,
+            sock.rcv_wnd,
+            &[_]u8{},
+        );
+        sock.snd_nxt +%= 1;
+        sock.state = .last_ack;
+    } else {
+        sock.state = .closed;
+        sock.in_use = false;
+    }
+}
+
+fn handleTcpStatus(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    if (payload_len < @sizeOf(netd_proto.TcpStatusPayload)) return;
+    const req: *align(1) const netd_proto.TcpStatusPayload = @ptrFromInt(payload_va);
+
+    var reply = netd_proto.TcpStatusReplyPayload{
+        .socket_id = req.socket_id,
+        .state = 0,
+        .local_port = 0,
+        .remote_port = 0,
+        .remote_ip = [_]u8{0} ** 16,
+        .rx_buffered = 0,
+    };
+
+    if (findTcpSocketById(req.socket_id)) |sock| {
+        reply.state = @intFromEnum(sock.state);
+        reply.local_port = sock.local_port;
+        reply.remote_port = sock.remote_port;
+        @memcpy(&reply.remote_ip, &sock.remote_ip);
+        reply.rx_buffered = @as(u32, @intCast(sock.rx_len));
+    }
+
+    _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_status_reply, std.mem.asBytes(&reply));
+}
+
+fn handleTcpFrame(f: []const u8, frame_len: usize, token: u64) void {
+    _ = token;
+    if (frame_len < 54 + tcp.TCP_HEADER_MIN_SIZE) return;
+
+    const src_mac = f[6..12][0..6];
+    const src_ip = f[22..38][0..16];
+    const dst_ip = f[38..54][0..16];
+
+    if (!ipv6Eq(dst_ip, &g_our_ipv6) and !isLoopbackIpv6(dst_ip)) return;
+
+    const src_port = be16(f[54..56]);
+    const dst_port = be16(f[56..58]);
+    const seq_num = be32(f[58..62]);
+    const ack_num = be32(f[62..66]);
+    const data_offset_words: u8 = (f[66] >> 4) & 0x0F;
+    const tcp_hdr_len: usize = @as(usize, data_offset_words) * 4;
+    if (tcp_hdr_len < 20 or frame_len < 54 + tcp_hdr_len) return;
+    const flags = f[67];
+    const window = be16(f[68..70]);
+    const payload = f[54 + tcp_hdr_len .. frame_len];
+
+    learnNeighbor(src_ip, src_mac);
+
+    if (findTcpConnection(dst_port, src_port, src_ip)) |sock| {
+        @memcpy(&sock.remote_mac, src_mac);
+        sock.snd_wnd = window;
+
+        if (flags & tcp.Flags.RST != 0) {
+            sock.state = .closed;
+            sock.in_use = false;
+            sendTcpClosedToOwner(sock, 1);
+            return;
+        }
+
+        switch (sock.state) {
+            .syn_sent => {
+                if ((flags & (tcp.Flags.SYN | tcp.Flags.ACK)) == (tcp.Flags.SYN | tcp.Flags.ACK)) {
+                    sock.irs = seq_num;
+                    sock.rcv_nxt = seq_num +% 1;
+                    sock.snd_una = ack_num;
+                    sock.state = .established;
+                    sendTcpSegment(
+                        &sock.remote_mac,
+                        &sock.remote_ip,
+                        sock.local_port,
+                        sock.remote_port,
+                        sock.snd_nxt,
+                        sock.rcv_nxt,
+                        tcp.Flags.ACK,
+                        sock.rcv_wnd,
+                        &[_]u8{},
+                    );
+                    sendTcpConnectAckToOwner(sock, 0);
+                }
+            },
+            .syn_received => {
+                if (flags & tcp.Flags.ACK != 0) {
+                    sock.snd_una = ack_num;
+                    sock.state = .established;
+                }
+            },
+            .established => {
+                if (flags & tcp.Flags.ACK != 0) {
+                    sock.snd_una = ack_num;
+                }
+                if (payload.len > 0 and seq_num == sock.rcv_nxt) {
+                    sock.rcv_nxt +%= @as(u32, @intCast(payload.len));
+                    const copy_len = @min(payload.len, sock.rx_buf.len - sock.rx_len);
+                    if (copy_len > 0) {
+                        @memcpy(sock.rx_buf[sock.rx_len .. sock.rx_len + copy_len], payload[0..copy_len]);
+                        sock.rx_len += copy_len;
+                    }
+                    sendTcpSegment(
+                        &sock.remote_mac,
+                        &sock.remote_ip,
+                        sock.local_port,
+                        sock.remote_port,
+                        sock.snd_nxt,
+                        sock.rcv_nxt,
+                        tcp.Flags.ACK,
+                        sock.rcv_wnd,
+                        &[_]u8{},
+                    );
+                    if (sock.owner_endpoint != 0 and copy_len > 0) {
+                        sendTcpRecvToOwner(sock, payload[0..copy_len]);
+                    }
+                }
+                if (flags & tcp.Flags.FIN != 0) {
+                    sock.rcv_nxt +%= 1;
+                    sock.state = .close_wait;
+                    sendTcpSegment(
+                        &sock.remote_mac,
+                        &sock.remote_ip,
+                        sock.local_port,
+                        sock.remote_port,
+                        sock.snd_nxt,
+                        sock.rcv_nxt,
+                        tcp.Flags.ACK,
+                        sock.rcv_wnd,
+                        &[_]u8{},
+                    );
+                    sendTcpClosedToOwner(sock, 0);
+                    sock.state = .last_ack;
+                    sendTcpSegment(
+                        &sock.remote_mac,
+                        &sock.remote_ip,
+                        sock.local_port,
+                        sock.remote_port,
+                        sock.snd_nxt,
+                        sock.rcv_nxt,
+                        tcp.Flags.FIN | tcp.Flags.ACK,
+                        sock.rcv_wnd,
+                        &[_]u8{},
+                    );
+                    sock.snd_nxt +%= 1;
+                }
+            },
+            .fin_wait_1 => {
+                if (flags & tcp.Flags.ACK != 0 and ack_num == sock.snd_nxt) {
+                    sock.state = .fin_wait_2;
+                }
+                if (flags & tcp.Flags.FIN != 0) {
+                    sock.rcv_nxt +%= 1;
+                    sendTcpSegment(
+                        &sock.remote_mac,
+                        &sock.remote_ip,
+                        sock.local_port,
+                        sock.remote_port,
+                        sock.snd_nxt,
+                        sock.rcv_nxt,
+                        tcp.Flags.ACK,
+                        sock.rcv_wnd,
+                        &[_]u8{},
+                    );
+                    sock.state = .closed;
+                    sock.in_use = false;
+                    sendTcpClosedToOwner(sock, 0);
+                }
+            },
+            .fin_wait_2 => {
+                if (flags & tcp.Flags.FIN != 0) {
+                    sock.rcv_nxt +%= 1;
+                    sendTcpSegment(
+                        &sock.remote_mac,
+                        &sock.remote_ip,
+                        sock.local_port,
+                        sock.remote_port,
+                        sock.snd_nxt,
+                        sock.rcv_nxt,
+                        tcp.Flags.ACK,
+                        sock.rcv_wnd,
+                        &[_]u8{},
+                    );
+                    sock.state = .closed;
+                    sock.in_use = false;
+                    sendTcpClosedToOwner(sock, 0);
+                }
+            },
+            .last_ack => {
+                if (flags & tcp.Flags.ACK != 0 and ack_num == sock.snd_nxt) {
+                    sock.state = .closed;
+                    sock.in_use = false;
+                }
+            },
+            .close_wait, .time_wait, .closed, .listen => {},
+        }
+        return;
+    }
+
+    if (findTcpListener(dst_port)) |listener| {
+        if (flags & tcp.Flags.RST != 0) return;
+
+        if (flags & tcp.Flags.SYN != 0 and flags & tcp.Flags.ACK == 0) {
+            const new_sock = allocTcpSocket() orelse return;
+            new_sock.state = .syn_received;
+            new_sock.local_port = dst_port;
+            new_sock.remote_port = src_port;
+            @memcpy(&new_sock.remote_ip, src_ip);
+            @memcpy(&new_sock.remote_mac, src_mac);
+            new_sock.owner_endpoint = listener.owner_endpoint;
+            @memcpy(&new_sock.owner_node, &listener.owner_node);
+
+            new_sock.irs = seq_num;
+            new_sock.rcv_nxt = seq_num +% 1;
+            new_sock.iss = nextIsn();
+            new_sock.snd_nxt = new_sock.iss +% 1;
+            new_sock.snd_una = new_sock.iss;
+            new_sock.snd_wnd = window;
+
+            sendTcpSegment(
+                src_mac,
+                src_ip,
+                dst_port,
+                src_port,
+                new_sock.iss,
+                new_sock.rcv_nxt,
+                tcp.Flags.SYN | tcp.Flags.ACK,
+                new_sock.rcv_wnd,
+                &[_]u8{},
+            );
+        }
+        return;
+    }
+
+    if (flags & tcp.Flags.RST == 0) {
+        if (flags & tcp.Flags.ACK != 0) {
+            sendTcpRst(src_mac, src_ip, dst_port, src_port, ack_num, 0, tcp.Flags.RST);
+        } else {
+            sendTcpRst(src_mac, src_ip, dst_port, src_port, 0, seq_num +% 1, tcp.Flags.RST | tcp.Flags.ACK);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Receive packet handler
 // ---------------------------------------------------------------------------
 
@@ -1031,6 +1654,8 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
                     }
                 }
             }
+        } else if (next_hdr == 0x06 and frame_len >= 54 + tcp.TCP_HEADER_MIN_SIZE) {
+            handleTcpFrame(f[0..frame_len], frame_len, token);
         }
     }
 }
@@ -1108,6 +1733,8 @@ pub export fn umain() noreturn {
     g_kernel_control_endpoint = bs.reserved_kernel_control_endpoint;
 
     lib.serialWrite("netd: starting\n");
+    initTcpStack();
+    lib.serialWrite("netd: TCP stack initialized\n");
 
     // Scan PCI for legacy virtio-net (VID=1AF4, DID=1000).
     var found_bus: u8 = 0;
@@ -1158,12 +1785,21 @@ pub export fn umain() noreturn {
     }
 
     if (!found) {
-        lib.serialWrite("netd: no virtio-net found; entering idle loop\n");
-        _ = lib.syscall(SYS_REGISTER, 0, 0, token);
+        lib.serialWrite("netd: no virtio-net found; entering fallback loop\n");
+        const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 12, 0, token);
+        if (dma_base_phys != 0) {
+            g_dipc_scratch_phys = dma_base_phys + 9 * PAGE_SIZE;
+            g_control_outbox_phys = dma_base_phys + 10 * PAGE_SIZE;
+        }
+        seedSyntheticMac(token, &g_our_mac);
+        deriveLinkLocal(&g_our_mac, &g_our_ipv6);
+        _ = lib.syscall(SYS_REGISTER, 0, @intFromEnum(lib.ReservedEndpoint.netd), token);
         lib.serialWrite("netd: registered\n");
         while (true) {
-            _ = lib.syscall(SYS_RECV, 0, 0, token);
-            asm volatile ("pause");
+            if (!pollDipc(token)) {
+                _ = lib.syscall(SYS_YIELD, 0, 0, token);
+                asm volatile ("pause");
+            }
         }
     }
 
@@ -1197,8 +1833,8 @@ pub export fn umain() noreturn {
     _ = inl(g_io_base + VIRTIO_PCI_HOST_FEATURES);
     outl(g_io_base + VIRTIO_PCI_GUEST_FEATURES, 0);
 
-    // Allocate 12 contiguous DMA pages for all rings, frame buffers, scratch, outbox, and poller stack.
-    const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 12, 0, token);
+    // Allocate 13 contiguous DMA pages: rings(0-8), scratch(9), outbox(10), unused(11), rx-poller stack(12).
+    const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 13, 0, token);
     if (dma_base_phys == 0) {
         lib.serialWrite("netd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
@@ -1272,10 +1908,12 @@ pub export fn umain() noreturn {
     // Spawn dedicated RX poller thread
     const stack_top: u64 = DMA_BASE_VA + 12 * PAGE_SIZE;
     const tid = lib.spawnThread(&rxPollerLoop, stack_top, token);
-    if (tid != 0 and tid != 0xFFFFFFFF) {
+    if (tid != 0xFFFFFFFF) {
         lib.serialWrite("netd: rx-poller thread spawned tid=");
         printHex(tid);
         lib.serialWrite("\n");
+    } else {
+        lib.serialWrite("netd: rx-poller spawn failed\n");
     }
 
     lib.serialWrite("netd: NIC ready, entering DIPC/NIC event loop\n");
