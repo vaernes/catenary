@@ -24,6 +24,10 @@ pub const Op = enum(u16) {
     /// Forwarded cross-node telemetry sample.
     /// Payload: ClusterTelemetryUpdate.
     cluster_telemetry_update = 3,
+
+    /// Run a built-in shell command. Payload: ShellCommandRequest.
+    /// Output is written to serial. No reply.
+    shell_command = 4,
 };
 
 pub const DashdHeader = extern struct {
@@ -97,4 +101,16 @@ pub const TelemetrySummaryReply = extern struct {
         .cpu_cycles = 0,
         .exit_count = 0,
     }} ** MAX_TELEMETRY_SUMMARY_ENTRIES,
+};
+
+// ---------------------------------------------------------------------------
+// Shell command dispatch (op: shell_command)
+// ---------------------------------------------------------------------------
+
+pub const MAX_CMD_LEN: usize = 64;
+
+/// Send a built-in shell command to dashd. dashd will execute it and write
+/// the output to the serial log. Commands: "help", "ps", "net-stat", "vmlist".
+pub const ShellCommandRequest = extern struct {
+    cmd: [MAX_CMD_LEN]u8 = [_]u8{0} ** MAX_CMD_LEN,
 };
