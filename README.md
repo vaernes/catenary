@@ -36,13 +36,29 @@ The kernel is stripped to the absolute minimum. It handles only:
 - **Hardware Virtualization (Intel VT-x)** — initializing and managing hypervisor VMX state
 - **Local IPC** — asynchronous message-passing queues between processes
 
-### User Space (Ring 3)
+### User Space (Ring 3) Services
 
-Everything else lives in isolated user-space processes:
+Following the exokernel philosophy, all system abstractions, drivers, networking, and user interfaces execute as unprivileged Ring-3 daemons communicating via DIPC:
 
-- Device drivers (via securely granted DMA/IOPL)
-- The network stack
-- Catenary routing and orchestration daemons
+| Daemon | Endpoint | Role & Responsibilities |
+|--------|:--------:|-------------------------|
+| **`netd`** | 1 | Physical Virtio-Net PCI driver, IPv6 NDP, embedded TCP stack, DIPC wire router |
+| **`storaged`** | 2 | NVMe PCI controller driver, block device management, partition DMA I/O |
+| **`dashd`** | 3 | Cluster telemetry aggregation, Varde shell command execution engine |
+| **`containerd`** | 6 | OCI container engine, NVMe partition staging, image unpack validation |
+| **`clusterd`** | 7 | Dynamic node discovery, presence multicast, remote MicroVM launch orchestration |
+| **`inputd`** | 8 | PS/2 keyboard driver, keycode decoding, modifier tracking (Shift/Ctrl/Alt) |
+| **`windowd`** | 9 | Display server & TUI window manager, framebuffer rendering, widget toolkit |
+| **`configd`** | 10 | Node configuration daemon, registry synchronization across cluster nodes |
+
+### Interactive TUI & The Varde Shell
+
+Catenary OS includes an unprivileged Ring-3 display server and TUI manager (**`windowd`**) rendering directly to the Limine framebuffer. The operator interface is organized into distinct functional workspaces:
+
+- **VM Manager & Cluster Topology**: Live tracking of local and remote MicroVMs, real-time VM-exit counts, and cluster node health.
+- **MicroVM Lifecycle Forms**: Interactive creation forms to configure vCPUs, memory, and container images, with live validation and execution controls.
+- **The Varde Shell**: Named after the Norwegian mountain trail cairns (*varder*), this interactive shell (`catenary> `) provides command history, scrollback logs, and cluster inspection tools (`ps`, `vmlist`, `cluster`, `net-stat`).
+- **Brand Palette**: Styled strictly according to the [visual identity guidelines](docs/BRANDING.md) with Sea Gray (`#4A4E69`), Terracotta (`#E2725B`), Golden Yellow (`#FFC300`), and Highlight Cyan (`#5BC0EB`).
 
 ### Distributed IPC
 
@@ -92,14 +108,17 @@ See [docs/PHASE_7_ROADMAP.md](docs/PHASE_7_ROADMAP.md) for completed Phase 7 ver
 **Prerequisites:** Zig, QEMU with x86_64 support, `xorriso`, and the checked-in Limine bootloader files under `limine/`. Rebuilding the embedded guest initramfs also requires `cc`, `fakeroot`, `cpio`, and `gzip`.
 
 ```sh
-# Build the kernel
+# Build the kernel and all Ring-3 service ELFs
 zig build
 
-# Run in QEMU (serial output to stdout)
+# Run interactive graphical OS in QEMU (launches graphical display window + serial output)
 ./run_qemu.sh
 
-# Default smoke test (core boot + Ring 3 service milestones)
+# Default automated smoke test (single-node SMP, services, and MicroVM milestones)
 ./test_qemu.sh
+
+# Automated 2-node cluster orchestration test (multicast discovery & remote launch)
+./test_qemu_cluster.sh
 
 # Direct VMX/Linux validation
 SMOKE_PROFILE=vmx-linux ./test_qemu.sh
