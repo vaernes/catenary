@@ -239,3 +239,4 @@ qemu-system-x86_64 -cdrom catenary.iso -m 512M -smp 2 -enable-kvm -display gtk \
 3. [ ] Submitting the New VM form successfully provisions a running MicroVM.
 4. [ ] Varde shell accepts typed commands, supports Backspace and history recall, and prints formatted output.
 5. [ ] Bottom status bar accurately reflects available hotkeys.
+
