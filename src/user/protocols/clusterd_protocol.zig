@@ -49,6 +49,12 @@ pub const Op = enum(u16) {
     /// Reply to resource_snapshot_request.
     /// Payload: ResourceSnapshotReply.
     resource_snapshot_reply = 7,
+
+    /// Per-VM telemetry sample. Sent by the local dashd to the local clusterd
+    /// (node_addr zero), which stamps its node address and multicasts it; peer
+    /// clusterd instances forward it to their local dashd.
+    /// Payload: dashd_protocol.ClusterTelemetryUpdate.
+    telemetry_report = 8,
 };
 
 /// Header for clusterd service-to-service messages (not kernel_control messages).

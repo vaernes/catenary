@@ -9,7 +9,7 @@ set -euo pipefail
 TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
 
-ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=false"
+ZIG_BUILD_ARGS=${ZIG_BUILD_ARGS:-"-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=false"}
 
 # Rebuild
 echo "[+] Building Catenary OS..."
@@ -97,15 +97,20 @@ ok=0
 for ((i=0; i<${TIMEOUT_SECS}; i++)); do
     a_ok=0
     b_ok=0
+    telem_milestone="dashd: cluster telemetry received from remote node"
     if grep -Fq "$milestone1" qemu_serial_A.log 2>/dev/null && grep -Fq "$milestone2" qemu_serial_B.log 2>/dev/null; then
-        ok=1
-        echo "[+] PASS: Node A requested remote launch, Node B launched staged MicroVM via DIPC."
-        break
+        if grep -Fq "$telem_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$telem_milestone" qemu_serial_B.log 2>/dev/null; then
+            ok=1
+            echo "[+] PASS: Node A requested remote launch, Node B launched staged MicroVM, cross-node telemetry verified via DIPC."
+            break
+        fi
     fi
     if grep -Fq "$milestone1" qemu_serial_B.log 2>/dev/null && grep -Fq "$milestone2" qemu_serial_A.log 2>/dev/null; then
-        ok=1
-        echo "[+] PASS: Node B requested remote launch, Node A launched staged MicroVM via DIPC."
-        break
+        if grep -Fq "$telem_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$telem_milestone" qemu_serial_B.log 2>/dev/null; then
+            ok=1
+            echo "[+] PASS: Node B requested remote launch, Node A launched staged MicroVM, cross-node telemetry verified via DIPC."
+            break
+        fi
     fi
     sleep 1
 done

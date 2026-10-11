@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const cpu = @import("cpu.zig");
+const smp = @import("smp.zig");
 const gdt = @import("gdt.zig");
 const host_paging = @import("paging.zig");
 const limine = @import("../../kernel/limine.zig");
@@ -766,12 +767,16 @@ fn validateIdentityMapWindow(layout: linux_boot.LaunchLayout, kernel_span: u64, 
 }
 
 fn serialWrite(s: []const u8) void {
+    smp.serialAcquire();
+    defer smp.serialRelease();
     for (s) |c| {
         cpu.outb(0x3F8, c);
     }
 }
 
 fn printHex(n: u64) void {
+    smp.serialAcquire();
+    defer smp.serialRelease();
     const hex = "0123456789ABCDEF";
     var shift: u6 = 60;
     var i: usize = 0;
@@ -1399,6 +1404,9 @@ fn loadHostState() VmxError!void {
     try vmwriteChecked(VMCS_HOST_IDTR_BASE, vmx_host_idtr.base);
     try vmwriteChecked(VMCS_HOST_SYSENTER_ESP, cpu.rdmsr(0x175));
     try vmwriteChecked(VMCS_HOST_SYSENTER_EIP, cpu.rdmsr(0x176));
+    // vmexitStub pushes 15 registers (120 bytes) before calling into Zig, so
+    // HOST_RSP must be 8 mod 16 for the SysV ABI's 16-byte call alignment.
+    host_rsp = (host_rsp & ~@as(u64, 0xF)) - 8;
     try vmwriteChecked(VMCS_HOST_RSP, host_rsp);
     try vmwriteChecked(VMCS_HOST_RIP, @intFromPtr(&vmexitStub));
     try vmwriteChecked(VMCS_HOST_IA32_PAT, cpu.rdmsr(IA32_PAT));
@@ -2520,6 +2528,9 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
 
     drainMicrovmIngress();
 
+    // Always broadcast on exit to ensure telemetry is dispatched even for single-exit test guests
+    microvm_bridge.broadcastTelemetryFromContext();
+
     if (should_resume) {
         tryInjectTimerIrq();
         vmx_start_tsc = cpu.rdtsc();
@@ -2580,6 +2591,7 @@ fn vmexitStub() callconv(.naked) noreturn {
         \\callq catenary_vmx_vmresume_failed
         \\2:
         \\addq $120, %rsp
+        \\andq $-16, %rsp
         \\callq catenary_vmx_guest_done
     );
 }

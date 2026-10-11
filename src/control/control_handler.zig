@@ -470,7 +470,7 @@ pub fn handleKernelControlPage(
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
         .get_node_status => {
-            const logical_cpu_total: u32 = 1;
+            const logical_cpu_total: u32 = @intCast(@import("../arch/x86_64/smp.zig").getCpuCount());
             var res = control_protocol.NodeStatusResult{
                 .total_mem_pages = @intCast(pmm.getTotalPages()),
                 .free_mem_pages = @intCast(pmm.getFreePages()),

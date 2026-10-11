@@ -416,6 +416,10 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 bootLog("SECURE BOOT WARNING: No golden hash provided. Booting in permissive mode.\n");
             }
 
+            dipc.setClusterSecret(build_options.cluster_secret);
+            if (std.mem.eql(u8, build_options.cluster_secret, "catenary-dev-cluster-secret")) {
+                bootLog("SECURITY WARNING: default cluster secret in use (pass -Dcluster_secret).\n");
+            }
             dipc.setAuthKey(manifest.capability_seed ^ 0xD19C_A77E_2045_B68F);
             service_registry.init();
             if (comptime builtin.cpu.arch == .x86_64) {

@@ -683,6 +683,8 @@ pub fn schedule() void {
 /// Called from vmexitStub (on the VMX host stack) when the guest session is
 /// complete and the VMX thread should yield to other ready threads indefinitely.
 pub export fn catenary_vmx_guest_done() callconv(.c) noreturn {
+    const vmm_bridge = @import("../vmm/microvm_bridge.zig");
+    vmm_bridge.broadcastTelemetryFromContext();
     get_current_thread().state = .Waiting;
     if (comptime builtin.cpu.arch == .x86_64) {
         asm volatile ("sti");

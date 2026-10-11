@@ -72,6 +72,49 @@ pub fn setAuthKey(seed: u64) void {
     auth_key = if (seed == 0) 1 else seed;
 }
 
+/// Cluster-wide key shared by all nodes; authenticates DIPC traffic that
+/// crosses the wire. Unlike `auth_key` (per-boot random, node-local) it is the
+/// same on every node of a cluster.
+var cluster_key: [32]u8 = [_]u8{0} ** 32;
+var cluster_key_set: bool = false;
+
+pub fn setClusterSecret(secret: []const u8) void {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    Hmac.create(&cluster_key, "DIPC-CLUSTER-V1", secret);
+    cluster_key_set = true;
+}
+
+/// Tag for a page crossing the wire. Binds the sender node/endpoint, the
+/// destination endpoint and the payload. dst.node is deliberately excluded:
+/// netd rewrites it on receive (multicast -> own address) and the receiving
+/// kernel routes by its own identity.
+pub fn computeClusterTag(src: Address, dst_endpoint: EndpointId, payload: []const u8) u64 {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac = Hmac.init(&cluster_key);
+    mac.update("DIPC-WIRE-V1");
+    mac.update(std.mem.asBytes(&src));
+    const dst_ep_wide: u64 = @intCast(dst_endpoint);
+    const ep_bytes = u64le(dst_ep_wide);
+    mac.update(&ep_bytes);
+    const len_bytes = u32le(@as(u32, @intCast(payload.len)));
+    mac.update(&len_bytes);
+    mac.update(payload);
+    var digest: [32]u8 = undefined;
+    mac.final(&digest);
+    return std.mem.readInt(u64, digest[0..8], .little);
+}
+
+pub fn verifyClusterTag(hhdm_offset: u64, page_phys: u64) bool {
+    if (!cluster_key_set) return false;
+    const hdr = headerFromPage(hhdm_offset, page_phys);
+    if (hdr.magic != WireMagic or hdr.version != WireVersion) return false;
+    if (@as(usize, hdr.header_len) != HEADER_SIZE) return false;
+    if (@as(usize, hdr.payload_len) > MAX_PAYLOAD) return false;
+    const payload_ptr: [*]const u8 = @ptrFromInt(page_phys + hhdm_offset + HEADER_SIZE);
+    const payload = payload_ptr[0..@as(usize, hdr.payload_len)];
+    return hdr.auth_tag == computeClusterTag(hdr.src, hdr.dst.endpoint, payload);
+}
+
 pub fn computeAuthTag(src: Address, dst: Address, payload: []const u8) u64 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     const key_bytes = u64le(auth_key);

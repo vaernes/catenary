@@ -2,6 +2,7 @@ const std = @import("std");
 const lib = @import("lib.zig");
 const clusterd_proto = @import("protocols/clusterd_protocol.zig");
 const netd_proto = @import("protocols/netd_protocol.zig");
+const dashd_proto = @import("protocols/dashd_protocol.zig");
 
 const SYS_REGISTER = lib.SYS_REGISTER;
 const SYS_RECV = lib.SYS_RECV;
@@ -224,6 +225,31 @@ fn sendNetdMessage(
     }
 
     return lib.syscall(SYS_SEND_PAGE, scratch_phys, 0, token) == 0;
+}
+
+fn sendDashdClusterTelemetry(
+    scratch_phys: u64,
+    scratch_va: u64,
+    token: u64,
+    sample: *const dashd_proto.ClusterTelemetryUpdate,
+) void {
+    const body_len = @sizeOf(dashd_proto.DashdHeader) + @sizeOf(dashd_proto.ClusterTelemetryUpdate);
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, scratch_va);
+    const head: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    head.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
+        .payload_len = @as(u32, @intCast(body_len)),
+        .auth_tag = 0,
+        .src = .{ .node = g_local_node, .endpoint = EP_CLUSTERD },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.dashd) },
+    };
+    const dh: *align(1) dashd_proto.DashdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    dh.* = .{ .op = .cluster_telemetry_update, .payload_len = @sizeOf(dashd_proto.ClusterTelemetryUpdate) };
+    const body: *align(1) dashd_proto.ClusterTelemetryUpdate = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE + @sizeOf(dashd_proto.DashdHeader));
+    body.* = sample.*;
+    _ = lib.syscall(SYS_SEND_PAGE, scratch_phys, 0, token);
 }
 
 fn sendControlRequest(
@@ -641,6 +667,20 @@ fn handleClusterdProtocol(
                 peer.has_resources = true;
             }
             maybeRequestRemoteLaunch(bs, scratch_phys, scratch_va, token);
+        },
+        .telemetry_report => {
+                        if (msg_payload_len != @sizeOf(dashd_proto.ClusterTelemetryUpdate)) return;
+            var sample = @as(*align(1) const dashd_proto.ClusterTelemetryUpdate, @ptrFromInt(msg_payload_va)).*;
+            if (isLoopback(src_node) or ipv6Eq(src_node, g_local_node)) {
+                // Local dashd sample: stamp our identity and share with peers.
+                if (isLoopback(g_local_node)) return;
+                sample.node_addr = g_local_node.bytes;
+                _ = sendClusterdMessage(scratch_phys, scratch_va, token, IPV6_ALL_NODES_MULTICAST, .telemetry_report, std.mem.asBytes(&sample));
+            } else {
+                // Remote sample: attribute to the sending node and hand to dashd.
+                sample.node_addr = src_node.bytes;
+                sendDashdClusterTelemetry(scratch_phys, scratch_va, token, &sample);
+            }
         },
         .vm_list_request, .vm_list_reply => {},
     }

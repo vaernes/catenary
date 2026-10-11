@@ -197,6 +197,12 @@ const control_protocol = @import("../control/control_protocol.zig");
 const microvm_registry = @import("microvm_registry.zig");
 
 /// Broadcast telemetry for all active MicroVMs to the dashd service.
+pub fn broadcastTelemetryFromContext() void {
+    const hhdm = bridge_hhdm_offset;
+    const table = bridge_endpoint_table orelse return;
+    broadcastTelemetry(hhdm, table);
+}
+
 pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable) void {
     const dashd_entity = table.lookup(@intFromEnum(identity.ReservedEndpoint.dashd)) orelse return;
     const dashd_sid = switch (dashd_entity) {
@@ -208,7 +214,7 @@ pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable)
     var i: usize = 0;
     while (i < microvm_registry.TARGET_INSTANCES) : (i += 1) {
         const inst = microvm_registry.findMutable(@as(u32, @intCast(i + 1))) orelse continue;
-        if (!inst.in_use or inst.state != .running) continue;
+        if (!inst.in_use) continue;
 
         const dashd_addr = dipc.Address{
             .node = dipc.Ipv6Addr.loopback(),

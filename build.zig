@@ -1,5 +1,8 @@
 const std = @import("std");
 
+/// Development-only default; production clusters must pass -Dcluster_secret.
+const DEFAULT_CLUSTER_SECRET = "catenary-dev-cluster-secret";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -33,6 +36,7 @@ pub fn build(b: *std.Build) void {
     const vmm_launch_val = b.option(bool, "vmm_launch_linux", "Launch Linux guest on boot") orelse false;
     opts.addOption(bool, "vmm_launch_linux", vmm_launch_val);
     opts.addOption(bool, "serial_syscall_keepalive", b.option(bool, "serial_syscall_keepalive", "Emit per-syscall UART keepalive for QEMU serial-file backends") orelse false);
+    opts.addOption([]const u8, "cluster_secret", b.option([]const u8, "cluster_secret", "Shared secret authenticating DIPC traffic between cluster nodes (all nodes must match)") orelse DEFAULT_CLUSTER_SECRET);
     opts.addOption(?[]const u8, "expected_kernel_hash", b.option([]const u8, "expected_kernel_hash", "Expected SHA-256 hash of the kernel for Secure Boot verification") orelse null);
 
     const exe = b.addExecutable(.{

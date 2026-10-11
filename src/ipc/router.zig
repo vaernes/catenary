@@ -84,6 +84,17 @@ pub fn routePage(
     }
 
     const netd_target = table.netdTarget() orelse return error.NoNetDaemon;
+
+    // Leaving the node: replace the node-local tag (verified above) with a
+    // cluster tag the receiving kernel can check. Pin an unresolved loopback
+    // source to our node address so the signed identity is the one on the wire.
+    const wire_hdr: *dipc.PageHeader = @ptrFromInt(page_phys + hhdm_offset);
+    if (dipc.Ipv6Addr.eql(wire_hdr.src.node, dipc.Ipv6Addr.loopback()) and node_config.isNodeAddrConfigured(local_node)) {
+        wire_hdr.src.node = local_node;
+    }
+    const wire_payload: [*]const u8 = @ptrFromInt(page_phys + hhdm_offset + dipc.HEADER_SIZE);
+    wire_hdr.auth_tag = dipc.computeClusterTag(wire_hdr.src, wire_hdr.dst.endpoint, wire_payload[0..@as(usize, wire_hdr.payload_len)]);
+
     net_bridge.sendToNetDaemon(netd_target, page_phys) catch return error.Busy;
     return .HandedToNetd;
 }

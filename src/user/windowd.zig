@@ -1,3 +1,4 @@
+const std = @import("std");
 const lib = @import("lib.zig");
 
 // Syscall ops (mirrors lib.zig constants)
@@ -55,6 +56,19 @@ var microvm_count: usize = 0;
 var needs_vm_refresh: bool = true;
 var needs_redraw: bool = true;
 
+const proto_dashd = @import("protocols/dashd_protocol.zig");
+
+// Cluster node view, aggregated from dashd's telemetry summary.
+const MAX_NODES: usize = 8;
+const NodeRow = struct {
+    used: bool = false,
+    addr: [16]u8 = [_]u8{0} ** 16,
+    vms: u32 = 0,
+    cycles: u64 = 0,
+    exits: u64 = 0,
+};
+var node_rows: [MAX_NODES]NodeRow = [_]NodeRow{.{}} ** MAX_NODES;
+
 const proto_inputd = @import("protocols/inputd_protocol.zig");
 const InputEventPayload = proto_inputd.InputEvent;
 
@@ -92,6 +106,7 @@ pub export fn umain() noreturn {
     while (true) {
         if (needs_vm_refresh or last_poll > 800_000) {
             requestVmList(bs, dma_phys, token);
+            requestClusterSummary(dma_phys, token);
             needs_vm_refresh = false;
             last_poll = 0;
         }
@@ -131,6 +146,108 @@ fn requestVmList(bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64) 
     const scratch_phys = dma_phys + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
     const scratch_va = DMA_BASE_VA + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
     lib.sendControl(bs, scratch_phys, scratch_va, token, .list_microvms, &[_]u8{});
+}
+
+fn requestClusterSummary(dma_phys: u64, token: u64) void {
+    const scratch_phys = dma_phys + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
+    const scratch_va = DMA_BASE_VA + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
+    const body_len = @sizeOf(proto_dashd.DashdHeader) + @sizeOf(proto_dashd.TelemetrySummaryRequest);
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, scratch_va);
+    const head: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    head.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
+        .payload_len = @as(u32, @intCast(body_len)),
+        .auth_tag = 0,
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.windowd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.dashd) },
+    };
+    const dh: *align(1) proto_dashd.DashdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    dh.* = .{ .op = .telemetry_summary_request, .payload_len = @sizeOf(proto_dashd.TelemetrySummaryRequest) };
+    const req: *align(1) proto_dashd.TelemetrySummaryRequest = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE + @sizeOf(proto_dashd.DashdHeader));
+    req.* = .{};
+    _ = lib.syscall(SYS_SEND_PAGE, scratch_phys, 0, token);
+}
+
+fn handleClusterSummary(payload_va: u64) void {
+    const reply: *align(1) const proto_dashd.TelemetrySummaryReply =
+        @ptrFromInt(payload_va + @sizeOf(proto_dashd.DashdHeader));
+    for (&node_rows) |*r| r.* = .{};
+    const count = @min(@as(usize, reply.count), proto_dashd.MAX_TELEMETRY_SUMMARY_ENTRIES);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const e = reply.entries[i];
+        var row: ?*NodeRow = null;
+        for (&node_rows) |*r| {
+            if (r.used and std.mem.eql(u8, &r.addr, &e.node_addr)) { row = r; break; }
+        }
+        if (row == null) {
+            for (&node_rows) |*r| {
+                if (!r.used) { r.used = true; r.addr = e.node_addr; row = r; break; }
+            }
+        }
+        if (row) |r| {
+            r.vms += 1;
+            r.cycles +%= e.cpu_cycles;
+            r.exits +%= e.exit_count;
+        }
+    }
+}
+
+fn appendStr(buf: []u8, pos: *usize, s: []const u8) void {
+    const n = @min(s.len, buf.len - pos.*);
+    @memcpy(buf[pos.*..][0..n], s[0..n]);
+    pos.* += n;
+}
+
+fn appendDec(buf: []u8, pos: *usize, v: u64) void {
+    var tmp: [20]u8 = undefined;
+    var n: usize = 0;
+    var x = v;
+    if (x == 0) {
+        tmp[0] = '0';
+        n = 1;
+    }
+    while (x > 0) : (x /= 10) {
+        tmp[n] = '0' + @as(u8, @intCast(x % 10));
+        n += 1;
+    }
+    while (n > 0) {
+        n -= 1;
+        appendStr(buf, pos, tmp[n .. n + 1]);
+    }
+}
+
+fn appendHexByte(buf: []u8, pos: *usize, b: u8) void {
+    const hex = "0123456789abcdef";
+    appendStr(buf, pos, &[_]u8{ hex[b >> 4], hex[b & 0xF] });
+}
+
+fn drawClusterNodes(text_phys: u64, text_va: u64, token: u64) void {
+    const base_row: u32 = @intCast(ROWS - 12); // bottom of sidebar, clear of the VM list
+    lib.drawText(text_phys, text_va, base_row, 2, COLOR_GOLDEN_YELLOW, "Cluster Nodes", token);
+    var shown: u32 = 0;
+    for (&node_rows) |*r| {
+        if (!r.used) continue;
+        var line: [64]u8 = undefined;
+        var p: usize = 0;
+        var is_local = true;
+        for (r.addr) |b| if (b != 0) { is_local = false; break; };
+        if (is_local) {
+            appendStr(&line, &p, "local");
+        } else {
+            // Show the last 4 address bytes to keep the line short.
+            for (r.addr[12..16]) |b| appendHexByte(&line, &p, b);
+        }
+        appendStr(&line, &p, " vms=");
+        appendDec(&line, &p, r.vms);
+        appendStr(&line, &p, " x=");
+        appendDec(&line, &p, r.exits);
+        lib.drawText(text_phys, text_va, base_row + 1 + shown, 2, COLOR_HIGHLIGHT, line[0..p], token);
+        shown += 1;
+    }
+    if (shown == 0) lib.drawText(text_phys, text_va, base_row + 1, 2, COLOR_DIM, "No telemetry yet", token);
 }
 
 fn vmStateLabel(state: u8) []const u8 {
@@ -176,6 +293,14 @@ fn handleMessage(page_va: u64, token: u64) void {
         return;
     }
 
+    if (hdr.src.endpoint == @intFromEnum(lib.ReservedEndpoint.dashd) and
+        hdr.payload_len == @sizeOf(proto_dashd.DashdHeader) + @sizeOf(proto_dashd.TelemetrySummaryReply))
+    {
+        const dh: *align(1) const proto_dashd.DashdHeader = @ptrFromInt(payload_va);
+        if (dh.magic == proto_dashd.MAGIC and dh.op == .telemetry_summary_reply) handleClusterSummary(payload_va);
+        return;
+    }
+
     if (hdr.src.endpoint == @intFromEnum(lib.ReservedEndpoint.kernel_control) and
         hdr.payload_len == @sizeOf(lib.VmSnapshotListPayload))
     {
@@ -216,6 +341,8 @@ fn drawTui(dma_phys: u64, token: u64) void {
     if (microvm_count == 0) {
         lib.drawText(text_phys, text_va, 7, 2, COLOR_DIM, "No MicroVMs discovered", token);
     }
+
+    drawClusterNodes(text_phys, text_va, token);
 
     // Shell log
     const log_phys = dma_phys + DMA_LOG_SLOT * lib.PAGE_SIZE;

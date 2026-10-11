@@ -232,6 +232,16 @@ pub export fn userModeGpBridge(error_code: u64, rip: u64, cs: u64, flags: u64, r
     serialWrite("\n");
 
     if ((cs & 0x3) == 0) {
+        // TMPDEBUG: scan stack for kernel text addresses
+        const sp: [*]const u64 = @ptrFromInt(rsp);
+        var si: usize = 0;
+        while (si < 96) : (si += 1) {
+            if (sp[si] >> 32 == 0xFFFFFFFF and (sp[si] & 0xFFFFFFFF) >= 0x80000000) {
+                serialWrite("  ret=0x");
+                printHex(sp[si]);
+                serialWrite("\n");
+            }
+        }
         serialWrite("FATAL: kernel general protection fault\n");
         while (true) {
             cpu.cli();
@@ -533,6 +543,22 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const src_bytes: [*]const u8 = @ptrFromInt(src_phys + hhdm_offset);
             const dst_bytes: [*]u8 = @ptrFromInt(dst_virt);
             @memcpy(dst_bytes[0 .. dipc.HEADER_SIZE + payload_len6], src_bytes[0 .. dipc.HEADER_SIZE + payload_len6]);
+            // Pages claiming a remote origin must come from netd and carry a valid
+            // cluster tag; this is the only place off-node identity is accepted.
+            {
+                const claimed: *const dipc.PageHeader = @ptrFromInt(dst_virt);
+                const node_cfg = @import("../../ipc/node_config.zig");
+                const src_node = claimed.src.node;
+                const src_zero = std.mem.allEqual(u8, &src_node.bytes, 0);
+                if (!src_zero and !node_cfg.isLocalAddress(src_node)) {
+                    const sender_is_netd = if (service_registry.getServiceKind(sid6)) |k| k == .netd else false;
+                    if (!sender_is_netd or !dipc.verifyClusterTag(hhdm_offset, dst_phys)) {
+                        serialWrite("[SECURITY] DIPC dropped: unauthenticated remote origin\n");
+                        pmm.freePage(dst_phys);
+                        return 1;
+                    }
+                }
+            }
             // Re-sign with kernel auth key.
             const dst_hdr: *dipc.PageHeader = @ptrFromInt(dst_virt);
             const payload6: [*]const u8 = @ptrFromInt(dst_virt + dipc.HEADER_SIZE);
