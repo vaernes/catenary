@@ -1,4 +1,8 @@
-# Catenary OS Web Dashboard Plan
+# [ARCHIVED] Catenary OS Web Dashboard Plan
+
+> [!NOTE]
+> **Status:** Archived concept.
+> Out-of-band web dashboard concepts will build upon the Ring-3 network and telemetry services established in Phase 7/8. Primary interactive host management is handled by the on-metal TUI (`windowd` / `varde`) specified in [Phase 8 Roadmap](../PHASE_8_ROADMAP.md).
 
 ## Objective
 Provide an out-of-band HTML/web-based dashboard to visualize and control the internal state of Catenary OS. This replaces the basic `varde` terminal for advanced operator workloads.

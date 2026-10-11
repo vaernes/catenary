@@ -1,4 +1,8 @@
-# GUI Plans for Catenary OS
+# [ARCHIVED] GUI Plans for Catenary OS
+
+> [!NOTE]
+> **Status:** Archived & Superseded by [Phase 8 Roadmap](../PHASE_8_ROADMAP.md).
+> This document served as an early design concept during Phase 6/7. The authoritative specification for Catenary OS's graphical and text user interface is now defined in `docs/PHASE_8_ROADMAP.md`.
 
 ## Overview
 The graphical user interface (GUI) for Catenary OS will be modernized to improve usability and functionality. The focus will be on creating a user-friendly interface for managing MicroVMs and interacting with the system. The following sections outline the planned features and improvements.

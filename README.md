@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/language-Zig-F7A41D?style=flat-square" alt="Zig"/>
   <img src="https://img.shields.io/badge/arch-x86__64-36454F?style=flat-square" alt="x86_64"/>
   <img src="https://img.shields.io/badge/bootloader-Limine-CD7F32?style=flat-square" alt="Limine"/>
-  <img src="https://img.shields.io/badge/status-Phase%207-blue?style=flat-square" alt="Phase 7"/>
+  <img src="https://img.shields.io/badge/status-Phase%208%20(UI%20%26%20Interaction)-blue?style=flat-square" alt="Phase 8"/>
 </p>
 
 ---
@@ -79,7 +79,11 @@ Catenary OS acts as a **Type-1 hypervisor**, booting stripped-down Linux kernels
 - [x] **Phase 4: Hypervisor & MicroVMs** — Intel VT-x integration and booting isolated Linux guest kernels.
 - [x] **Phase 5: Networking & IPC** — IPv6 networking, distributed IPC, and multi-node cluster orchestration basics.
 - [x] **Phase 6: Storage & Persistent State** — NVMe drivers, Virtio-Blk bridging, and DIPC-backed storage volumes.
-- [ ] **Phase 7: Cluster Orchestration** (*Current*) — Dynamic workload placement, cross-node migration, and global DIPC routing.
+- [x] **Phase 7: Cluster Orchestration** — Dynamic workload placement, remote launching, user-space TCP/IPv6, and SMP scaling.
+- [ ] **Phase 8: User Interface & OS Interaction** (*Current*) — TUI window manager (`windowd`), interactive MicroVM lifecycle forms, Varde shell input, and keyboard workflows.
+
+See [docs/PHASE_8_ROADMAP.md](docs/PHASE_8_ROADMAP.md) for detailed Phase 8 architecture and milestones.  
+See [docs/PHASE_7_ROADMAP.md](docs/PHASE_7_ROADMAP.md) for completed Phase 7 verification.
 
 ---
 
