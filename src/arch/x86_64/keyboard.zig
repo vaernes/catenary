@@ -78,10 +78,13 @@ pub export fn catenary_keyboardInterruptBridge() callconv(.c) void {
     const status = cpu.inb(KBD_STATUS_PORT);
     if ((status & 0x01) != 0) {
         const scancode = cpu.inb(KBD_DATA_PORT);
-        // Only handle make codes (bit 7 clear), ignore break codes for now
-        if ((scancode & 0x80) == 0) {
+        // Forward every byte (make, break, and 0xE0 extended prefixes) so the
+        // Ring-3 input daemon can track modifier state and extended keys.
+        // Drop on overflow rather than overwriting unread scancodes.
+        const next = kbd_ring_head +% 1;
+        if (next != kbd_ring_tail) {
             kbd_ring_buf[kbd_ring_head] = scancode;
-            kbd_ring_head +%= 1;
+            kbd_ring_head = next;
         }
     }
     cpu.outb(0x20, 0x20); // Send EOI to master PIC

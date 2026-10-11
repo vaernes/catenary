@@ -517,13 +517,18 @@ pub fn fillRect(x: u32, y: u32, w: u32, h: u32, color: u32, token: u64) void {
 }
 
 pub fn drawText(dma_phys: u64, dma_va: u64, row: u32, col: u32, fg: u32, text: []const u8, token: u64) void {
+    drawTextBg(dma_phys, dma_va, row, col, fg, 0, text, token);
+}
+
+pub fn drawTextBg(dma_phys: u64, dma_va: u64, row: u32, col: u32, fg: u32, bg: u32, text: []const u8, token: u64) void {
     const len = @min(text.len, 255);
     if (len == 0) return;
     const buf: [*]u8 = ptrFrom([*]u8, dma_va);
     @memcpy(buf[0..len], text[0..len]);
     buf[len] = 0;
-    const arg1 = (@as(u64, row) << 48) | (@as(u64, col) << 32) | fg;
-    _ = syscall(SYS_FB_DRAW_COLORED, dma_phys, arg1, token);
+    const arg0 = (dma_phys & 0xFF_FFFF_FFFF) | (@as(u64, bg & 0xFF_FFFF) << 40);
+    const arg1 = (@as(u64, row) << 48) | (@as(u64, col) << 32) | (fg & 0xFF_FFFF);
+    _ = syscall(SYS_FB_DRAW_COLORED, arg0, arg1, token);
 }
 
 // --- DIPC Helpers ---

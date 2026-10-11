@@ -158,7 +158,23 @@ fn cmdHelp() void {
     write("  services — service registry slots\r\n");
     write("  vms      — list active MicroVM instances\r\n");
     write("  memory   — PMM page count\r\n");
+    write("  clear    — clear the shell window\r\n");
+    write("  about    — about Catenary OS\r\n");
     write("  halt     — halt the CPU\r\n");
+}
+
+fn cmdAbout() void {
+    write("\r\n");
+    write(main.OS_NAME);
+    write(" - distributed microkernel and Type-1 hypervisor\r\n");
+    write("Ring-3 services: netd storaged dashd containerd clusterd\r\n");
+    write("                 inputd windowd configd\r\n");
+}
+
+fn cmdClear() void {
+    // Reset the UI scrollback; the prompt is re-printed by the caller.
+    history_pos = 0;
+    history_buf[0] = 0;
 }
 
 fn cmdVms() void {
@@ -300,6 +316,10 @@ fn dispatch(cmd: []const u8) void {
         cmdVms();
     } else if (strEq(cmd, "memory")) {
         cmdMemory();
+    } else if (strEq(cmd, "about")) {
+        cmdAbout();
+    } else if (strEq(cmd, "clear")) {
+        cmdClear();
     } else if (strEq(cmd, "halt")) {
         write("\r\nHalting CPU.\r\n");
         while (true) asm volatile ("hlt");

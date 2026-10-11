@@ -695,7 +695,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const sid18 = service_registry.serviceIdForCapability(token) orelse return 0;
             const kind18 = service_registry.getServiceKind(sid18) orelse return 0;
             if (kind18 != .windowd and kind18 != .dashd) return 0;
-            const page18 = arg0;
+            // arg0[39:0] = DMA page phys; arg0[63:40] = optional 0xRRGGBB background
+            // (0 selects the default Sea Gray background).
+            const page18 = arg0 & 0xFF_FFFF_FFFF;
+            const bg18_req = @as(u32, @truncate(arg0 >> 40));
+            const bg18 = if (bg18_req == 0) @import("../../kernel/fb.zig").ColorSeaGray else bg18_req;
             if (page18 == 0) return 0;
             // arg1 high 32 bits: (row16 << 16) | col16
             const packed18 = @as(u32, @truncate(arg1 >> 32));
@@ -710,7 +714,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 if (c18 == 0) break;
                 const px18 = (col18 + ci18) * fb18.CharWidth;
                 const py18 = row18 * fb18.CharHeight;
-                fb18.drawChar(px18, py18, c18, fg18, fb18.ColorSeaGray);
+                fb18.drawChar(px18, py18, c18, fg18, bg18);
             }
             return 0;
         },
