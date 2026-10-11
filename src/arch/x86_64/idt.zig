@@ -16,7 +16,7 @@ const IdtEntry = packed struct {
 };
 
 var idt: [256]IdtEntry = undefined;
-var idtr: cpu.DescriptorTablePointer = undefined;
+pub var idtr: cpu.DescriptorTablePointer = undefined;
 
 pub fn setGate(vector: u8, isr: *const fn () callconv(.naked) void, flags: u8) void {
     setGateWithIst(vector, isr, flags, 0);

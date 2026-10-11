@@ -4,6 +4,7 @@ const pmm = @import("pmm.zig");
 const arch = @import("../arch.zig");
 const microvm_registry = @import("../vmm/microvm_registry.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
+const smp = arch.smp;
 
 pub const THREAD_TARGET_COUNT = 64;
 
@@ -34,6 +35,8 @@ pub const Thread = struct {
     /// spawned via SYS_SPAWN_THREAD set this to false so that sendToService
     /// always delivers inbound DIPC pages to the primary (blocking) thread.
     dipc_eligible: bool = true,
+    /// Function pointer for kernel worker threads spawned via spawn().
+    entry_fn: ?*const fn () void = null,
 
     pub const State = enum {
         Empty,
@@ -86,10 +89,74 @@ pub const Mailbox = struct {
 
 var threads_pool: [THREAD_TARGET_COUNT]Thread align(16) linksection(".data") = undefined;
 pub var threads: []Thread = threads_pool[0..THREAD_TARGET_COUNT];
+pub var current_thread_per_cpu: [smp.MAX_CPUS]usize = [_]usize{0} ** smp.MAX_CPUS;
 pub var current_thread_idx: usize = 0;
 var next_thread_id: u32 = 1;
 var hhdm_offset: u64 = 0;
 pub var last_tsc_stamp: u64 = 0;
+pub var scheduler_active: bool = false;
+
+var schedule_spinlock: bool = false;
+var lock_depth: [smp.MAX_CPUS]u32 = [_]u32{0} ** smp.MAX_CPUS;
+var saved_flags: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
+var thread_active: [THREAD_TARGET_COUNT]bool = [_]bool{false} ** THREAD_TARGET_COUNT;
+var prev_switched_thread: [smp.MAX_CPUS]?usize = [_]?usize{null} ** smp.MAX_CPUS;
+var ap_task_logged: [smp.MAX_CPUS][THREAD_TARGET_COUNT]bool = [_][THREAD_TARGET_COUNT]bool{[_]bool{false} ** THREAD_TARGET_COUNT} ** smp.MAX_CPUS;
+
+fn acquireScheduleLock() void {
+    var flags: u64 = 0;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile (
+            \\pushfq
+            \\popq %[flags]
+            \\cli
+            : [flags] "=r" (flags),
+        );
+    }
+    const cpu_id = smp.getCurrentCpuId();
+    if (lock_depth[cpu_id] == 0) {
+        saved_flags[cpu_id] = flags;
+    }
+    lock_depth[cpu_id] += 1;
+
+    while (@atomicRmw(bool, &schedule_spinlock, .Xchg, true, .seq_cst)) {
+        asm volatile ("pause");
+    }
+}
+
+fn releaseScheduleLock() void {
+    const cpu_id = smp.getCurrentCpuId();
+    @atomicStore(bool, &schedule_spinlock, false, .seq_cst);
+    lock_depth[cpu_id] -= 1;
+    if (lock_depth[cpu_id] == 0) {
+        const flags = saved_flags[cpu_id];
+        if (comptime builtin.cpu.arch == .x86_64) {
+            asm volatile (
+                \\pushq %[flags]
+                \\popfq
+                :
+                : [flags] "r" (flags),
+            );
+        }
+    }
+}
+
+pub fn start() void {
+    @atomicStore(bool, &scheduler_active, true, .seq_cst);
+}
+
+pub fn onThreadFirstDispatch() void {
+    const cpu_id = smp.getCurrentCpuId();
+    if (prev_switched_thread[cpu_id]) |prev| {
+        thread_active[prev] = false;
+        prev_switched_thread[cpu_id] = null;
+    }
+    @atomicStore(bool, &schedule_spinlock, false, .seq_cst);
+    lock_depth[cpu_id] = 0;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile ("cli");
+    }
+}
 
 pub fn init(offset: u64) void {
     hhdm_offset = offset;
@@ -99,12 +166,29 @@ pub fn init(offset: u64) void {
             .id = 0,
             .state = .Empty,
         };
+        thread_active[i] = false;
     }
     threads[0].state = .Running;
     threads[0].id = 0;
     threads[0].setName("kernel/boot");
+    current_thread_per_cpu[0] = 0;
     current_thread_idx = 0;
+    thread_active[0] = true;
     last_tsc_stamp = arch.cpu.rdtsc();
+
+    // Dedicated idle thread slots for AP cores
+    for (1..smp.MAX_CPUS) |c| {
+        const idle_idx = THREAD_TARGET_COUNT - c;
+        threads[idle_idx] = Thread{
+            .rsp = 0,
+            .id = 1000 + @as(u32, @intCast(c)),
+            .state = .Waiting,
+        };
+        const name_buf = [_]u8{ 'i', 'd', 'l', 'e', '/', 'c', 'p', 'u', '0' + @as(u8, @intCast(c)), 0, 0, 0, 0, 0, 0, 0 };
+        threads[idle_idx].name = name_buf;
+        current_thread_per_cpu[c] = idle_idx;
+        thread_active[idle_idx] = true;
+    }
 }
 
 fn serviceKindName(kind: @import("../services/service_bootstrap.zig").ServiceKind) []const u8 {
@@ -136,8 +220,11 @@ fn fmtVmxName(vmid: u32) [16]u8 {
 }
 
 pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootstrap.zig").ServiceKind) !u32 {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
     arch.cpu.outb(0x3F8, 's');
-    for (0..THREAD_TARGET_COUNT) |i| {
+    const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    for (0..max_slots) |i| {
         if (threads[i].state == .Empty) {
             arch.cpu.outb(0x3F8, 'S');
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
@@ -200,23 +287,47 @@ pub fn spawnThreadForService(sid: u32, kind: @import("../services/service_bootst
     }
     return error.NoEmptySlots;
 }
+fn kernel_thread_bridge() void {
+    onThreadFirstDispatch();
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile ("sti");
+    }
+    const thread = get_current_thread();
+    if (thread.entry_fn) |f| {
+        f();
+    }
+    get_current_thread().state = .Waiting;
+    while (true) {
+        schedule();
+        asm volatile ("pause");
+    }
+}
+
 pub fn spawn(entry: *const fn () void, name: []const u8) !u32 {
-    for (0..THREAD_TARGET_COUNT) |i| {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
+    const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    for (0..max_slots) |i| {
         if (threads[i].state == .Empty) {
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
             const stack_top = stack_p + hhdm_offset + 4096;
-            var rsp = stack_top - 8;
-            @as(*u64, @ptrFromInt(rsp)).* = 0;
-            rsp -= 8;
-            @as(*u64, @ptrFromInt(rsp)).* = @intFromPtr(entry);
-            rsp -= 48; // r15-rbx
-            for (0..6) |j| @as(*u64, @ptrFromInt(rsp + j * 8)).* = 0;
+            const st: [*]u64 = @ptrFromInt(stack_top - 64);
+            st[0] = 0; // r15
+            st[1] = 0; // r14
+            st[2] = 0; // r13
+            st[3] = 0; // r12
+            st[4] = 0; // rbp
+            st[5] = 0; // rbx
+            st[6] = @intFromPtr(&kernel_thread_bridge);
+            st[7] = 0; // dummy alignment word
+
             const id = next_thread_id;
             next_thread_id += 1;
             threads[i] = Thread{
-                .rsp = rsp,
+                .rsp = stack_top - 64,
                 .id = id,
                 .state = .Ready,
+                .entry_fn = entry,
             };
             threads[i].setName(name);
             return id;
@@ -226,15 +337,20 @@ pub fn spawn(entry: *const fn () void, name: []const u8) !u32 {
 }
 
 pub fn get_current_thread() *Thread {
-    return &threads[current_thread_idx];
+    const cpu_id = smp.getCurrentCpuId();
+    return &threads[current_thread_per_cpu[cpu_id]];
 }
 
 pub fn receive() ?u64 {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
     const thread = get_current_thread();
     return thread.mailbox.pop();
 }
 
 pub fn send(tid: u32, data: u64) bool {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
     for (0..THREAD_TARGET_COUNT) |i| {
         if (threads[i].state != .Empty and threads[i].id == tid) {
             if (threads[i].mailbox.isFull()) return false;
@@ -248,6 +364,8 @@ pub fn send(tid: u32, data: u64) bool {
 }
 
 pub fn sendToService(sid: u32, data: u64) bool {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
     // First pass: prefer a Waiting, DIPC-eligible thread so we wake the
     // primary receive loop rather than a background polling thread.
     for (0..THREAD_TARGET_COUNT) |i| {
@@ -282,10 +400,13 @@ pub fn sendToService(sid: u32, data: u64) bool {
 /// The new thread shares the service's address space and capability token but
 /// is NOT eligible for inbound DIPC delivery (dipc_eligible = false).
 pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
     const user_mode = @import("../arch/x86_64/user_mode.zig");
     const service_registry = @import("../services/service_registry.zig");
 
-    for (0..THREAD_TARGET_COUNT) |i| {
+    const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    for (0..max_slots) |i| {
         if (threads[i].state == .Empty) {
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
             const stack_top = stack_p + hhdm_offset + 4096;
@@ -344,7 +465,10 @@ pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
 }
 
 pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx: u32) !u32 {
-    for (0..THREAD_TARGET_COUNT) |i| {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
+    const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    for (0..max_slots) |i| {
         if (threads[i].state == .Empty) {
             const stack_p = pmm.allocPage() orelse return error.OutOfMemory;
             const stack_top = stack_p + hhdm_offset + 4096;
@@ -367,12 +491,17 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
 
                 rsp = stack_top - 64;
             } else {
-                rsp = stack_top - 8;
-                @as(*u64, @ptrFromInt(rsp)).* = 0;
-                rsp -= 8;
-                @as(*u64, @ptrFromInt(rsp)).* = @intFromPtr(entry.?);
-                rsp -= 48; // r15-rbx
-                for (0..6) |j| @as(*u64, @ptrFromInt(rsp + j * 8)).* = 0;
+                const st: [*]u64 = @ptrFromInt(stack_top - 64);
+                st[0] = 0; // r15
+                st[1] = 0; // r14
+                st[2] = 0; // r13
+                st[3] = 0; // r12
+                st[4] = 0; // rbp
+                st[5] = 0; // rbx
+                st[6] = @intFromPtr(&kernel_thread_bridge);
+                st[7] = 0; // alignment
+
+                rsp = stack_top - 64;
             }
 
             const id = next_thread_id;
@@ -384,6 +513,7 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
                 .is_vmx = is_vmx,
                 .vmid = vmid,
                 .vcpu_idx = vcpu_idx,
+                .entry_fn = entry,
             };
             if (is_vmx) {
                 threads[i].name = fmtVmxName(vmid);
@@ -397,6 +527,7 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
 }
 
 fn vmx_thread_bridge() void {
+    onThreadFirstDispatch();
     const vmx = @import("../arch/x86_64/vmx.zig");
     const thread = get_current_thread();
     if (microvm_registry.findMutable(thread.vmid)) |inst| {
@@ -405,67 +536,159 @@ fn vmx_thread_bridge() void {
             arch.cpu.outb(0x3F8, 'F');
         };
     }
-    // If we return, just yield/schedule
+    // If we return, mark thread as Waiting, re-enable interrupts, and yield
+    get_current_thread().state = .Waiting;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile ("sti");
+    }
     while (true) {
         schedule();
+        asm volatile ("pause");
     }
 }
 
 extern fn switchContext(old_rsp: *u64, new_rsp: u64) void;
 
-var schedule_lock: bool = false;
+fn logApTaskExecution(cpu_id: usize, task_idx: usize) void {
+    smp.serialAcquire();
+    defer smp.serialRelease();
+    const t = &threads[task_idx];
+    const prefix = "smp: AP core ";
+    for (prefix) |c| arch.cpu.outb(0x3F8, c);
+    arch.cpu.outb(0x3F8, '0' + @as(u8, @intCast(cpu_id)));
+    const mid = " running Ring-3 task: ";
+    for (mid) |c| arch.cpu.outb(0x3F8, c);
+    for (t.nameSlice()) |c| {
+        arch.cpu.outb(0x3F8, c);
+    }
+    arch.cpu.outb(0x3F8, '\n');
+}
+
+pub fn apScheduleLoop(cpu_id: usize) noreturn {
+    while (!@atomicLoad(bool, &scheduler_active, .seq_cst)) {
+        asm volatile ("pause");
+    }
+
+    const idle_idx = THREAD_TARGET_COUNT - cpu_id;
+    threads[idle_idx].state = .Running;
+    current_thread_per_cpu[cpu_id] = idle_idx;
+    thread_active[idle_idx] = true;
+
+    while (true) {
+        schedule();
+        asm volatile ("pause");
+    }
+}
 
 pub fn schedule() void {
-    if (schedule_lock) return;
-    schedule_lock = true;
+    if (!@atomicLoad(bool, &scheduler_active, .seq_cst)) return;
 
-    const old_idx = current_thread_idx;
+    const cpu_id = smp.getCurrentCpuId();
+    acquireScheduleLock();
+
+    // Release any previous thread that this CPU finished switching away from
+    if (prev_switched_thread[cpu_id]) |prev| {
+        thread_active[prev] = false;
+        prev_switched_thread[cpu_id] = null;
+    }
+
+    const old_idx = current_thread_per_cpu[cpu_id];
     const old_state = threads[old_idx].state;
-    var next_idx = (old_idx + 1) % THREAD_TARGET_COUNT;
-    while (threads[next_idx].state != .Ready and next_idx != old_idx) {
-        next_idx = (next_idx + 1) % THREAD_TARGET_COUNT;
+
+    // Normal runnable threads are in range [1 .. THREAD_TARGET_COUNT - smp.MAX_CPUS - 1]
+    const max_runnable = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    var next_idx: ?usize = null;
+    var i: usize = 0;
+    while (i < max_runnable) : (i += 1) {
+        const candidate = (old_idx + 1 + i) % max_runnable;
+        if (candidate == 0) continue; // Skip thread 0 (BSP boot/idle thread)
+        if (cpu_id != 0 and threads[candidate].sid == 0 and !threads[candidate].is_vmx) continue;
+        if (threads[candidate].state == .Ready and !thread_active[candidate]) {
+            next_idx = candidate;
+            break;
+        }
     }
-    if (next_idx == old_idx and threads[old_idx].state != .Ready and threads[old_idx].state != .Running) {
-        schedule_lock = false;
-        return; // No one to run
+
+    // If no runnable user thread is found:
+    if (next_idx == null) {
+        // If current thread is a valid runnable user thread and still Running, keep running it
+        if (old_idx < max_runnable and old_state == .Running) {
+            releaseScheduleLock();
+            return;
+        }
+        // Otherwise, switch to this CPU's dedicated idle thread
+        const my_idle_idx = if (cpu_id == 0) 0 else (THREAD_TARGET_COUNT - cpu_id);
+        if (old_idx == my_idle_idx) {
+            releaseScheduleLock();
+            return;
+        }
+        next_idx = my_idle_idx;
     }
-    if (next_idx == old_idx) {
-        schedule_lock = false;
+
+    const chosen_idx = next_idx.?;
+    if (chosen_idx == old_idx) {
+        releaseScheduleLock();
         return;
     }
 
+    // Accounting
     const now = arch.cpu.rdtsc();
     threads[old_idx].total_tsc += now -% last_tsc_stamp;
     last_tsc_stamp = now;
 
-    current_thread_idx = next_idx;
+    // Update states
+    const my_idle_idx = if (cpu_id == 0) 0 else (THREAD_TARGET_COUNT - cpu_id);
     if (old_state == .Running) {
-        threads[old_idx].state = .Ready;
+        if (old_idx != my_idle_idx) {
+            threads[old_idx].state = .Ready;
+        } else {
+            threads[old_idx].state = .Waiting;
+        }
     }
-    threads[next_idx].state = .Running;
 
-    // Release the reentrancy guard before switchContext because the switch
-    // suspends this call frame — the lock would stay held across the entire
-    // time this thread is not running, blocking all timer-driven scheduling.
-    schedule_lock = false;
+    threads[chosen_idx].state = .Running;
+    thread_active[chosen_idx] = true;
+    current_thread_per_cpu[cpu_id] = chosen_idx;
+    if (cpu_id == 0) {
+        current_thread_idx = chosen_idx;
+    }
+    prev_switched_thread[cpu_id] = old_idx;
 
-    switchContext(&threads[old_idx].rsp, threads[next_idx].rsp);
+    // Emit explicit evidence when an AP runs a Ring-3 task
+    if (cpu_id != 0 and threads[chosen_idx].sid != 0 and !ap_task_logged[cpu_id][chosen_idx]) {
+        ap_task_logged[cpu_id][chosen_idx] = true;
+        logApTaskExecution(cpu_id, chosen_idx);
+    }
 
-    // After returning to the new thread's context: restore its page table and
-    // kernel interrupt stack so that Ring-3 interrupts land on the right stack.
-    const t = &threads[current_thread_idx];
+    switchContext(&threads[old_idx].rsp, threads[chosen_idx].rsp);
+
+    // After returning from switchContext (we may now be running on a different CPU):
+    const current_cpu = smp.getCurrentCpuId();
+    if (prev_switched_thread[current_cpu]) |prev| {
+        thread_active[prev] = false;
+        prev_switched_thread[current_cpu] = null;
+    }
+
+    const t = &threads[current_thread_per_cpu[current_cpu]];
     if (t.user_pml4 != 0) {
         arch.cpu.writeCr3(t.user_pml4);
     }
     if (t.kernel_int_stack_top != 0) {
-        gdt.setKernelRsp0(t.kernel_int_stack_top);
+        gdt.setKernelRsp0ForCpu(current_cpu, t.kernel_int_stack_top);
     }
+
+    releaseScheduleLock();
 }
 
 /// Called from vmexitStub (on the VMX host stack) when the guest session is
 /// complete and the VMX thread should yield to other ready threads indefinitely.
 pub export fn catenary_vmx_guest_done() callconv(.c) noreturn {
+    get_current_thread().state = .Waiting;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile ("sti");
+    }
     while (true) {
         schedule();
+        asm volatile ("pause");
     }
 }

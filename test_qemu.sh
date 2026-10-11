@@ -17,7 +17,11 @@ DEFAULT_VMX_LINUX_PATTERNS=""
 
 case "${SMOKE_PROFILE}" in
     default)
-        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
+        if [ "${SMP:-2}" -eq 1 ]; then
+            DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
+        else
+            DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
+        fi
         ;;
     vmx-linux)
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=true -Dvmm_active=true -Dvmm_launch_linux=true -Dservices_active=false"
@@ -93,11 +97,16 @@ elif [ "${REQUIRE_KVM}" -eq 1 ]; then
     exit 2
 fi
 
+if [ ! -f test_disk.img ]; then
+    dd if=/dev/zero of=test_disk.img bs=1M count=64 status=none
+fi
+
 echo "[+] Starting QEMU (accel=${ACCEL}, timeout=${TIMEOUT_SECS}s)..."
 # GTK_PATH= is required to prevent snap-related crashes in some environments
 GTK_PATH= qemu-system-x86_64 \
     -M q35 -m 1G \
     -cpu "${CPU}" -accel "${ACCEL}" \
+    -smp "${SMP:-2}" \
     -cdrom catenary.iso -boot d \
     -chardev file,id=s0,path=qemu_serial.log \
     -serial chardev:s0 \

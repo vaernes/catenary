@@ -35,6 +35,16 @@ pub const cpu = switch (builtin.cpu.arch) {
     else => @compileError("Unsupported arch for CPU"),
 };
 
+pub const smp = switch (builtin.cpu.arch) {
+    .x86_64 => @import("arch/x86_64/smp.zig"),
+    else => struct {
+        pub const MAX_CPUS: usize = 1;
+        pub fn getCurrentCpuId() usize {
+            return 0;
+        }
+    },
+};
+
 pub const hardening = switch (builtin.cpu.arch) {
     .x86_64 => @import("arch/x86_64/hardening.zig"),
     else => struct {

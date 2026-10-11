@@ -18,16 +18,39 @@ pub const Tss = packed struct {
     iopb_offset: u16 = 104,
 };
 
-var gdt: [7]u64 align(16) = undefined;
-var gdtr: cpu.DescriptorTablePointer = undefined;
+pub const MAX_CPUS: usize = 8;
 
-// Dedicated 16KB stack for IST1 (double-fault handler).
+var gdt: [5 + MAX_CPUS * 2]u64 align(16) = undefined;
+pub var gdtr: cpu.DescriptorTablePointer = undefined;
+
+// Dedicated 16KB stack per CPU for IST1 (double-fault handler).
 // Must survive for the entire kernel lifetime.
-var ist1_stack: [16384]u8 align(16) linksection(".bss") = undefined;
+var per_cpu_ist1_stacks: [MAX_CPUS][16384]u8 align(16) linksection(".bss") = undefined;
 
-var tss: Tss align(16) = .{
+var per_cpu_tss: [MAX_CPUS]Tss align(16) = [_]Tss{.{
     .iopb_offset = @sizeOf(Tss),
-};
+}} ** MAX_CPUS;
+
+pub fn tssSelectorForCpu(cpu_id: usize) u16 {
+    return @as(u16, @intCast(0x28 + cpu_id * 16));
+}
+
+pub fn initTssForCpu(cpu_id: usize) void {
+    if (cpu_id >= MAX_CPUS) return;
+    per_cpu_tss[cpu_id].ist1 = @intFromPtr(&per_cpu_ist1_stacks[cpu_id]) + per_cpu_ist1_stacks[cpu_id].len;
+    per_cpu_tss[cpu_id].iopb_offset = @sizeOf(Tss);
+
+    const tss_ptr = @intFromPtr(&per_cpu_tss[cpu_id]);
+    const tss_limit = @as(u64, @sizeOf(Tss) - 1);
+    const gdt_idx = 5 + cpu_id * 2;
+
+    gdt[gdt_idx] = (tss_limit & 0xFFFF) |
+        ((tss_ptr & 0xFFFFFF) << 16) |
+        (0x89 << 40) | // Present, Type 9 (Available 64-bit TSS)
+        (((tss_limit >> 16) & 0x0F) << 48) |
+        (((tss_ptr >> 24) & 0xFF) << 56);
+    gdt[gdt_idx + 1] = (tss_ptr >> 32);
+}
 
 pub fn init() void {
     gdt[0] = 0; // Null descriptor
@@ -36,22 +59,13 @@ pub fn init() void {
     gdt[3] = 0x00affb0000000000; // User code (0x18) - DPL 3, Long Mode, Readable
     gdt[4] = 0x00aff30000000000; // User data (0x20) - DPL 3, Writable, Long Mode (Ignored but present)
 
-    // Populate IST1 with the dedicated double-fault stack.
-    tss.ist1 = @intFromPtr(&ist1_stack) + ist1_stack.len;
-
-    // TSS Descriptor (Task State Segment) - 16 bytes in x86_64
-    const tss_ptr = @intFromPtr(&tss);
-    const tss_limit = @as(u64, @sizeOf(Tss) - 1);
-
-    gdt[5] = (tss_limit & 0xFFFF) |
-        ((tss_ptr & 0xFFFFFF) << 16) |
-        (0x89 << 40) | // Present, Type 9 (Available 64-bit TSS)
-        (((tss_limit >> 16) & 0x0F) << 48) |
-        (((tss_ptr >> 24) & 0xFF) << 56);
-    gdt[6] = (tss_ptr >> 32);
+    // Pre-initialize TSS descriptors for all supported cores (0..MAX_CPUS-1)
+    for (0..MAX_CPUS) |i| {
+        initTssForCpu(i);
+    }
 
     gdtr = cpu.DescriptorTablePointer{
-        .limit = @as(u16, (7 * 8) - 1),
+        .limit = @as(u16, ((5 + MAX_CPUS * 2) * 8) - 1),
         .base = @intFromPtr(&gdt),
     };
 
@@ -66,12 +80,13 @@ pub fn init() void {
         \\mov %ax, %gs
         \\mov %ax, %ss
         \\pushq $0x08
-        \\pushq $1f
+        \\leaq 1f(%rip), %rax
+        \\pushq %rax
         \\lretq
         \\1:
     );
 
-    cpu.ltr(0x28);
+    cpu.ltr(tssSelectorForCpu(0));
 }
 
 pub const USER_CODE_SELECTOR: u16 = 0x18;
@@ -79,12 +94,26 @@ pub const USER_DATA_SELECTOR: u16 = 0x20;
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 
+pub fn getCurrentCpuId() usize {
+    const c1 = cpu.cpuid(1, 0);
+    const lapic_id: usize = @as(usize, @intCast((c1.ebx >> 24) & 0xFF));
+    return if (lapic_id < MAX_CPUS) lapic_id else 0;
+}
+
 pub fn setKernelRsp0(rsp: u64) void {
-    tss.rsp0 = rsp;
+    const cpu_id = getCurrentCpuId();
+    per_cpu_tss[cpu_id].rsp0 = rsp;
+}
+
+pub fn setKernelRsp0ForCpu(cpu_id: usize, rsp: u64) void {
+    if (cpu_id < MAX_CPUS) {
+        per_cpu_tss[cpu_id].rsp0 = rsp;
+    }
 }
 
 pub fn getKernelRsp0() u64 {
-    return tss.rsp0;
+    const cpu_id = getCurrentCpuId();
+    return per_cpu_tss[cpu_id].rsp0;
 }
 
 fn printHex(n: u64) void {
@@ -97,5 +126,6 @@ fn printHex(n: u64) void {
 }
 
 pub fn tssBase() u64 {
-    return @intFromPtr(&tss);
+    return @intFromPtr(&per_cpu_tss[0]);
 }
+

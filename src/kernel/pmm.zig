@@ -33,6 +33,18 @@ var bitmap_size_in_bytes: usize = 0;
 var initialized: bool = false;
 var next_search_page: usize = 1;
 
+var pmm_lock: bool = false;
+
+fn pmmAcquire() void {
+    while (@atomicRmw(bool, &pmm_lock, .Xchg, true, .seq_cst)) {
+        asm volatile ("pause");
+    }
+}
+
+fn pmmRelease() void {
+    @atomicStore(bool, &pmm_lock, false, .seq_cst);
+}
+
 pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64) void {
     var highest_addr: u64 = 0;
     const entries = memmap.entries[0..memmap.entry_count];
@@ -90,6 +102,7 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64) void {
 
     // Mark page 0 as reserved
     setBit(0);
+    setBit(0x8000 / PAGE_SIZE); // Reserve page 8 (0x8000) for SMP AP trampoline
 
     // Mark kernel memory as reserved
     for (entries) |entry| {
@@ -124,6 +137,8 @@ pub fn testBit(bit: usize) bool {
 }
 
 pub fn allocPage() ?u64 {
+    pmmAcquire();
+    defer pmmRelease();
     if (!initialized) return null;
 
     var page = next_search_page;
@@ -154,6 +169,8 @@ pub fn allocPage() ?u64 {
 }
 
 pub fn allocContiguousAligned(n_pages: u64, alignment_pages: u64) ?u64 {
+    pmmAcquire();
+    defer pmmRelease();
     if (!initialized) return null;
     if (n_pages == 0) return null;
     if (alignment_pages == 0) return null;
@@ -195,6 +212,8 @@ pub fn allocContiguousAligned(n_pages: u64, alignment_pages: u64) ?u64 {
 }
 
 pub fn allocContiguous(n_pages: u64) ?u64 {
+    pmmAcquire();
+    defer pmmRelease();
     if (!initialized) return null;
     if (n_pages == 0) return null;
 
@@ -250,6 +269,8 @@ fn serialWriteSecurity(s: []const u8) void {
 }
 
 pub fn freePage(phys_addr: u64) void {
+    pmmAcquire();
+    defer pmmRelease();
     if (!initialized) return;
     const page = phys_addr / PAGE_SIZE;
     if (page >= highest_page) return;
@@ -298,6 +319,8 @@ pub const GuardedRegion = struct {
 };
 
 fn reserveContiguous(pages: usize) ?usize {
+    pmmAcquire();
+    defer pmmRelease();
     if (!initialized or pages == 0) return null;
     if (pages >= highest_page) return null;
 
@@ -353,6 +376,8 @@ pub fn allocGuardedRegion(n_pages: usize) ?GuardedRegion {
 
 /// Free a previously allocated guarded region (guards + data pages).
 pub fn freeGuardedRegion(region: GuardedRegion) void {
+    pmmAcquire();
+    defer pmmRelease();
     if (!initialized) return;
 
     // Zero the data pages (not the guard pages — they're unmapped).

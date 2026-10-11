@@ -2429,7 +2429,9 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
             cpu.outb(0x20, 0x20); // EOI to PIC master
             if (build_options.services_active) {
                 const scheduler = @import("../../kernel/scheduler.zig");
+                asm volatile ("sti");
                 scheduler.schedule();
+                asm volatile ("cli");
             }
             return true;
         },

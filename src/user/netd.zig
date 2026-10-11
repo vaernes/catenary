@@ -104,7 +104,6 @@ const SYS_YIELD = lib.SYS_YIELD;
 const DIPC_RECV_VA: u64 = lib.DIPC_RECV_VA;
 const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
 const PAGE_SIZE: u64 = lib.PAGE_SIZE;
-const CONTROL_OUTBOX_VA: u64 = DMA_BASE_VA + 10 * PAGE_SIZE;
 const DEFAULT_LINK_MTU: u16 = 1500;
 const NETD_ENDPOINT: u64 = @intFromEnum(lib.ReservedEndpoint.netd);
 const NETD_SERVICE_MASK: u32 = @as(u32, 1) << @as(u5, @intCast(@intFromEnum(lib.ServiceKind.netd)));
@@ -187,14 +186,16 @@ const VirtqUsed = extern struct {
     ring: [QUEUE_SIZE]VirtqUsedElem,
 };
 
-// DMA layout (window slots, contiguous per allocation):
+// DMA layout (window slots, contiguous per allocation: 16 pages):
 // Slot 0-2: RX ring (3 pages for a 256-entry legacy split ring)
 // Slot 3-5: TX ring
 // Slot 6-7: RX frame buffers (2 pages = 8 × 1024-byte buffers)
 // Slot 8:   TX frame buffer
-// Slot 9:   DIPC routing scratch page
-// Slot 10:  netd control outbox page
-// Slot 11:  RX poller stack page
+// Slot 9:   TX DIPC routing scratch page
+// Slot 10:  TX netd control outbox page
+// Slot 11:  RX DIPC routing scratch page
+// Slot 12:  RX netd control outbox page
+// Slot 13-14: RX poller stack pages (stack top at slot 15)
 const RX_DESC_VA: u64 = DMA_BASE_VA + 0 * PAGE_SIZE;
 const RX_AVAIL_VA: u64 = DMA_BASE_VA + 0 * PAGE_SIZE + @sizeOf([QUEUE_SIZE]VirtqDesc);
 const RX_USED_VA: u64 = DMA_BASE_VA + 2 * PAGE_SIZE;
@@ -203,7 +204,10 @@ const TX_AVAIL_VA: u64 = DMA_BASE_VA + 3 * PAGE_SIZE + @sizeOf([QUEUE_SIZE]Virtq
 const TX_USED_VA: u64 = DMA_BASE_VA + 5 * PAGE_SIZE;
 const RXBUF_VA: u64 = DMA_BASE_VA + 6 * PAGE_SIZE;
 const TXBUF_VA: u64 = DMA_BASE_VA + 8 * PAGE_SIZE;
-const DIPC_SCRATCH_VA: u64 = DMA_BASE_VA + 9 * PAGE_SIZE;
+const TX_DIPC_SCRATCH_VA: u64 = DMA_BASE_VA + 9 * PAGE_SIZE;
+const TX_CONTROL_OUTBOX_VA: u64 = DMA_BASE_VA + 10 * PAGE_SIZE;
+const RX_DIPC_SCRATCH_VA: u64 = DMA_BASE_VA + 11 * PAGE_SIZE;
+const RX_CONTROL_OUTBOX_VA: u64 = DMA_BASE_VA + 12 * PAGE_SIZE;
 const RX_BUF_SIZE: u32 = 1024; // per RX descriptor buffer
 const NUM_RX_BUFS: u16 = 8; // pre-populated RX descriptors
 
@@ -225,9 +229,34 @@ var g_rx_ring_phys: u64 = 0;
 var g_tx_ring_phys: u64 = 0;
 var g_rxbuf_phys: u64 = 0;
 var g_txbuf_phys: u64 = 0;
-var g_dipc_scratch_phys: u64 = 0;
-var g_control_outbox_phys: u64 = 0;
+var g_tx_dipc_scratch_phys: u64 = 0;
+var g_tx_control_outbox_phys: u64 = 0;
+var g_rx_dipc_scratch_phys: u64 = 0;
+var g_rx_control_outbox_phys: u64 = 0;
 var g_kernel_control_endpoint: u64 = 0;
+
+var g_tx_lock: bool = false;
+var g_tcp_lock: bool = false;
+
+fn acquireTxLock() void {
+    while (@atomicRmw(bool, &g_tx_lock, .Xchg, true, .seq_cst)) {
+        asm volatile ("pause");
+    }
+}
+
+fn releaseTxLock() void {
+    @atomicStore(bool, &g_tx_lock, false, .seq_cst);
+}
+
+fn acquireTcpLock() void {
+    while (@atomicRmw(bool, &g_tcp_lock, .Xchg, true, .seq_cst)) {
+        asm volatile ("pause");
+    }
+}
+
+fn releaseTcpLock() void {
+    @atomicStore(bool, &g_tcp_lock, false, .seq_cst);
+}
 
 // IPv6 Neighbor Cache — maps IPv6 address → Ethernet MAC.
 const NEIGHBOR_CACHE_SIZE: usize = 32;
@@ -417,13 +446,20 @@ fn resolveNextHop(dst_node: *const [16]u8, next_hop_out: *[16]u8) void {
     }
 }
 
-fn sendNetdMessage(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op, payload: []const u8) bool {
-    if (g_control_outbox_phys == 0) return false;
+fn sendNetdMessageWithOutbox(
+    outbox_va: u64,
+    outbox_phys: u64,
+    dst_node: *const [16]u8,
+    dst_endpoint: u64,
+    op: netd_proto.Op,
+    payload: []const u8,
+) bool {
+    if (outbox_phys == 0) return false;
 
     const total_payload_len = @sizeOf(netd_proto.NetdHeader) + payload.len;
     if (lib.DIPC_HEADER_SIZE + total_payload_len > PAGE_SIZE) return false;
 
-    const outbox: [*]u8 = lib.ptrFrom([*]u8, CONTROL_OUTBOX_VA);
+    const outbox: [*]u8 = lib.ptrFrom([*]u8, outbox_va);
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(outbox));
     header.* = .{
         .magic = lib.WireMagic,
@@ -445,7 +481,17 @@ fn sendNetdMessage(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op
         );
     }
 
-    return lib.syscall(SYS_SEND_PAGE, g_control_outbox_phys, 0, g_token) == 0;
+    return lib.syscall(SYS_SEND_PAGE, outbox_phys, 0, g_token) == 0;
+}
+
+// For umain (thread 0):
+fn sendNetdMessageTx(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op, payload: []const u8) bool {
+    return sendNetdMessageWithOutbox(TX_CONTROL_OUTBOX_VA, g_tx_control_outbox_phys, dst_node, dst_endpoint, op, payload);
+}
+
+// For rxPollerLoop (thread 1):
+fn sendNetdMessageRx(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op, payload: []const u8) bool {
+    return sendNetdMessageWithOutbox(RX_CONTROL_OUTBOX_VA, g_rx_control_outbox_phys, dst_node, dst_endpoint, op, payload);
 }
 
 fn sendSelfPeerAnnouncement(dst_node: *const [16]u8) bool {
@@ -456,18 +502,18 @@ fn sendSelfPeerAnnouncement(dst_node: *const [16]u8) bool {
         .flags = localPeerFlags(),
         .mac = g_our_mac,
     };
-    return sendNetdMessage(dst_node, NETD_ENDPOINT, .peer_announce, std.mem.asBytes(&payload));
+    return sendNetdMessageTx(dst_node, NETD_ENDPOINT, .peer_announce, std.mem.asBytes(&payload));
 }
 
 fn sendNodeAddrReply(dst_node: *const [16]u8, dst_endpoint: u64) void {
     const reply = netd_proto.NodeAddrReply{ .addr = g_our_ipv6 };
-    _ = sendNetdMessage(dst_node, dst_endpoint, .node_addr_reply, std.mem.asBytes(&reply));
+    _ = sendNetdMessageTx(dst_node, dst_endpoint, .node_addr_reply, std.mem.asBytes(&reply));
 }
 
 fn sendPeerSnapshotReply(dst_node: *const [16]u8, dst_endpoint: u64) void {
     var reply = netd_proto.PeerSnapshotReply{ .count = 0 };
     fillPeerSnapshot(&reply);
-    _ = sendNetdMessage(dst_node, dst_endpoint, .peer_snapshot_reply, std.mem.asBytes(&reply));
+    _ = sendNetdMessageTx(dst_node, dst_endpoint, .peer_snapshot_reply, std.mem.asBytes(&reply));
 }
 
 fn lookupNeighbor(ipv6: *const [16]u8) ?[6]u8 {
@@ -560,6 +606,12 @@ fn sendDipcPageToWire(dst_node: *const [16]u8, dipc_page: []const u8) void {
     put_be16(frame[56..58], DIPC_UDP_PORT);
     put_be16(frame[58..60], @as(u16, @intCast(8 + dipc_page.len)));
     @memcpy(frame[62 .. 62 + dipc_page.len], dipc_page);
+    if (dipc_page.len >= lib.DIPC_HEADER_SIZE) {
+        const out_hdr: *align(1) lib.PageHeader = @ptrCast(&frame[62]);
+        if (isLoopbackIpv6(&out_hdr.src.node.bytes) or isUnspecifiedIpv6(&out_hdr.src.node.bytes)) {
+            @memcpy(&out_hdr.src.node.bytes, &g_our_ipv6);
+        }
+    }
     txFrame(frame[0..frame_len]);
 }
 
@@ -702,6 +754,9 @@ fn replenishRx(desc_idx: u16) void {
 // Transmit a raw ethernet frame (no virtio-net header wrap needed for legacy
 // DMA-direct; the header is prepended here).
 fn txFrame(frame: []const u8) void {
+    acquireTxLock();
+    defer releaseTxLock();
+
     // Ensure previous TX is done (single-descriptor TX, wait for it).
     var spin: u32 = 100_000;
     const used = txUsed();
@@ -927,7 +982,7 @@ fn seedSyntheticMac(seed: u64, out: *[6]u8) void {
 }
 
 fn publishKernelNodeAddress(bs: *const BootstrapDescriptor, token: u64) bool {
-    const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, TX_DIPC_SCRATCH_VA);
     const bootstrap_node = lib.Ipv6Addr{ .bytes = bs.local_node };
 
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
@@ -952,7 +1007,7 @@ fn publishKernelNodeAddress(bs: *const BootstrapDescriptor, token: u64) bool {
         .addr = .{ .bytes = g_our_ipv6 },
     };
 
-    const ok = lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, token) == 0;
+    const ok = lib.syscall(SYS_SEND_PAGE, g_tx_dipc_scratch_phys, 0, token) == 0;
     if (ok) {
         sendNodeAddrReply(&g_our_ipv6, @intFromEnum(lib.ReservedEndpoint.clusterd));
     }
@@ -1136,11 +1191,11 @@ fn sendTcpConnectAckToOwner(sock: *Socket, status: u16) void {
         .status = status,
         .local_port = sock.local_port,
     };
-    _ = sendNetdMessage(&sock.owner_node, sock.owner_endpoint, .tcp_connect_ack, std.mem.asBytes(&reply));
+    _ = sendNetdMessageRx(&sock.owner_node, sock.owner_endpoint, .tcp_connect_ack, std.mem.asBytes(&reply));
 }
 
 fn sendTcpRecvToOwner(sock: *Socket, data: []const u8) void {
-    if (sock.owner_endpoint == 0 or g_control_outbox_phys == 0) return;
+    if (sock.owner_endpoint == 0 or g_rx_control_outbox_phys == 0) return;
     const total_len = @sizeOf(netd_proto.TcpRecvPayload) + data.len;
     if (total_len > 1024) return;
 
@@ -1152,7 +1207,7 @@ fn sendTcpRecvToOwner(sock: *Socket, data: []const u8) void {
         ._pad = 0,
     };
     @memcpy(buf[@sizeOf(netd_proto.TcpRecvPayload) .. total_len], data);
-    _ = sendNetdMessage(&sock.owner_node, sock.owner_endpoint, .tcp_recv, buf[0..total_len]);
+    _ = sendNetdMessageRx(&sock.owner_node, sock.owner_endpoint, .tcp_recv, buf[0..total_len]);
 }
 
 fn sendTcpClosedToOwner(sock: *Socket, reason: u16) void {
@@ -1162,10 +1217,12 @@ fn sendTcpClosedToOwner(sock: *Socket, reason: u16) void {
         .reason = reason,
         ._pad = 0,
     };
-    _ = sendNetdMessage(&sock.owner_node, sock.owner_endpoint, .tcp_closed, std.mem.asBytes(&payload));
+    _ = sendNetdMessageRx(&sock.owner_node, sock.owner_endpoint, .tcp_closed, std.mem.asBytes(&payload));
 }
 
 fn handleTcpListen(page_hdr: *align(1) const lib.PageHeader, port: u16) void {
+    acquireTcpLock();
+    defer releaseTcpLock();
     lib.serialWrite("netd: TCP listen on port ");
     printDec(port);
     lib.serialWrite(" acknowledged\n");
@@ -1192,10 +1249,12 @@ fn handleTcpListen(page_hdr: *align(1) const lib.PageHeader, port: u16) void {
         }
     }
 
-    _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_listen_ack, std.mem.asBytes(&ack));
+    _ = sendNetdMessageTx(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_listen_ack, std.mem.asBytes(&ack));
 }
 
 fn handleTcpConnect(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    acquireTcpLock();
+    defer releaseTcpLock();
     if (payload_len < @sizeOf(netd_proto.TcpConnectPayload)) return;
     const req: *align(1) const netd_proto.TcpConnectPayload = @ptrFromInt(payload_va);
 
@@ -1207,7 +1266,7 @@ fn handleTcpConnect(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, p
 
     const sock = allocTcpSocket() orelse {
         ack.status = 2; // table full
-        _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_connect_ack, std.mem.asBytes(&ack));
+        _ = sendNetdMessageTx(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_connect_ack, std.mem.asBytes(&ack));
         return;
     };
 
@@ -1248,10 +1307,12 @@ fn handleTcpConnect(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, p
         &[_]u8{},
     );
 
-    _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_connect_ack, std.mem.asBytes(&ack));
+    _ = sendNetdMessageTx(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_connect_ack, std.mem.asBytes(&ack));
 }
 
 fn handleTcpSend(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    acquireTcpLock();
+    defer releaseTcpLock();
     _ = page_hdr;
     if (payload_len < @sizeOf(netd_proto.TcpSendPayload)) return;
     const req: *align(1) const netd_proto.TcpSendPayload = @ptrFromInt(payload_va);
@@ -1278,6 +1339,8 @@ fn handleTcpSend(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payl
 }
 
 fn handleTcpClose(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    acquireTcpLock();
+    defer releaseTcpLock();
     _ = page_hdr;
     if (payload_len < @sizeOf(netd_proto.TcpClosePayload)) return;
     const req: *align(1) const netd_proto.TcpClosePayload = @ptrFromInt(payload_va);
@@ -1319,6 +1382,8 @@ fn handleTcpClose(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, pay
 }
 
 fn handleTcpStatus(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, payload_len: usize) void {
+    acquireTcpLock();
+    defer releaseTcpLock();
     if (payload_len < @sizeOf(netd_proto.TcpStatusPayload)) return;
     const req: *align(1) const netd_proto.TcpStatusPayload = @ptrFromInt(payload_va);
 
@@ -1339,10 +1404,12 @@ fn handleTcpStatus(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, pa
         reply.rx_buffered = @as(u32, @intCast(sock.rx_len));
     }
 
-    _ = sendNetdMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_status_reply, std.mem.asBytes(&reply));
+    _ = sendNetdMessageTx(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .tcp_status_reply, std.mem.asBytes(&reply));
 }
 
 fn handleTcpFrame(f: []const u8, frame_len: usize, token: u64) void {
+    acquireTcpLock();
+    defer releaseTcpLock();
     _ = token;
     if (frame_len < 54 + tcp.TCP_HEADER_MIN_SIZE) return;
 
@@ -1633,24 +1700,28 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
                 if (udp_payload_len >= 4) {
                     const magic = std.mem.readInt(u32, udp_payload[0..4], .little);
                     if (magic == DIPC_WIRE_MAGIC and udp_payload_len >= DIPC_HEADER_SIZE) {
-                        // Copy DIPC header+payload into scratch page and route.
+                        // Copy DIPC header+payload into dedicated RX scratch page and route.
                         const copy_len = @min(@as(usize, udp_payload_len), PAGE_SIZE);
                         @memcpy(
-                            lib.ptrFrom([*]u8, DIPC_SCRATCH_VA)[0..copy_len],
+                            lib.ptrFrom([*]u8, RX_DIPC_SCRATCH_VA)[0..copy_len],
                             udp_payload[0..copy_len],
                         );
 
-                        const scratch_hdr: *align(1) lib.PageHeader = @ptrFromInt(DIPC_SCRATCH_VA);
+                        const scratch_hdr: *align(1) lib.PageHeader = @ptrFromInt(RX_DIPC_SCRATCH_VA);
                         if (scratch_hdr.version == DIPC_WIRE_VERSION and
-                            @as(usize, scratch_hdr.header_len) == DIPC_HEADER_SIZE and
-                            isAllNodesMulticast(&scratch_hdr.dst.node.bytes))
+                            @as(usize, scratch_hdr.header_len) == DIPC_HEADER_SIZE)
                         {
-                            for (g_our_ipv6, 0..) |byte, index| {
-                                scratch_hdr.dst.node.bytes[index] = byte;
+                            if (isAllNodesMulticast(&scratch_hdr.dst.node.bytes)) {
+                                for (g_our_ipv6, 0..) |byte, index| {
+                                    scratch_hdr.dst.node.bytes[index] = byte;
+                                }
+                            }
+                            if (isLoopbackIpv6(&scratch_hdr.src.node.bytes) or isUnspecifiedIpv6(&scratch_hdr.src.node.bytes)) {
+                                @memcpy(&scratch_hdr.src.node.bytes, src_ip);
                             }
                         }
 
-                        _ = lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, token);
+                        _ = lib.syscall(SYS_SEND_PAGE, g_rx_dipc_scratch_phys, 0, token);
                     }
                 }
             }
@@ -1786,10 +1857,12 @@ pub export fn umain() noreturn {
 
     if (!found) {
         lib.serialWrite("netd: no virtio-net found; entering fallback loop\n");
-        const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 12, 0, token);
+        const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 16, 0, token);
         if (dma_base_phys != 0) {
-            g_dipc_scratch_phys = dma_base_phys + 9 * PAGE_SIZE;
-            g_control_outbox_phys = dma_base_phys + 10 * PAGE_SIZE;
+            g_tx_dipc_scratch_phys = dma_base_phys + 9 * PAGE_SIZE;
+            g_tx_control_outbox_phys = dma_base_phys + 10 * PAGE_SIZE;
+            g_rx_dipc_scratch_phys = dma_base_phys + 11 * PAGE_SIZE;
+            g_rx_control_outbox_phys = dma_base_phys + 12 * PAGE_SIZE;
         }
         seedSyntheticMac(token, &g_our_mac);
         deriveLinkLocal(&g_our_mac, &g_our_ipv6);
@@ -1833,8 +1906,9 @@ pub export fn umain() noreturn {
     _ = inl(g_io_base + VIRTIO_PCI_HOST_FEATURES);
     outl(g_io_base + VIRTIO_PCI_GUEST_FEATURES, 0);
 
-    // Allocate 13 contiguous DMA pages: rings(0-8), scratch(9), outbox(10), unused(11), rx-poller stack(12).
-    const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 13, 0, token);
+    // Allocate 16 contiguous DMA pages:
+    // rings(0-8), tx_scratch(9), tx_outbox(10), rx_scratch(11), rx_outbox(12), stack(13-14, top=15).
+    const dma_base_phys = lib.syscall(SYS_ALLOC_DMA, 16, 0, token);
     if (dma_base_phys == 0) {
         lib.serialWrite("netd: DMA alloc failed\n");
         while (true) asm volatile ("pause");
@@ -1844,9 +1918,11 @@ pub export fn umain() noreturn {
     g_tx_ring_phys = dma_base_phys + 3 * PAGE_SIZE;
     g_rxbuf_phys = dma_base_phys + 6 * PAGE_SIZE;
     g_txbuf_phys = dma_base_phys + 8 * PAGE_SIZE;
-    g_dipc_scratch_phys = dma_base_phys + 9 * PAGE_SIZE;
-    g_control_outbox_phys = dma_base_phys + 10 * PAGE_SIZE;
-    const rx_poller_stack_phys = dma_base_phys + 11 * PAGE_SIZE;
+    g_tx_dipc_scratch_phys = dma_base_phys + 9 * PAGE_SIZE;
+    g_tx_control_outbox_phys = dma_base_phys + 10 * PAGE_SIZE;
+    g_rx_dipc_scratch_phys = dma_base_phys + 11 * PAGE_SIZE;
+    g_rx_control_outbox_phys = dma_base_phys + 12 * PAGE_SIZE;
+    const rx_poller_stack_phys = dma_base_phys + 13 * PAGE_SIZE;
     _ = rx_poller_stack_phys;
 
     lib.serialWrite("netd: stage dma ok\n");
@@ -1905,8 +1981,8 @@ pub export fn umain() noreturn {
 
     sendUnsolicitedNA();
 
-    // Spawn dedicated RX poller thread
-    const stack_top: u64 = DMA_BASE_VA + 12 * PAGE_SIZE;
+    // Spawn dedicated RX poller thread (stack top at slot 15)
+    const stack_top: u64 = DMA_BASE_VA + 15 * PAGE_SIZE;
     const tid = lib.spawnThread(&rxPollerLoop, stack_top, token);
     if (tid != 0xFFFFFFFF) {
         lib.serialWrite("netd: rx-poller thread spawned tid=");
@@ -1919,14 +1995,14 @@ pub export fn umain() noreturn {
     lib.serialWrite("netd: NIC ready, entering DIPC/NIC event loop\n");
 
     // Send initial peer announcement immediately upon entering event loop
-    if (g_control_outbox_phys != 0) {
+    if (g_tx_control_outbox_phys != 0) {
         _ = sendSelfPeerAnnouncement(&IPV6_ALL_NODES_MULTICAST);
     }
 
     var poll_counter: u32 = 0;
     while (true) {
         poll_counter +%= 1;
-        if (poll_counter % 10 == 0 and g_control_outbox_phys != 0) {
+        if (poll_counter % 10 == 0 and g_tx_control_outbox_phys != 0) {
             _ = sendSelfPeerAnnouncement(&IPV6_ALL_NODES_MULTICAST);
         }
         if (!pollDipc(token)) {

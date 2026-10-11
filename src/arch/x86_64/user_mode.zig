@@ -4,6 +4,7 @@ const gdt = @import("gdt.zig");
 const host_paging = @import("paging.zig");
 const idt = @import("idt.zig");
 const cpu = @import("cpu.zig");
+const smp = @import("smp.zig");
 const pmm = @import("../../kernel/pmm.zig");
 const scheduler = @import("../../kernel/scheduler.zig");
 const service_bootstrap = @import("../../services/service_bootstrap.zig");
@@ -62,6 +63,7 @@ pub fn ensureKernelEntryStack() !void {
 }
 
 pub fn service_trampoline_bridge() callconv(.c) void {
+    scheduler.onThreadFirstDispatch();
     // This function is entered via `ret` from switchContext — SysV arg registers
     // (rdi/rsi/rdx) are NOT initialized here.  Look up entry/stack from the
     // service registry using the current thread's sid instead.
@@ -107,6 +109,7 @@ pub fn service_trampoline_bridge() callconv(.c) void {
 /// Reads entry/stack from the current Thread struct (set by spawnUserThread)
 /// and enters user mode at the service-supplied RIP.
 pub fn service_extra_thread_trampoline() callconv(.c) void {
+    scheduler.onThreadFirstDispatch();
     const thread = scheduler.get_current_thread();
     const sid = thread.sid;
 
@@ -135,6 +138,26 @@ pub fn service_extra_thread_trampoline() callconv(.c) void {
     enterUserMode(thread.user_entry, thread.user_stack_va, 0, 0x18, 0x20);
 }
 
+fn userSerialAcquire() void {
+    smp.serialAcquire();
+}
+
+fn userSerialRelease() void {
+    smp.serialRelease();
+}
+
+var pci_lock: bool = false;
+
+fn pciAcquire() void {
+    while (@atomicRmw(bool, &pci_lock, .Xchg, true, .seq_cst)) {
+        asm volatile ("pause");
+    }
+}
+
+fn pciRelease() void {
+    @atomicStore(bool, &pci_lock, false, .seq_cst);
+}
+
 fn outb(port: u16, val: u8) void {
     cpu.outb(port, val);
 }
@@ -144,10 +167,12 @@ fn serialByte(c: u8) void {
 }
 
 fn serialWrite(s: []const u8) void {
+    userSerialAcquire();
+    defer userSerialRelease();
     for (s) |c| outb(0x3F8, c);
 }
 
-fn printHex(n: u64) void {
+fn printHexRaw(n: u64) void {
     const hex = "0123456789ABCDEF";
     var shift: u6 = 60;
     while (true) {
@@ -156,6 +181,12 @@ fn printHex(n: u64) void {
         if (shift == 0) break;
         shift -= 4;
     }
+}
+
+fn printHex(n: u64) void {
+    userSerialAcquire();
+    defer userSerialRelease();
+    printHexRaw(n);
 }
 
 inline fn clearSmapAccessIfActive() void {
@@ -218,11 +249,8 @@ pub export fn userModeGpBridge(error_code: u64, rip: u64, cs: u64, flags: u64, r
     scheduler.schedule();
 }
 
-pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, flags: u64, rsp: u64, ss: u64) void {
+pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64) void {
     clearSmapAccessIfActive();
-    _ = flags;
-    _ = rsp;
-    _ = ss;
     current_user_state.demo_status = .page_fault;
     current_user_state.demo_error_code = error_code;
     current_user_state.demo_cr2 = cr2;
@@ -242,6 +270,8 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
     printHex(error_code);
     serialWrite(" rip=0x");
     printHex(rip);
+    serialWrite(" cs=0x");
+    printHex(cs);
     serialWrite("\n");
 
     // If Ring-3 fault, park the thread to prevent an infinite fault loop.
@@ -249,6 +279,12 @@ pub export fn userModePfBridge(error_code: u64, cr2: u64, rip: u64, cs: u64, fla
         const t_pf = scheduler.get_current_thread();
         t_pf.state = .Waiting;
         scheduler.schedule();
+    } else {
+        serialWrite("FATAL: kernel page fault\n");
+        while (true) {
+            cpu.cli();
+            cpu.hlt();
+        }
     }
 }
 
@@ -445,13 +481,17 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 };
             }
             cpu.writeCr3(pml4_5);
-            serialWrite("dma_alloc ok: sid=");
-            printHex(sid5);
-            serialWrite(" slot=");
-            printHex(slot5);
-            serialWrite(" phys=");
-            printHex(phys5);
-            serialWrite("\n");
+            {
+                userSerialAcquire();
+                defer userSerialRelease();
+                for ("dma_alloc ok: sid=") |c| outb(0x3F8, c);
+                printHexRaw(sid5);
+                for (" slot=") |c| outb(0x3F8, c);
+                printHexRaw(slot5);
+                for (" phys=") |c| outb(0x3F8, c);
+                printHexRaw(phys5);
+                outb(0x3F8, '\n');
+            }
             return phys5;
         },
         // op=6: send a DIPC page. arg0 = phys base of a DMA page holding a DIPC message.
@@ -677,6 +717,8 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
             const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
             if (kind != .storaged and kind != .netd) return 0xFFFFFFFF;
+            pciAcquire();
+            defer pciRelease();
             const bus = @as(u8, @truncate(arg0 >> 24));
             const dev = @as(u8, @truncate(arg0 >> 16));
             const func = @as(u8, @truncate(arg0 >> 8));
@@ -726,6 +768,8 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const ptr = arg0;
             const len = arg1;
             if (ptr != 0 and len > 0 and len <= 4096) {
+                userSerialAcquire();
+                defer userSerialRelease();
                 const smap_active = (cpu.readCr4() & (1 << 21)) != 0;
                 if (smap_active) cpu.stac();
                 const buf: [*]const u8 = @ptrFromInt(ptr);
@@ -853,13 +897,15 @@ pub export fn gpIsr() callconv(.naked) void {
         \\pushq %r14
         \\pushq %r15
         \\
-        \\movq 112(%rsp), %rdi
-        \\movq 40(%rsp), %rsi
-        \\movq 96(%rsp), %rdx
-        \\movq 120(%rsp), %rcx
-        \\movq 72(%rsp), %r8
-        \\movq 112(%rsp), %r9
+        \\movq 120(%rsp), %rdi
+        \\movq 128(%rsp), %rsi
+        \\movq 136(%rsp), %rdx
+        \\movq 144(%rsp), %rcx
+        \\movq 152(%rsp), %r8
+        \\movq 160(%rsp), %r9
+        \\subq $8, %rsp
         \\callq userModeGpBridge
+        \\addq $8, %rsp
         \\popq %r15
         \\popq %r14
         \\popq %r13
@@ -906,10 +952,9 @@ pub export fn pfIsr() callconv(.naked) void {
         \\movq %cr2, %rsi
         \\movq 80(%rsp), %rdx
         \\movq 88(%rsp), %rcx
-        \\movq 96(%rsp), %r8
-        \\movq 104(%rsp), %r9
-        \\movq 112(%rsp), %r10
+        \\subq $8, %rsp
         \\callq userModePfBridge
+        \\addq $8, %rsp
         \\
         \\popq %r11
         \\popq %r10

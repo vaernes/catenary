@@ -22,6 +22,9 @@ pub const HandleError = (error{
 } || dipc.AllocError || router.RouteError);
 
 fn serialWrite(s: []const u8) void {
+    const smp = @import("../arch/x86_64/smp.zig");
+    smp.serialAcquire();
+    defer smp.serialRelease();
     for (s) |c| {
         asm volatile ("outb %al, %dx"
             :
@@ -147,11 +150,11 @@ fn nodeFlagsFor(table: *const endpoint_table.EndpointTable) u32 {
 fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.ControlOp) bool {
     const dipc_local = node_config.getLocalNode();
     if (op != .set_node_addr and !dipc.Ipv6Addr.eql(hdr.src.node, dipc_local)) {
-        for ("Control: reject: src_node mismatch\n") |c| arch_cpu.outb(0x3F8, c);
+        serialWrite("Control: reject: src_node mismatch\n");
         return false;
     }
     if (hdr.src.endpoint != @intFromEnum(identity.ReservedEndpoint.netd)) {
-        for ("Control: reject: src_endpoint mismatch\n") |c| arch_cpu.outb(0x3F8, c);
+        serialWrite("Control: reject: src_endpoint mismatch\n");
         return false;
     }
     return true;
@@ -219,19 +222,19 @@ pub fn handleKernelControlPage(
         },
         .set_node_addr => {
             if (!isAuthorizedControlSource(hdr, ch.op)) {
-                for ("Control: set_node_addr auth failed\n") |c| arch_cpu.outb(0x3F8, c);
+                serialWrite("Control: set_node_addr auth failed\n");
                 return error.Unauthorized;
             }
             if (remaining != @sizeOf(control_protocol.SetNodeAddrPayload)) {
-                for ("Control: set_node_addr length failed\n") |c| arch_cpu.outb(0x3F8, c);
+                serialWrite("Control: set_node_addr length failed\n");
                 return error.BadPayload;
             }
             const p: *const control_protocol.SetNodeAddrPayload = @ptrCast(@alignCast(payload_ptr));
             if (!node_config.assignLocalNode(p.addr)) {
-                for ("Control: set_node_addr lock failed\n") |c| arch_cpu.outb(0x3F8, c);
+                serialWrite("Control: set_node_addr lock failed\n");
                 return error.NodeLocked;
             }
-            for ("Control: set_node_addr success\n") |c| arch_cpu.outb(0x3F8, c);
+            serialWrite("Control: set_node_addr success\n");
         },
         .revoke_node_addr => {
             if (!isAuthorizedControlSource(hdr, ch.op)) return error.Unauthorized;

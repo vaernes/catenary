@@ -263,6 +263,7 @@ fn threadA() void {
     arch.cpu.sti();
     while (true) {
         if (scheduler.receive() != null) {}
+        scheduler.schedule();
         arch.cpu.pause();
     }
 }
@@ -270,6 +271,7 @@ fn threadA() void {
 fn threadB() void {
     arch.cpu.sti();
     while (true) {
+        scheduler.schedule();
         arch.cpu.pause();
     }
 }
@@ -467,11 +469,8 @@ pub export fn _kernel_main() callconv(.c) noreturn {
             }
 
             if (comptime builtin.cpu.arch == .x86_64) {
-                smp.init();
+                smp.init(hhdm.offset);
                 if (build_options.vmm_active) {
-                    timer.init();
-                    bootLog("Timer initialized.\n");
-                    timer_initialized_early = true;
                     hvm.init(memmap, hhdm.offset, manager.endpointTable());
                 }
             }
@@ -503,6 +502,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
     }
 
     bootLog("Catenary OS checks complete. Starting scheduler...\n");
+    scheduler.start();
 
     // Idle loop: enable interrupts, poll serial shell for operator input.
     // The shell is polled on every iteration; CPU halts between polls to
