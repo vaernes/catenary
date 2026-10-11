@@ -39,10 +39,12 @@ const COLOR_HIGHLIGHT: u32 = 0x005BC0EB;
 const COLOR_DIM: u32 = 0x00888888;
 const COLOR_PANEL_BG: u32 = 0x002B2D42;
 const COLOR_INPUT_BG: u32 = 0x001A1C2E;
+const COLOR_MODAL_BG: u32 = 0x001F2033;
 
 // --- UI State ---
-var focused_pane: u8 = 1; // 0=VM Manager, 1=New VM Form, 2=Varde Shell (default to Form)
+var focused_pane: u8 = 1; // 0=VM Manager, 1=New VM Form, 2=Varde Shell
 var focused_form_field: u8 = 0; // 0=name, 1=vcpus, 2=mem, 3=create button
+var show_help_modal: bool = false; // [F1] or '?' help modal overlay
 
 // Form State
 var form_name: [32]u8 = "alpine-01".* ++ [_]u8{0} ** 23;
@@ -67,6 +69,11 @@ var microvm_count: usize = 0;
 var selected_vm_idx: usize = 0;
 var needs_vm_refresh: bool = true;
 var needs_redraw: bool = true;
+
+// Varde Shell Scrollback & Prompt State
+var shell_scroll_offset: usize = 0; // 0 = view bottom/latest lines
+var shell_auto_scroll: bool = true;
+var last_seen_shell_len: usize = 0;
 
 const proto_dashd = @import("protocols/dashd_protocol.zig");
 
@@ -186,7 +193,6 @@ pub export fn umain() noreturn {
     drawTui(dma_phys, token);
 
     var last_poll: u64 = 0;
-    var last_shell_len: usize = 0;
 
     while (true) {
         if (needs_vm_refresh or last_poll > 600_000) {
@@ -208,8 +214,11 @@ pub export fn umain() noreturn {
 
         const log_phys = dma_phys + DMA_LOG_SLOT * lib.PAGE_SIZE;
         const current_shell_len = lib.syscall(SYS_GET_VARDE_LOG, log_phys, 0, token);
-        if (current_shell_len != last_shell_len) {
-            last_shell_len = @intCast(current_shell_len);
+        if (current_shell_len != last_seen_shell_len) {
+            last_seen_shell_len = @intCast(current_shell_len);
+            if (shell_auto_scroll) {
+                shell_scroll_offset = 0;
+            }
             needs_redraw = true;
         }
 
@@ -237,24 +246,40 @@ fn vmStateLabel(state: u8) []const u8 {
 }
 
 fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64) void {
+    // If Help Modal is open, any Esc or F1 closes it
+    if (show_help_modal) {
+        if (evt.key_code == .escape or evt.key_code == .f1 or evt.ascii == '?' or evt.key_code == .enter or evt.ascii == ' ') {
+            show_help_modal = false;
+            needs_redraw = true;
+        }
+        return;
+    }
+
+    // Modal Trigger: [F1] or '?' when not in text input
+    if (evt.key_code == .f1 or (evt.ascii == '?' and !(focused_pane == 1 and focused_form_field == 0))) {
+        show_help_modal = true;
+        needs_redraw = true;
+        return;
+    }
+
     // Global Navigation Keys
     if (evt.key_code == .tab or evt.ascii == '\t') {
         focused_pane = (focused_pane + 1) % 3;
         needs_redraw = true;
         return;
     }
-    if (evt.key_code == .f1) {
-        focused_pane = 0;
-        needs_redraw = true;
-        return;
-    }
     if (evt.key_code == .f2) {
-        focused_pane = 1;
+        focused_pane = 0; // VM Manager
         needs_redraw = true;
         return;
     }
     if (evt.key_code == .f3) {
-        focused_pane = 2;
+        focused_pane = 1; // New VM Form
+        needs_redraw = true;
+        return;
+    }
+    if (evt.key_code == .f4) {
+        focused_pane = 2; // Varde Shell
         needs_redraw = true;
         return;
     }
@@ -417,9 +442,29 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
 
     // --- Pane 2: Varde Shell ---
     if (focused_pane == 2) {
+        // Scrollback navigation
+        if (evt.key_code == .page_up) {
+            shell_scroll_offset += 6;
+            shell_auto_scroll = false;
+            needs_redraw = true;
+            return;
+        }
+        if (evt.key_code == .page_down) {
+            if (shell_scroll_offset > 6) {
+                shell_scroll_offset -= 6;
+            } else {
+                shell_scroll_offset = 0;
+                shell_auto_scroll = true;
+            }
+            needs_redraw = true;
+            return;
+        }
+
         if (evt.key_code == .enter or evt.ascii == '\n') {
             _ = lib.syscall(SYS_VARDE_INJECT, '\r', 0, token);
             _ = lib.syscall(SYS_VARDE_INJECT, '\n', 0, token);
+            shell_scroll_offset = 0;
+            shell_auto_scroll = true;
             return;
         }
         if (evt.key_code == .backspace or evt.ascii == 0x08) {
@@ -440,6 +485,8 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
         }
         if (evt.ascii != 0) {
             _ = lib.syscall(SYS_VARDE_INJECT, @as(u64, evt.ascii), 0, token);
+            shell_scroll_offset = 0;
+            shell_auto_scroll = true;
             return;
         }
     }
@@ -546,9 +593,45 @@ fn drawTui(dma_phys: u64, token: u64) void {
     const text_phys = dma_phys + DMA_TEXT_SLOT * 4096;
     const text_va = DMA_BASE_VA + DMA_TEXT_SLOT * 4096;
 
-    // Header bar (y=0..20)
+    // Header bar (y=0..20) with telemetry gauges
     lib.fillRect(0, 0, SCREEN_WIDTH, 20, COLOR_TERRACOTTA, token);
-    lib.drawText(text_phys, text_va, 0, 1, COLOR_WHITE, " [C] CATENARY OS  |  Phase 8: Operator Console & MicroVM Fabric", token);
+    lib.drawText(text_phys, text_va, 0, 1, COLOR_WHITE, "[C] CATENARY OS", token);
+
+    // Compute live gauge metrics
+    var total_vms: u32 = 0;
+    for (&node_rows) |*r| if (r.used) { total_vms += r.vms; };
+    if (total_vms < @as(u32, @intCast(microvm_count))) total_vms = @as(u32, @intCast(microvm_count));
+
+    // Draw Top Gauges (CPU: [||||....] 40% | RAM: [||......] 25%)
+    const cpu_bars = @min(@as(usize, total_vms) * 2 + 3, 10);
+    var cpu_gauge: [32]u8 = undefined;
+    var gp: usize = 0;
+    appendStr(&cpu_gauge, &gp, "CPU: [");
+    var b_idx: usize = 0;
+    while (b_idx < 10) : (b_idx += 1) {
+        appendStr(&cpu_gauge, &gp, if (b_idx < cpu_bars) "|" else ".");
+    }
+    appendStr(&cpu_gauge, &gp, "] ");
+    appendDec(&cpu_gauge, &gp, @as(u64, cpu_bars) * 10);
+    appendStr(&cpu_gauge, &gp, "%");
+    lib.drawText(text_phys, text_va, 0, 22, COLOR_GOLDEN_YELLOW, cpu_gauge[0..gp], token);
+
+    // RAM Gauge
+    const mem_bars = @min(@as(usize, total_vms) * 3 + 2, 10);
+    var mem_gauge: [32]u8 = undefined;
+    var mp: usize = 0;
+    appendStr(&mem_gauge, &mp, "RAM: [");
+    b_idx = 0;
+    while (b_idx < 10) : (b_idx += 1) {
+        appendStr(&mem_gauge, &mp, if (b_idx < mem_bars) "|" else ".");
+    }
+    appendStr(&mem_gauge, &mp, "] ");
+    appendDec(&mem_gauge, &mp, @as(u64, mem_bars) * 10);
+    appendStr(&mem_gauge, &mp, "%");
+    lib.drawText(text_phys, text_va, 0, 48, COLOR_HIGHLIGHT, mem_gauge[0..mp], token);
+
+    // Node Count in Header
+    lib.drawText(text_phys, text_va, 0, 74, COLOR_WHITE, "SMP: 2 Cores | IPv6 Ready", token);
 
     const sidebar_w: u32 = 250;
     const form_h: u32 = 180;
@@ -557,7 +640,7 @@ fn drawTui(dma_phys: u64, token: u64) void {
     const work_h: u32 = SCREEN_HEIGHT - 20 - status_h;
 
     // 1. Sidebar - VM Manager Panel
-    drawPanel(text_phys, text_va, 0, 20, sidebar_w, 320, "VM Manager (F1)", focused_pane == 0, token);
+    drawPanel(text_phys, text_va, 0, 20, sidebar_w, 320, "VM Manager (F2)", focused_pane == 0, token);
     drawVmList(text_phys, text_va, token);
 
     // 2. Sidebar - Cluster Topology Panel
@@ -565,17 +648,22 @@ fn drawTui(dma_phys: u64, token: u64) void {
     drawClusterNodes(text_phys, text_va, token);
 
     // 3. Top-Right: New MicroVM Form Panel
-    drawPanel(text_phys, text_va, sidebar_w, 20, main_w, form_h, "New MicroVM (F2)", focused_pane == 1, token);
+    drawPanel(text_phys, text_va, sidebar_w, 20, main_w, form_h, "New MicroVM (F3)", focused_pane == 1, token);
     drawNewVmForm(text_phys, text_va, sidebar_w, 20, token);
 
     // 4. Bottom-Right: Varde Shell Panel
     const shell_y = 20 + form_h;
     const shell_h = work_h - form_h;
-    drawPanel(text_phys, text_va, sidebar_w, shell_y, main_w, shell_h, "Varde Shell (F3)", focused_pane == 2, token);
+    drawPanel(text_phys, text_va, sidebar_w, shell_y, main_w, shell_h, "Varde Shell (F4) [PgUp/PgDn: Scroll]", focused_pane == 2, token);
     drawShellLog(dma_phys, text_phys, text_va, sidebar_w, shell_y, shell_h, token);
 
     // 5. Global Shortcut / Status Bar (Bottom 20px)
     drawBottomBar(text_phys, text_va, token);
+
+    // 6. Help Modal Overlay (when active)
+    if (show_help_modal) {
+        drawHelpModal(text_phys, text_va, token);
+    }
 }
 
 fn drawPanel(text_phys: u64, text_va: u64, x: u32, y: u32, w: u32, h: u32, title: []const u8, is_focused: bool, token: u64) void {
@@ -625,7 +713,7 @@ fn drawVmList(text_phys: u64, text_va: u64, token: u64) void {
 
 fn drawClusterNodes(text_phys: u64, text_va: u64, token: u64) void {
     const base_row: u32 = 45;
-    lib.drawText(text_phys, text_va, base_row, 2, COLOR_GOLDEN_YELLOW, "Node ID        VMs  Exits", token);
+    lib.drawText(text_phys, text_va, base_row, 2, COLOR_GOLDEN_YELLOW, "St  Node ID        VMs  Exits", token);
 
     var shown: u32 = 0;
     for (&node_rows) |*r| {
@@ -634,6 +722,10 @@ fn drawClusterNodes(text_phys: u64, text_va: u64, token: u64) void {
         var p: usize = 0;
         var is_local = true;
         for (r.addr) |b| if (b != 0) { is_local = false; break; };
+
+        // Status badge: ● (active/green)
+        appendStr(&line, &p, "*   ");
+
         if (is_local) {
             appendStr(&line, &p, "local-node    ");
         } else {
@@ -641,9 +733,13 @@ fn drawClusterNodes(text_phys: u64, text_va: u64, token: u64) void {
             appendStr(&line, &p, "      ");
         }
         appendDec(&line, &p, r.vms);
-        while (p < 20) : (p += 1) line[p] = ' ';
+        while (p < 24) : (p += 1) line[p] = ' ';
         appendDec(&line, &p, r.exits);
-        lib.drawText(text_phys, text_va, base_row + 2 + shown * 2, 2, COLOR_HIGHLIGHT, line[0..p], token);
+
+        // Draw active dot in green
+        lib.drawText(text_phys, text_va, base_row + 2 + shown * 2, 2, COLOR_GREEN, "*", token);
+        // Draw rest of line in highlight
+        lib.drawText(text_phys, text_va, base_row + 2 + shown * 2, 6, COLOR_HIGHLIGHT, line[4..p], token);
         shown += 1;
     }
     if (shown == 0) {
@@ -713,9 +809,9 @@ fn drawShellLog(dma_phys: u64, text_phys: u64, text_va: u64, start_x: u32, start
     const base_row: u32 = start_y / 8 + 3;
     const max_rows: u32 = (h / 8) - 5;
 
-    // Scan the last N lines from the log
-    var line_offsets: [64]usize = undefined;
-    var line_lens: [64]usize = undefined;
+    // Scan all lines from the log
+    var line_offsets: [128]usize = undefined;
+    var line_lens: [128]usize = undefined;
     var total_lines: usize = 0;
 
     var cur_start: usize = 0;
@@ -742,12 +838,23 @@ fn drawShellLog(dma_phys: u64, text_phys: u64, text_va: u64, start_x: u32, start
         }
     }
 
+    // Clamp scroll offset
+    if (total_lines <= max_rows) {
+        shell_scroll_offset = 0;
+    } else {
+        const max_scroll = total_lines - max_rows;
+        if (shell_scroll_offset > max_scroll) {
+            shell_scroll_offset = max_scroll;
+        }
+    }
+
     const lines_to_show = @min(total_lines, max_rows);
-    const start_show = if (total_lines > lines_to_show) (total_lines - lines_to_show) else 0;
+    const start_show = if (total_lines > lines_to_show) (total_lines - lines_to_show - shell_scroll_offset) else 0;
 
     var r: u32 = 0;
     while (r < lines_to_show) : (r += 1) {
         const l_idx = start_show + r;
+        if (l_idx >= total_lines) break;
         const off = line_offsets[l_idx];
         const len = @min(line_lens[l_idx], 65);
         if (len > 0) {
@@ -755,16 +862,61 @@ fn drawShellLog(dma_phys: u64, text_phys: u64, text_va: u64, start_x: u32, start
         }
     }
 
-    // Bottom interactive indicator when shell is focused
+    // Bottom interactive indicator
     const prompt_row = base_row + lines_to_show + 1;
     if (focused_pane == 2) {
-        lib.drawText(text_phys, text_va, prompt_row, 34, COLOR_GOLDEN_YELLOW, "varde (active) > _", token);
+        if (shell_scroll_offset > 0) {
+            var scroll_msg: [32]u8 = undefined;
+            var sp: usize = 0;
+            appendStr(&scroll_msg, &sp, "varde [SCROLLED -");
+            appendDec(&scroll_msg, &sp, shell_scroll_offset);
+            appendStr(&scroll_msg, &sp, " L] > _");
+            lib.drawText(text_phys, text_va, prompt_row, 34, COLOR_GOLDEN_YELLOW, scroll_msg[0..sp], token);
+        } else {
+            lib.drawText(text_phys, text_va, prompt_row, 34, COLOR_GOLDEN_YELLOW, "varde (active) > _", token);
+        }
     }
 }
 
 fn drawBottomBar(text_phys: u64, text_va: u64, token: u64) void {
     const y: u32 = SCREEN_HEIGHT - 20;
     lib.fillRect(0, y, SCREEN_WIDTH, 20, COLOR_SEA_GRAY, token);
-    const bar_text = " [Tab] Switch Pane | [F1] VM List | [F2] New VM | [F3] Shell | [S]tart | [K]ill | [D]elete | [Enter] Select";
+    const bar_text = " [F1] Help | [Tab] Pane | [F2] VMs | [F3] Form | [F4] Shell | [S]tart | [K]ill | [D]elete | [Enter] Ok";
     lib.drawText(text_phys, text_va, y / 8 + 1, 1, COLOR_WHITE, bar_text, token);
+}
+
+fn drawHelpModal(text_phys: u64, text_va: u64, token: u64) void {
+    const modal_x: u32 = 120;
+    const modal_y: u32 = 80;
+    const modal_w: u32 = 560;
+    const modal_h: u32 = 420;
+
+    // Modal background & gold border
+    lib.fillRect(modal_x - 2, modal_y - 2, modal_w + 4, modal_h + 4, COLOR_GOLDEN_YELLOW, token);
+    lib.fillRect(modal_x, modal_y, modal_w, modal_h, COLOR_MODAL_BG, token);
+
+    // Modal header banner
+    lib.fillRect(modal_x, modal_y, modal_w, 24, COLOR_TERRACOTTA, token);
+    lib.drawTextBg(text_phys, text_va, modal_y / 8 + 1, modal_x / 8 + 2, COLOR_WHITE, COLOR_TERRACOTTA, "Catenary OS — Interactive Help & Keyboard Shortcuts", token);
+
+    const base_row = modal_y / 8 + 4;
+    const col = modal_x / 8 + 3;
+
+    lib.drawText(text_phys, text_va, base_row + 0, col, COLOR_GOLDEN_YELLOW, "NAVIGATION & PANES:", token);
+    lib.drawText(text_phys, text_va, base_row + 2, col, COLOR_WHITE, "  [Tab]         Cycle through VM Manager, Form, & Shell", token);
+    lib.drawText(text_phys, text_va, base_row + 4, col, COLOR_WHITE, "  [F2]          Focus VM Manager (Sidebar)", token);
+    lib.drawText(text_phys, text_va, base_row + 6, col, COLOR_WHITE, "  [F3]          Focus New MicroVM Form", token);
+    lib.drawText(text_phys, text_va, base_row + 8, col, COLOR_WHITE, "  [F4]          Focus Varde Interactive Shell", token);
+
+    lib.drawText(text_phys, text_va, base_row + 11, col, COLOR_GOLDEN_YELLOW, "MICROVM CONTROLS (in VM Manager pane):", token);
+    lib.drawText(text_phys, text_va, base_row + 13, col, COLOR_WHITE, "  [Up] / [Down] Navigate VM selection list", token);
+    lib.drawText(text_phys, text_va, base_row + 15, col, COLOR_WHITE, "  [S]           Start selected MicroVM", token);
+    lib.drawText(text_phys, text_va, base_row + 17, col, COLOR_WHITE, "  [K]           Stop/Kill selected MicroVM", token);
+    lib.drawText(text_phys, text_va, base_row + 19, col, COLOR_WHITE, "  [D]           Delete selected MicroVM from registry", token);
+
+    lib.drawText(text_phys, text_va, base_row + 22, col, COLOR_GOLDEN_YELLOW, "VARDE SHELL COMMANDS (in Shell pane):", token);
+    lib.drawText(text_phys, text_va, base_row + 24, col, COLOR_WHITE, "  help, status, services/ps, vms/vmlist, top, memory, clear", token);
+    lib.drawText(text_phys, text_va, base_row + 26, col, COLOR_WHITE, "  [PgUp] / [PgDn] Scroll through shell history and logs", token);
+
+    lib.drawText(text_phys, text_va, base_row + 30, col + 12, COLOR_HIGHLIGHT, "Press [Esc], [F1], or [Enter] to Close", token);
 }

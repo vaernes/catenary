@@ -310,9 +310,9 @@ fn dispatch(cmd: []const u8) void {
         cmdTop();
     } else if (strEq(cmd, "status")) {
         cmdStatus();
-    } else if (strEq(cmd, "services")) {
+    } else if (strEq(cmd, "services") or strEq(cmd, "ps")) {
         cmdServices();
-    } else if (strEq(cmd, "vms")) {
+    } else if (strEq(cmd, "vms") or strEq(cmd, "vmlist")) {
         cmdVms();
     } else if (strEq(cmd, "memory")) {
         cmdMemory();
