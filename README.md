@@ -12,7 +12,7 @@
   <img src="https://img.shields.io/badge/language-Zig-F7A41D?style=flat-square" alt="Zig"/>
   <img src="https://img.shields.io/badge/arch-x86__64-36454F?style=flat-square" alt="x86_64"/>
   <img src="https://img.shields.io/badge/bootloader-Limine-CD7F32?style=flat-square" alt="Limine"/>
-  <img src="https://img.shields.io/badge/status-Phase%208%20(UI%20%26%20Interaction)-blue?style=flat-square" alt="Phase 8"/>
+  <img src="https://img.shields.io/badge/status-Phase%208%20Complete%20(UI%20%26%20Interaction)-brightgreen?style=flat-square" alt="Phase 8 Complete"/>
 </p>
 
 ---
@@ -96,7 +96,7 @@ Catenary OS acts as a **Type-1 hypervisor**, booting stripped-down Linux kernels
 - [x] **Phase 5: Networking & IPC** — IPv6 networking, distributed IPC, and multi-node cluster orchestration basics.
 - [x] **Phase 6: Storage & Persistent State** — NVMe drivers, Virtio-Blk bridging, and DIPC-backed storage volumes.
 - [x] **Phase 7: Cluster Orchestration** — Dynamic workload placement, remote launching, user-space TCP/IPv6, and SMP scaling.
-- [ ] **Phase 8: User Interface & OS Interaction** (*Current*) — TUI window manager (`windowd`), interactive MicroVM lifecycle forms, Varde shell input, and keyboard workflows.
+- [x] **Phase 8: User Interface & OS Interaction** — Modular Ring-3 TUI widget toolkit (`src/user/tui/`), dirty-rect window manager (`windowd`), interactive MicroVM lifecycle forms, Varde shell line editor with history/scrollback, and automated keyboard smoke testing (`SMOKE_PROFILE=ui-phase8`).
 
 See [docs/PHASE_8_ROADMAP.md](docs/PHASE_8_ROADMAP.md) for detailed Phase 8 architecture and milestones.  
 See [docs/PHASE_7_ROADMAP.md](docs/PHASE_7_ROADMAP.md) for completed Phase 7 verification.
@@ -125,6 +125,9 @@ SMOKE_PROFILE=vmx-linux ./test_qemu.sh
 
 # Integrated services-owned Linux MicroVM validation
 SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh
+
+# Automated Phase 8 UI, MicroVM form provisioning, and Varde shell verification
+SMOKE_PROFILE=ui-phase8 ./test_qemu.sh
 ```
 
 Additional build/run notes and bring-up options are documented in [docs/SETUP.md](docs/SETUP.md).
