@@ -77,9 +77,9 @@ pub fn loadElfIntoNewSpace(elf_bytes: []const u8, hhdm_offset: u64) LoadError!Lo
         const ph_offset = hdr.e_phoff + (i * hdr.e_phentsize);
         const ph: *const elf_loader.Elf64_Phdr = @ptrCast(@alignCast(&elf_bytes[ph_offset]));
 
-        if (ph.p_type == std.elf.PT_LOAD) {
-            const start_vaddr = ph.p_vaddr & ~(PAGE_SIZE - 1);
-            const end_vaddr = (ph.p_vaddr + ph.p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        if (ph.type == .LOAD) {
+            const start_vaddr = ph.vaddr & ~(PAGE_SIZE - 1);
+            const end_vaddr = (ph.vaddr + ph.memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
             var vaddr = start_vaddr;
             while (vaddr < end_vaddr) : (vaddr += PAGE_SIZE) {
@@ -96,12 +96,12 @@ pub fn loadElfIntoNewSpace(elf_bytes: []const u8, hhdm_offset: u64) LoadError!Lo
                 const frame_ptr: [*]u8 = @ptrFromInt(user_frame + hhdm_offset);
 
                 // Copy data if within filesz
-                if (vaddr < ph.p_vaddr + ph.p_filesz) {
-                    const copy_start = if (vaddr < ph.p_vaddr) ph.p_vaddr else vaddr;
-                    const copy_end = if (vaddr + PAGE_SIZE > ph.p_vaddr + ph.p_filesz) ph.p_vaddr + ph.p_filesz else vaddr + PAGE_SIZE;
+                if (vaddr < ph.vaddr + ph.filesz) {
+                    const copy_start = if (vaddr < ph.vaddr) ph.vaddr else vaddr;
+                    const copy_end = if (vaddr + PAGE_SIZE > ph.vaddr + ph.filesz) ph.vaddr + ph.filesz else vaddr + PAGE_SIZE;
                     const len = copy_end - copy_start;
 
-                    const src_offset = ph.p_offset + (copy_start - ph.p_vaddr);
+                    const src_offset = ph.offset + (copy_start - ph.vaddr);
                     const dest_offset = copy_start - vaddr;
 
                     for (0..len) |j| {
@@ -110,9 +110,9 @@ pub fn loadElfIntoNewSpace(elf_bytes: []const u8, hhdm_offset: u64) LoadError!Lo
                 }
 
                 // Zero BSS if within memsz and past filesz
-                if (ph.p_memsz > ph.p_filesz) {
-                    const filesz_end = ph.p_vaddr + ph.p_filesz;
-                    const memsz_end = ph.p_vaddr + ph.p_memsz;
+                if (ph.memsz > ph.filesz) {
+                    const filesz_end = ph.vaddr + ph.filesz;
+                    const memsz_end = ph.vaddr + ph.memsz;
                     if (vaddr + PAGE_SIZE > filesz_end and vaddr < memsz_end) {
                         const bss_start = if (vaddr < filesz_end) filesz_end else vaddr;
                         const bss_end = if (vaddr + PAGE_SIZE > memsz_end) memsz_end else vaddr + PAGE_SIZE;

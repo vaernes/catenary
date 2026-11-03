@@ -50,7 +50,7 @@ const PartitionHeader = extern struct {
     name: [32]u8,
 };
 
-var part_used: [MAX_PARTS]bool = [_]bool{false} ** MAX_PARTS;
+var part_used: [MAX_PARTS]bool = @splat(false);
 
 /// Reserve the first free partition slot; returns its slot index.
 fn allocPartition() ?u32 {
@@ -217,7 +217,7 @@ pub export fn umain() noreturn {
                     .slot = slot,
                     .start_lba = partitionStart(slot),
                     .sectors = PART_SECTORS,
-                    .name = [_]u8{0} ** 32,
+                    .name = @splat(0),
                 };
                 @memcpy(hdr_va.name[0..6], "rootfs");
                 if (sendBlkRequest(dipc_phys, token, local_node, container_endpoint, bs.reserved_storaged_endpoint, 1, partitionStart(slot), data_phys)) {

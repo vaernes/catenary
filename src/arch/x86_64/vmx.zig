@@ -285,7 +285,7 @@ var timer_irq_pending: bool = false;
 var lapic_nmi_pending: bool = false;
 var preemption_timer_active: bool = false;
 var guest_apic_base: u64 = 0x0000_0000_FEE0_0900;
-var lapic_regs: [LAPIC_REG_WORDS]u32 = [_]u32{0} ** LAPIC_REG_WORDS;
+var lapic_regs: [LAPIC_REG_WORDS]u32 = @splat(0);
 // COM1 (ttyS0) IER shadow and THRE IRQ4 pending flag
 var serial_dll: u8 = 0x01;
 var serial_dlm: u8 = 0x00;
@@ -301,7 +301,7 @@ var unknown_msr_read_logs: u8 = 0;
 var unknown_msr_write_logs: u8 = 0;
 var pci_config_address: u32 = 0;
 var pci_root_command: u16 = 0;
-var vmx_msr_bitmap align(4096) = [_]u8{0} ** 4096;
+var vmx_msr_bitmap: [4096]u8 align(4096) = @splat(0);
 
 // -- Port 0x61 (System Control Port B) emulation --
 var port_61_value: u8 = 0;
@@ -1184,7 +1184,7 @@ fn stageFallbackGuest(layout: linux_boot.LaunchLayout) VmxError!void {
     _ = try ensureGuestPage(layout.guest_pdpt_gpa);
     _ = try ensureGuestPage(layout.guest_pd_gpa);
 
-    const boot_params_page: [linux_boot.zero_page_size]u8 = [_]u8{0} ** linux_boot.zero_page_size;
+    const boot_params_page: [linux_boot.zero_page_size]u8 = @splat(0);
     const guest_stub: [8]u8 = .{ 0xB8, 0x45, 0x54, 0x41, 0x43, 0x0F, 0xA2, 0xF4 }; // mov eax,'CATE'; cpuid; hlt
     try copyIntoGuest(layout.boot_params_gpa, boot_params_page[0..]);
     try copyIntoGuest(layout.cmdline_gpa, DEFAULT_CMDLINE ++ "\x00");
@@ -2431,10 +2431,18 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
             return true;
         },
         VMEXIT_REASON_EXTERNAL_INTERRUPT => {
-            // The Catenary PIT fired while the Linux guest was running.  ACK
-            // the PIC master and yield to the Catenary scheduler so that Ring-3
-            // services continue to make progress alongside the guest.
-            cpu.outb(0x20, 0x20); // EOI to PIC master
+            // An external host interrupt fired while the guest was running.
+            // Because EXIT_CTL_ACK_INTERRUPT is set, the CPU already acknowledged
+            // the vector at the PIC on VM-exit; dispatch IRQ1 (0x21) to the keyboard
+            // bridge so the 8042 buffer is drained before EOI, or ACK IRQ0 (0x20).
+            const intr_info = vmread(VMCS_VM_EXIT_INTERRUPTION_INFO) orelse 0;
+            const vec = @as(u8, @truncate(intr_info & 0xFF));
+            if (vec == 0x21) {
+                const kbd = @import("keyboard.zig");
+                kbd.catenary_keyboardInterruptBridge();
+            } else {
+                cpu.outb(0x20, 0x20); // EOI to PIC master
+            }
             if (build_options.services_active) {
                 const scheduler = @import("../../kernel/scheduler.zig");
                 asm volatile ("sti");
@@ -2505,8 +2513,8 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
 
 fn drainMicrovmIngress() void {
     while (microvm_bridge.dequeue()) |entry| {
-        virtio_net.injectPacket(entry.microvm_id, dipc.payloadFromPage(vmx_hhdm_offset, entry.page_phys));
-        pmm.freePage(entry.page_phys);
+        virtio_net.injectPacket(entry.microvm_id, dipc.payloadSliceFromPage(vmx_hhdm_offset, entry.page_phys));
+        dipc.freePageMessage(entry.page_phys);
     }
 }
 
@@ -2528,8 +2536,11 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
 
     drainMicrovmIngress();
 
-    // Always broadcast on exit to ensure telemetry is dispatched even for single-exit test guests
-    microvm_bridge.broadcastTelemetryFromContext();
+    // Broadcast telemetry immediately on early exits or final exit (for single-exit test guests),
+    // and throttle during continuous Linux execution so dashd's receive queue is not flooded.
+    if (vmexit_count <= 4 or !should_resume or (vmexit_count & 0xFF) == 0) {
+        microvm_bridge.broadcastTelemetryFromContext();
+    }
 
     if (should_resume) {
         tryInjectTimerIrq();
@@ -2632,6 +2643,9 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
     _ = memmap;
     vmx_hhdm_offset = hhdm_offset;
     microvm_bridge.setBridgeContext(hhdm_offset, table);
+    virtio_net.hhdm_offset = hhdm_offset;
+    virtio_net.system_endpoint_table = table;
+    virtio_net.gpa_to_hpa_fn = translateGpaToHpa;
 
     if (!isVmxSupported()) return error.VmxUnsupported;
 
@@ -2654,7 +2668,9 @@ pub fn init(memmap: *limine.MemmapResponse, hhdm_offset: u64, table: *const endp
 
     serialWrite("vmx: global vmxon active\n");
 
-    if (microvm_registry.create([_]u8{0} ** 32, [_]u8{0} ** 32, GUEST_POOL_PAGES, 1, 0, 0, 0, 0)) |id| {
+    const default_vm_name: [32]u8 = "linux-vm-1".* ++ @as([22]u8, @splat(0));
+    const default_vm_container: [32]u8 = "oci-demo".* ++ @as([24]u8, @splat(0));
+    if (microvm_registry.create(default_vm_name, default_vm_container, GUEST_POOL_PAGES, 1, 0, 0, 0, 0)) |id| {
         current_instance_id = id;
     } else {
         serialWrite("VMX: failed to create microvm instance\n");
@@ -2683,7 +2699,6 @@ pub fn launchStagedInstance() !u32 {
     const id = current_instance_id orelse return error.Unsupported;
     const inst = microvm_registry.findMutable(id) orelse return error.Unsupported;
 
-    if (inst.state == .running) return id;
     if (inst.state != .created) return error.Unsupported;
     if (!microvm_registry.start(id)) return error.Unsupported;
 

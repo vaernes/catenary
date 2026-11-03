@@ -44,7 +44,7 @@ pub fn bootAll(hhdm_offset: u64, local_node: dipc.Ipv6Addr) ManagerError!void {
     const response = main.limine_module_request.response orelse {
         return error.ModuleNotFound;
     };
-    var launched_kinds: [10]bool = [_]bool{false} ** 10;
+    var launched_kinds: [10]bool = @splat(false);
 
     for (0..response.module_count) |i| {
         const module_ptr = response.modules.?[i] orelse continue;
@@ -71,7 +71,7 @@ pub fn bootAll(hhdm_offset: u64, local_node: dipc.Ipv6Addr) ManagerError!void {
             null;
 
         const service_kind = kind orelse continue;
-        const kind_index: usize = @intFromEnum(service_kind);
+        const kind_index: usize = @backingInt(service_kind);
         if (launched_kinds[kind_index]) continue;
 
         try launchService(hhdm_offset, local_node, service_kind, module.address[0..module.size]);

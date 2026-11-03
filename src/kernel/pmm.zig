@@ -399,7 +399,7 @@ pub fn freeGuardedRegion(region: GuardedRegion) void {
 }
 
 test "allocPage reuses freed page" {
-    var bitmap: [8]u8 = [_]u8{0xFF} ** 8;
+    var bitmap: [8]u8 = @splat(0xFF);
 
     mem_bitmap = &bitmap;
     highest_page = 64;
@@ -419,7 +419,7 @@ test "allocPage reuses freed page" {
 }
 
 test "guarded region alloc/free roundtrip" {
-    var bitmap: [8]u8 = [_]u8{0xFF} ** 8;
+    var bitmap: [8]u8 = @splat(0xFF);
 
     mem_bitmap = &bitmap;
     highest_page = 64;
@@ -446,5 +446,13 @@ pub fn getTotalPages() usize {
 }
 
 pub fn getFreePages() usize {
-    return 0; // Stub
+    pmmAcquire();
+    defer pmmRelease();
+    if (!initialized) return 0;
+    var free_count: usize = 0;
+    var page: usize = 1;
+    while (page < highest_page) : (page += 1) {
+        if (!testBit(page)) free_count += 1;
+    }
+    return free_count;
 }

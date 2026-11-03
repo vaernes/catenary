@@ -95,12 +95,12 @@ pub const MAX_TELEMETRY_SUMMARY_ENTRIES: usize = 32;
 pub const TelemetrySummaryReply = extern struct {
     count: u32,
     _pad: u32 = 0,
-    entries: [MAX_TELEMETRY_SUMMARY_ENTRIES]TelemetrySummaryEntry = [_]TelemetrySummaryEntry{.{
-        .node_addr = [_]u8{0} ** 16,
+    entries: [MAX_TELEMETRY_SUMMARY_ENTRIES]TelemetrySummaryEntry = @splat(.{
+        .node_addr = @splat(0),
         .instance_id = 0,
         .cpu_cycles = 0,
         .exit_count = 0,
-    }} ** MAX_TELEMETRY_SUMMARY_ENTRIES,
+    }),
 };
 
 // ---------------------------------------------------------------------------
@@ -112,5 +112,5 @@ pub const MAX_CMD_LEN: usize = 64;
 /// Send a built-in shell command to dashd. dashd will execute it and write
 /// the output to the serial log. Commands: "help", "ps", "net-stat", "vmlist".
 pub const ShellCommandRequest = extern struct {
-    cmd: [MAX_CMD_LEN]u8 = [_]u8{0} ** MAX_CMD_LEN,
+    cmd: [MAX_CMD_LEN]u8 = @splat(0),
 };

@@ -192,7 +192,7 @@ pub fn printHex(n: u64) void {
 pub const Ipv6Addr = extern struct {
     bytes: [16]u8,
     pub fn loopback() Ipv6Addr {
-        var out: Ipv6Addr = .{ .bytes = [_]u8{0} ** 16 };
+        var out: Ipv6Addr = .{ .bytes = @splat(0) };
         out.bytes[15] = 1;
         return out;
     }
@@ -399,7 +399,7 @@ pub const ListVmsRequest = extern struct {
 pub const VmSnapshotEntry = extern struct {
     instance_id: u32,
     state: u8,
-    _pad: [3]u8 = [_]u8{0} ** 3,
+    _pad: [3]u8 = @splat(0),
     mem_pages: u32,
     vcpus: u32,
     cpu_cycles: u64,
@@ -414,16 +414,16 @@ pub const VmSnapshotListPayload = extern struct {
     count: u32,
     _pad: u32 = 0,
     entries: [MAX_VM_SNAPSHOT_ENTRIES]VmSnapshotEntry =
-        [_]VmSnapshotEntry{.{
+        @splat(.{
             .instance_id = 0,
             .state = 0,
             .mem_pages = 0,
             .vcpus = 0,
             .cpu_cycles = 0,
             .exit_count = 0,
-            .name = [_]u8{0} ** 32,
-            .container = [_]u8{0} ** 32,
-        }} ** MAX_VM_SNAPSHOT_ENTRIES,
+            .name = @splat(0),
+            .container = @splat(0),
+        }),
 };
 
 pub const UpdateMicrovmNamePayload = extern struct {
@@ -500,8 +500,8 @@ pub fn _user_start() callconv(.naked) noreturn {
     }
 }
 
-pub fn getFramebufferInfo() ?struct { width: u32, height: u32 } {
-    const res = syscall(SYS_FB_GET_INFO, 0, 0, 0);
+pub fn getFramebufferInfo(token: u64) ?struct { width: u32, height: u32 } {
+    const res = syscall(SYS_FB_GET_INFO, 0, 0, token);
     if (res == 0 or res == 0xFFFFFFFF) return null;
     return .{
         .width = @as(u32, @truncate(res >> 32)),
@@ -535,14 +535,14 @@ pub fn drawTextBg(dma_phys: u64, dma_va: u64, row: u32, col: u32, fg: u32, bg: u
 
 fn controlSourceEndpoint(bs: *const BootstrapDescriptor) EndpointId {
     return switch (bs.service_kind) {
-        @intFromEnum(ServiceKind.netd) => bs.reserved_netd_endpoint,
-        @intFromEnum(ServiceKind.storaged) => bs.reserved_storaged_endpoint,
-        @intFromEnum(ServiceKind.dashd) => bs.reserved_dashd_endpoint,
-        @intFromEnum(ServiceKind.containerd) => bs.reserved_containerd_endpoint,
-        @intFromEnum(ServiceKind.clusterd) => bs.reserved_clusterd_endpoint,
-        @intFromEnum(ServiceKind.inputd) => bs.reserved_inputd_endpoint,
-        @intFromEnum(ServiceKind.windowd) => bs.reserved_windowd_endpoint,
-        @intFromEnum(ServiceKind.configd) => bs.reserved_configd_endpoint,
+        @backingInt(ServiceKind.netd) => bs.reserved_netd_endpoint,
+        @backingInt(ServiceKind.storaged) => bs.reserved_storaged_endpoint,
+        @backingInt(ServiceKind.dashd) => bs.reserved_dashd_endpoint,
+        @backingInt(ServiceKind.containerd) => bs.reserved_containerd_endpoint,
+        @backingInt(ServiceKind.clusterd) => bs.reserved_clusterd_endpoint,
+        @backingInt(ServiceKind.inputd) => bs.reserved_inputd_endpoint,
+        @backingInt(ServiceKind.windowd) => bs.reserved_windowd_endpoint,
+        @backingInt(ServiceKind.configd) => bs.reserved_configd_endpoint,
         else => bs.service_id,
     };
 }
@@ -567,7 +567,7 @@ pub fn sendControl(
         .payload_len = total_payload,
         .auth_tag = 0,
         .src = .{ .node = local_node, .endpoint = controlSourceEndpoint(bs) },
-        .dst = .{ .node = local_node, .endpoint = @intFromEnum(ReservedEndpoint.kernel_control) },
+        .dst = .{ .node = local_node, .endpoint = @backingInt(ReservedEndpoint.kernel_control) },
     };
     const ctrl: *align(1) ControlHeader = @ptrFromInt(@intFromPtr(scratch) + DIPC_HEADER_SIZE);
     ctrl.* = .{ .op = op, .payload_len = @as(u32, @intCast(extra_payload.len)) };
@@ -582,7 +582,7 @@ pub fn sendControl(
 // --- Utility Helpers ---
 
 pub fn formatU32(n: u32) [8]u8 {
-    var buf: [8]u8 = [_]u8{' '} ** 8;
+    var buf: [8]u8 = @splat(' ');
     if (n == 0) {
         buf[7] = '0';
         return buf;

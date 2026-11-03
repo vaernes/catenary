@@ -89,6 +89,12 @@ pub fn routePage(
     // cluster tag the receiving kernel can check. Pin an unresolved loopback
     // source to our node address so the signed identity is the one on the wire.
     const wire_hdr: *dipc.PageHeader = @ptrFromInt(page_phys + hhdm_offset);
+    const orig_src_node = wire_hdr.src.node;
+    const orig_auth_tag = wire_hdr.auth_tag;
+    errdefer {
+        wire_hdr.src.node = orig_src_node;
+        wire_hdr.auth_tag = orig_auth_tag;
+    }
     if (dipc.Ipv6Addr.eql(wire_hdr.src.node, dipc.Ipv6Addr.loopback()) and node_config.isNodeAddrConfigured(local_node)) {
         wire_hdr.src.node = local_node;
     }
@@ -126,7 +132,7 @@ test "routePage rejects invalid header" {
     var table: endpoint_table.EndpointTable = undefined;
     table.init();
 
-    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
+    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = @splat(0);
     const hdr: *dipc.PageHeader = @ptrCast(@alignCast(&page));
     hdr.* = .{
         .magic = 0,
@@ -146,7 +152,7 @@ test "routePage local endpoint not found" {
     var table: endpoint_table.EndpointTable = undefined;
     table.init();
 
-    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
+    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = @splat(0);
     _ = makeTestHeader(&page, dipc.Ipv6Addr.loopback(), dipc.Ipv6Addr.loopback(), 1234);
 
     const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
@@ -160,7 +166,7 @@ test "routePage remote requires net daemon" {
     var remote: dipc.Ipv6Addr = dipc.Ipv6Addr.loopback();
     remote.bytes[0] = 0x20;
 
-    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
+    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = @splat(0);
     _ = makeTestHeader(&page, dipc.Ipv6Addr.loopback(), remote, 3);
 
     const res = routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
@@ -179,7 +185,7 @@ test "routePage treats loopback as local alias" {
     // In this test, local is FE80...42 which IS configured.
     // But kernel tests run in Ring 3 (linux user-space) and outb 0x3F8 is forbidden.
 
-    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
+    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = @splat(0);
     _ = makeTestHeader(&page, local, dipc.Ipv6Addr.loopback(), 1234);
 
     // We use loopback as the "local address" for the router in this test to avoid the outb call.
@@ -195,7 +201,7 @@ test "routePage queues for microvm" {
     const endpoint = table.registerMicrovm(7);
     try std.testing.expect(endpoint != 0);
 
-    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16);
+    var page: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = @splat(0);
     _ = makeTestHeader(&page, dipc.Ipv6Addr.loopback(), dipc.Ipv6Addr.loopback(), endpoint);
 
     const result = try routePage(0, dipc.Ipv6Addr.loopback(), &table, @intFromPtr(&page));
@@ -215,9 +221,9 @@ test "routePage reports busy when microvm queue full" {
     try std.testing.expect(endpoint != 0);
 
     const TestPage = struct {
-        bytes: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = [_]u8{0} ** (dipc.HEADER_SIZE + 16),
+        bytes: [dipc.HEADER_SIZE + 16]u8 align(@alignOf(dipc.PageHeader)) = @splat(0),
     };
-    var pages: [9]TestPage = [_]TestPage{.{}} ** 9;
+    var pages: [9]TestPage = @splat(.{});
 
     // Fill queue capacity (8 entries).
     var i: usize = 0;

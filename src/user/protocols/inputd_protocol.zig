@@ -66,7 +66,7 @@ pub const InputEvent = extern struct {
     key_code: KeyCode = .none,
     /// Bitmask of MOD_* flags active when the key went down.
     modifiers: u8 = 0,
-    _reserved: [3]u8 = [_]u8{0} ** 3,
+    _reserved: [3]u8 = @splat(0),
 };
 
 comptime {

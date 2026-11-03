@@ -27,9 +27,9 @@ pub var gdtr: cpu.DescriptorTablePointer = undefined;
 // Must survive for the entire kernel lifetime.
 var per_cpu_ist1_stacks: [MAX_CPUS][16384]u8 align(16) linksection(".bss") = undefined;
 
-var per_cpu_tss: [MAX_CPUS]Tss align(16) = [_]Tss{.{
+var per_cpu_tss: [MAX_CPUS]Tss align(16) = @splat(.{
     .iopb_offset = @sizeOf(Tss),
-}} ** MAX_CPUS;
+});
 
 pub fn tssSelectorForCpu(cpu_id: usize) u16 {
     return @as(u16, @intCast(0x28 + cpu_id * 16));
@@ -128,4 +128,3 @@ fn printHex(n: u64) void {
 pub fn tssBase() u64 {
     return @intFromPtr(&per_cpu_tss[0]);
 }
-

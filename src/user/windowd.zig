@@ -1,5 +1,17 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const tui = @import("tui/mod.zig");
+const color = tui.color;
+const Rect = tui.Rect;
+const DamageTracker = tui.DamageTracker;
+const Panel = tui.Panel;
+const TextInput = tui.TextInput;
+const NumberSpinner = tui.NumberSpinner;
+const OptionSelect = tui.OptionSelect;
+const ListView = tui.ListView;
+const Button = tui.Button;
+const ModalDialog = tui.ModalDialog;
+const HistoryRing = tui.HistoryRing;
 
 // Syscall ops (mirrors lib.zig constants)
 const SYS_REGISTER = lib.SYS_REGISTER;
@@ -8,11 +20,9 @@ const SYS_MAP_RECV = lib.SYS_MAP_RECV;
 const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
 const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
 const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
-const SYS_FB_DRAW_COLORED = lib.SYS_FB_DRAW_COLORED;
-const SYS_FB_FILL_RECT = lib.SYS_FB_FILL_RECT;
 const SYS_GET_VARDE_LOG = lib.SYS_GET_VARDE_LOG;
 const SYS_VARDE_INJECT = lib.SYS_VARDE_INJECT;
-const SYS_FB_GET_INFO = lib.SYS_FB_GET_INFO;
+const SYS_YIELD = lib.SYS_YIELD;
 
 const USER_BOOTSTRAP_VADDR: usize = lib.USER_BOOTSTRAP_VADDR;
 const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
@@ -28,69 +38,128 @@ var ROWS: usize = 75;
 var SCREEN_WIDTH: u32 = 800;
 var SCREEN_HEIGHT: u32 = 600;
 
-// Branding palette
-const COLOR_SEA_GRAY: u32 = 0x004A4E69;
-const COLOR_TERRACOTTA: u32 = 0x00E2725B;
-const COLOR_GOLDEN_YELLOW: u32 = 0x00FFC300;
-const COLOR_WHITE: u32 = 0x00FFFFFF;
-const COLOR_GREEN: u32 = 0x0000CC44;
-const COLOR_RED: u32 = 0x00FF4444;
-const COLOR_HIGHLIGHT: u32 = 0x005BC0EB;
-const COLOR_DIM: u32 = 0x00888888;
-const COLOR_PANEL_BG: u32 = 0x002B2D42;
-const COLOR_INPUT_BG: u32 = 0x001A1C2E;
-const COLOR_MODAL_BG: u32 = 0x001F2033;
+// Surface Adapter: Bridges to lib.fillRect and lib.drawTextBg satisfying tui duck-typing
+pub const Surface = struct {
+    token: u64,
+    dma_phys: u64,
+    dma_va: u64,
 
-// --- UI State ---
-var focused_pane: u8 = 1; // 0=VM Manager, 1=New VM Form, 2=Varde Shell
-var focused_form_field: u8 = 0; // 0=name, 1=vcpus, 2=mem, 3=create button
-var show_help_modal: bool = false; // [F1] or '?' help modal overlay
+    pub fn fillRect(self: Surface, x: u32, y: u32, w: u32, h: u32, col: u32) void {
+        lib.fillRect(x, y, w, h, col, self.token);
+    }
 
-// Form State
-var form_name: [32]u8 = "alpine-01".* ++ [_]u8{0} ** 23;
-var form_name_len: usize = 9;
-var form_vcpus: u32 = 1;
-const MEM_OPTIONS = [_]u32{ 16, 32, 64, 128 };
-var form_mem_idx: usize = 1; // Default 32 MB
-var form_status_buf: [64]u8 = [_]u8{0} ** 64;
+    pub fn drawText(self: Surface, row: u32, col: u32, fg: u32, bg: u32, text: []const u8) void {
+        lib.drawTextBg(self.dma_phys, self.dma_va, row, col, fg, bg, text, self.token);
+    }
+};
+
+// --- Focus & Layout State ---
+pub const Pane = enum(u8) {
+    vm_form = 0,
+    vm_manager = 1,
+    varde_shell = 2,
+};
+
+pub const FormField = enum(u8) {
+    name = 0,
+    vcpus = 1,
+    memory = 2,
+    kernel = 3,
+    rootfs = 4,
+    create_btn = 5,
+    reset_btn = 6,
+};
+
+var focused_pane: Pane = .vm_form;
+var focused_form_field: FormField = .name;
+
+// Geometry Rectangles
+var header_rect: Rect = Rect.init(0, 0, 800, 20);
+var left_panel_rect: Rect = Rect.init(0, 20, 400, 288);
+var shell_panel_rect: Rect = Rect.init(0, 308, 400, 272);
+var shell_prompt_rect: Rect = Rect.init(16, 544, 368, 16);
+var right_panel_rect: Rect = Rect.init(400, 20, 400, 560);
+var bottom_bar_rect: Rect = Rect.init(0, 580, 800, 20);
+var status_banner_rect: Rect = Rect.init(24, 212, 352, 24);
+
+// Damage Tracker
+var damage_tracker: DamageTracker = DamageTracker.initWithBounds(Rect.init(0, 0, 800, 600));
+
+// TUI Panels
+var left_panel: Panel = undefined;
+var shell_panel: Panel = undefined;
+var right_panel: Panel = undefined;
+var help_modal: ModalDialog = undefined;
+
+// Varde Shell Line Editor, History & Scrollback State
+var shell_input: TextInput = undefined;
+var shell_history: HistoryRing = HistoryRing.init();
+var shell_scroll_offset: usize = 0;
+var shell_auto_scroll: bool = true;
+
+// Form Widgets
+var form_name_input: TextInput = undefined;
+var form_vcpu_spinner: NumberSpinner = undefined;
+const MEM_OPTIONS = [_][]const u8{ "16 MB", "32 MB", "64 MB", "128 MB" };
+const MEM_VALUES = [_]u32{ 16, 32, 64, 128 };
+var form_mem_select: OptionSelect = undefined;
+const KERNEL_OPTIONS = [_][]const u8{ "Embedded Linux 6.6", "Custom" };
+var form_kernel_select: OptionSelect = undefined;
+const ROOTFS_OPTIONS = [_][]const u8{ "In-Memory OCI Demo", "NVMe Staged" };
+var form_rootfs_select: OptionSelect = undefined;
+var form_create_btn: Button = undefined;
+var form_reset_btn: Button = undefined;
+
+// VM List View
+var vm_list_view: ListView = undefined;
+
+// Status feedback buffer
+var form_status_buf: [64]u8 = @splat(0);
 var form_status_len: usize = 0;
-var form_status_color: u32 = COLOR_GREEN;
+var form_status_color: u32 = color.COLOR_GREEN;
 
-fn setFormStatus(msg: []const u8, color: u32) void {
+fn setFormStatus(msg: []const u8, c: u32) void {
     const n = @min(msg.len, form_status_buf.len);
     @memcpy(form_status_buf[0..n], msg[0..n]);
     form_status_len = n;
-    form_status_color = color;
+    form_status_color = c;
 }
 
-// MicroVM Management State
-var microvm_list: [16]struct { name: [32]u8, status: []const u8, id: u32, state: u8 } = undefined;
+// MicroVM State
+const VmItem = struct {
+    name: [32]u8,
+    status: []const u8,
+    id: u32,
+    state: u8,
+    vcpus: u32,
+    mem_pages: u64,
+    cpu_cycles: u64,
+    exit_count: u64,
+};
+var microvm_list: [16]VmItem = undefined;
 var microvm_count: usize = 0;
 var selected_vm_idx: usize = 0;
 var needs_vm_refresh: bool = true;
 var needs_redraw: bool = true;
 
-// Varde Shell Scrollback & Prompt State
-var shell_scroll_offset: usize = 0; // 0 = view bottom/latest lines
-var shell_auto_scroll: bool = true;
+// Varde Shell Log Tracking
 var last_seen_shell_len: usize = 0;
 
 const proto_dashd = @import("protocols/dashd_protocol.zig");
 
-// Cluster node view, aggregated from dashd's telemetry summary.
+// Cluster Node View
 const MAX_NODES: usize = 8;
 const NodeRow = struct {
     used: bool = false,
-    addr: [16]u8 = [_]u8{0} ** 16,
+    addr: [16]u8 = @splat(0),
     vms: u32 = 0,
     cycles: u64 = 0,
     exits: u64 = 0,
 };
-var node_rows: [MAX_NODES]NodeRow = [_]NodeRow{.{}} ** MAX_NODES;
+var node_rows: [MAX_NODES]NodeRow = @splat(.{});
 
 const proto_inputd = @import("protocols/inputd_protocol.zig");
 const InputEventPayload = proto_inputd.InputEvent;
-const KeyCode = proto_inputd.KeyCode;
 
 // --- DIPC Control Requests ---
 
@@ -112,8 +181,8 @@ fn requestClusterSummary(dma_phys: u64, token: u64) void {
         .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
         .payload_len = @as(u32, @intCast(body_len)),
         .auth_tag = 0,
-        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.windowd) },
-        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.dashd) },
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.windowd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.dashd) },
     };
     const dh: *align(1) proto_dashd.DashdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
     dh.* = .{ .op = .telemetry_summary_request, .payload_len = @sizeOf(proto_dashd.TelemetrySummaryRequest) };
@@ -143,7 +212,7 @@ fn sendVmDelete(bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64, i
     lib.sendControl(bs, scratch_phys, scratch_va, token, .delete_microvm, std.mem.asBytes(&p));
 }
 
-fn sendVmCreate(bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64, name: []const u8, vcpus: u32, mem_mb: u32) void {
+fn sendVmCreate(bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64, name: []const u8, vcpus: u32, mem_mb: u32, rootfs_tag: []const u8) void {
     const scratch_phys = dma_phys + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
     const scratch_va = DMA_BASE_VA + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
     const mem_pages = mem_mb * 256; // 1 MB = 256 * 4 KB pages
@@ -154,12 +223,125 @@ fn sendVmCreate(bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64, n
         .kernel_size = bs.linux_bzimage_size,
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
-        .name = [_]u8{0} ** 32,
-        .container = [_]u8{0} ** 32,
+        .name = @splat(0),
+        .container = @splat(0),
     };
     const len = @min(name.len, 31);
     @memcpy(p.name[0..len], name[0..len]);
+    const rlen = @min(rootfs_tag.len, 31);
+    @memcpy(p.container[0..rlen], rootfs_tag[0..rlen]);
     lib.sendControl(bs, scratch_phys, scratch_va, token, .create_microvm, std.mem.asBytes(&p));
+}
+
+// --- Serial Milestone Emission Helpers ---
+
+fn emitMilestoneProvisioned(name: []const u8) void {
+    var buf: [64]u8 = undefined;
+    var p: usize = 0;
+    appendStr(&buf, &p, "[UI] MicroVM provisioned: ");
+    appendStr(&buf, &p, name);
+    appendStr(&buf, &p, "\n");
+    lib.serialWrite(buf[0..p]);
+}
+
+fn emitMilestoneStarted(id: u32) void {
+    var buf: [48]u8 = undefined;
+    var p: usize = 0;
+    appendStr(&buf, &p, "[UI] MicroVM ");
+    appendDec(&buf, &p, id);
+    appendStr(&buf, &p, " started\n");
+    lib.serialWrite(buf[0..p]);
+}
+
+fn emitMilestoneStopped(id: u32) void {
+    var buf: [48]u8 = undefined;
+    var p: usize = 0;
+    appendStr(&buf, &p, "[UI] MicroVM ");
+    appendDec(&buf, &p, id);
+    appendStr(&buf, &p, " stopped\n");
+    lib.serialWrite(buf[0..p]);
+}
+
+fn emitMilestoneDeleted(id: u32) void {
+    var buf: [48]u8 = undefined;
+    var p: usize = 0;
+    appendStr(&buf, &p, "[UI] MicroVM ");
+    appendDec(&buf, &p, id);
+    appendStr(&buf, &p, " deleted\n");
+    lib.serialWrite(buf[0..p]);
+}
+
+// --- Widget Focus Synchronization ---
+
+fn syncWidgetFocus() void {
+    const is_form = (focused_pane == .vm_form);
+    const is_mgr = (focused_pane == .vm_manager);
+    const is_shell = (focused_pane == .varde_shell);
+    left_panel.setFocused(is_form);
+    right_panel.setFocused(is_mgr);
+    shell_panel.setFocused(is_shell);
+    form_name_input.setFocused(is_form and focused_form_field == .name);
+    form_vcpu_spinner.setFocused(is_form and focused_form_field == .vcpus);
+    form_mem_select.setFocused(is_form and focused_form_field == .memory);
+    form_kernel_select.setFocused(is_form and focused_form_field == .kernel);
+    form_rootfs_select.setFocused(is_form and focused_form_field == .rootfs);
+    form_create_btn.setFocused(is_form and focused_form_field == .create_btn);
+    form_reset_btn.setFocused(is_form and focused_form_field == .reset_btn);
+    vm_list_view.setFocused(is_mgr);
+    shell_input.setFocused(is_shell);
+}
+
+// --- Widget Initialization ---
+
+fn initWidgets() void {
+    const pane_w = SCREEN_WIDTH / 2;
+    const work_h = SCREEN_HEIGHT - 40;
+    const form_h: u32 = 288;
+    const shell_h: u32 = work_h - form_h;
+
+    header_rect = Rect.init(0, 0, SCREEN_WIDTH, 20);
+    left_panel_rect = Rect.init(0, 20, pane_w, form_h);
+    shell_panel_rect = Rect.init(0, 20 + form_h, pane_w, shell_h);
+    shell_prompt_rect = Rect.init(16, 544, pane_w - 32, 16);
+    right_panel_rect = Rect.init(pane_w, 20, pane_w, work_h);
+    bottom_bar_rect = Rect.init(0, SCREEN_HEIGHT - 20, SCREEN_WIDTH, 20);
+    status_banner_rect = Rect.init(24, 212, 352, 24);
+
+    damage_tracker = DamageTracker.initWithBounds(Rect.init(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT));
+
+    left_panel = Panel.init(left_panel_rect, "MicroVM Provisioning Form [F2]");
+    shell_panel = Panel.init(shell_panel_rect, "Varde Shell [F4] [PgUp/PgDn]");
+    right_panel = Panel.init(right_panel_rect, "VM Manager & Inspector [F3]");
+
+    // Form fields
+    form_name_input = TextInput.init(Rect.init(128, 48, 248, 16), 31);
+    form_name_input.setText("alpine-node-01");
+
+    form_vcpu_spinner = NumberSpinner.init(Rect.init(128, 72, 160, 16), 2, 1, 2, 1, " vCPU");
+
+    form_mem_select = OptionSelect.init(Rect.init(128, 96, 160, 16), &MEM_OPTIONS, 1);
+
+    form_kernel_select = OptionSelect.init(Rect.init(128, 120, 248, 16), &KERNEL_OPTIONS, 0);
+
+    form_rootfs_select = OptionSelect.init(Rect.init(128, 144, 248, 16), &ROOTFS_OPTIONS, 0);
+
+    form_create_btn = Button.init(Rect.init(24, 176, 192, 24), "CREATE & LAUNCH");
+    form_reset_btn = Button.init(Rect.init(232, 176, 136, 24), "RESET");
+
+    // Varde Shell Line Editor
+    shell_input = TextInput.init(Rect.init(96, 544, 288, 16), 64);
+    shell_history = HistoryRing.init();
+    shell_scroll_offset = 0;
+    shell_auto_scroll = true;
+
+    // VM Manager ListView
+    vm_list_view = ListView.init(Rect.init(412, 60, 376, 144), 7);
+    vm_list_view.setItemCount(0);
+
+    // Centered Help Modal
+    help_modal = ModalDialog.initCentered(560, 420, SCREEN_WIDTH, SCREEN_HEIGHT, "Catenary OS - Operator Guide & Shortcuts");
+
+    syncWidgetFocus();
 }
 
 // --- Main Event Loop ---
@@ -170,14 +352,14 @@ pub export fn umain() noreturn {
         lib.ptrFrom(*const lib.BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
     const token = bs.capability_token;
 
-    _ = lib.syscall(SYS_REGISTER, 0, @intFromEnum(lib.ReservedEndpoint.windowd), token);
+    _ = lib.syscall(SYS_REGISTER, 0, @backingInt(lib.ReservedEndpoint.windowd), token);
     lib.serialWrite("windowd: registered at endpoint 9\n");
 
     // Allocate DMA pages
     const dma_phys = lib.syscall(SYS_ALLOC_DMA, DMA_NUM_PAGES, 0, token);
     if (dma_phys == 0) while (true) asm volatile ("pause");
 
-    if (lib.getFramebufferInfo()) |info| {
+    if (lib.getFramebufferInfo(token)) |info| {
         if (info.width > 0) {
             SCREEN_WIDTH = info.width;
             SCREEN_HEIGHT = info.height;
@@ -186,11 +368,13 @@ pub export fn umain() noreturn {
         }
     }
 
-    setFormStatus("Ready. Press [Tab] to switch focus.", COLOR_HIGHLIGHT);
+    initWidgets();
+    setFormStatus("Ready. Press [Tab] to navigate fields.", color.COLOR_HIGHLIGHT);
 
-    // Initial paint
-    lib.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_SEA_GRAY, token);
+    // Initial paint with full screen damage
+    damage_tracker.markAllDirty();
     drawTui(dma_phys, token);
+    needs_redraw = false;
 
     var last_poll: u64 = 0;
 
@@ -202,13 +386,15 @@ pub export fn umain() noreturn {
             last_poll = 0;
         }
 
-        const page_phys = lib.syscall(SYS_TRY_RECV, 0, 0, token);
-        if (page_phys != 0) {
+        while (true) {
+            const page_phys = lib.syscall(SYS_TRY_RECV, 0, 0, token);
+            if (page_phys == 0) break;
             const page_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (page_va != 0) {
                 handleMessage(page_va, bs, dma_phys, token);
                 _ = lib.syscall(SYS_FREE_PAGE, lib.DIPC_RECV_VA, 0, token);
-                needs_redraw = true;
+            } else {
+                _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
         }
 
@@ -219,6 +405,7 @@ pub export fn umain() noreturn {
             if (shell_auto_scroll) {
                 shell_scroll_offset = 0;
             }
+            damage_tracker.addDamage(shell_panel_rect);
             needs_redraw = true;
         }
 
@@ -228,7 +415,8 @@ pub export fn umain() noreturn {
         }
 
         last_poll += 1;
-        _ = lib.syscall(lib.SYS_RECV, 0, 0, token);
+        _ = lib.syscall(SYS_YIELD, 0, 0, token);
+        asm volatile ("pause");
     }
 }
 
@@ -245,207 +433,449 @@ fn vmStateLabel(state: u8) []const u8 {
     };
 }
 
+// --- Input Event Dispatcher ---
+
 fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64) void {
-    // If Help Modal is open, any Esc or F1 closes it
-    if (show_help_modal) {
-        if (evt.key_code == .escape or evt.key_code == .f1 or evt.ascii == '?' or evt.key_code == .enter or evt.ascii == ' ') {
-            show_help_modal = false;
+    // 1. Modal Overlay Input Trapping
+    if (help_modal.isOpen()) {
+        const is_dismiss = (evt.key_code == .escape or
+            evt.key_code == .enter or evt.ascii == '\n' or evt.ascii == '\r' or
+            evt.key_code == .f1 or evt.ascii == '?' or evt.ascii == ' ' or
+            evt.ascii == 'q' or evt.ascii == 'Q');
+        if (is_dismiss) {
+            help_modal.close();
+            damage_tracker.addDamage(help_modal.rect);
+            damage_tracker.addDamage(left_panel_rect);
+            damage_tracker.addDamage(shell_panel_rect);
+            damage_tracker.addDamage(right_panel_rect);
+            damage_tracker.addDamage(bottom_bar_rect);
             needs_redraw = true;
         }
+        // Exclusively trap all keyboard events while modal is visible
         return;
     }
 
-    // Modal Trigger: [F1] or '?' when not in text input
-    if (evt.key_code == .f1 or (evt.ascii == '?' and !(focused_pane == 1 and focused_form_field == 0))) {
-        show_help_modal = true;
+    // 2. Help Modal Trigger ([F1] or '?' when not typing in text input)
+    const in_text_input = (focused_pane == .vm_form and focused_form_field == .name) or (focused_pane == .varde_shell);
+    if (evt.key_code == .f1 or (evt.ascii == '?' and !in_text_input)) {
+        help_modal.open();
+        damage_tracker.addDamage(help_modal.rect);
         needs_redraw = true;
         return;
     }
 
-    // Global Navigation Keys
-    if (evt.key_code == .tab or evt.ascii == '\t') {
-        focused_pane = (focused_pane + 1) % 3;
-        needs_redraw = true;
-        return;
-    }
+    // 3. Direct Function Key Pane Navigation
     if (evt.key_code == .f2) {
-        focused_pane = 0; // VM Manager
-        needs_redraw = true;
+        if (focused_pane != .vm_form) {
+            focused_pane = .vm_form;
+            syncWidgetFocus();
+            damage_tracker.addDamage(left_panel_rect);
+            damage_tracker.addDamage(shell_panel_rect);
+            damage_tracker.addDamage(right_panel_rect);
+            needs_redraw = true;
+        }
         return;
     }
     if (evt.key_code == .f3) {
-        focused_pane = 1; // New VM Form
-        needs_redraw = true;
+        if (focused_pane != .vm_manager) {
+            focused_pane = .vm_manager;
+            syncWidgetFocus();
+            damage_tracker.addDamage(left_panel_rect);
+            damage_tracker.addDamage(shell_panel_rect);
+            damage_tracker.addDamage(right_panel_rect);
+            needs_redraw = true;
+        }
         return;
     }
     if (evt.key_code == .f4) {
-        focused_pane = 2; // Varde Shell
+        if (focused_pane != .varde_shell) {
+            focused_pane = .varde_shell;
+            syncWidgetFocus();
+            damage_tracker.addDamage(left_panel_rect);
+            damage_tracker.addDamage(shell_panel_rect);
+            damage_tracker.addDamage(right_panel_rect);
+            needs_redraw = true;
+        }
+        return;
+    }
+    if (evt.key_code == .f5) {
+        needs_vm_refresh = true;
+        setFormStatus("Refreshing VM & cluster telemetry...", color.COLOR_HIGHLIGHT);
+        damage_tracker.addDamage(status_banner_rect);
+        damage_tracker.addDamage(shell_panel_rect);
+        damage_tracker.addDamage(right_panel_rect);
+        damage_tracker.addDamage(header_rect);
         needs_redraw = true;
         return;
     }
 
-    // --- Pane 0: VM Manager ---
-    if (focused_pane == 0) {
-        if (evt.key_code == .up) {
-            if (selected_vm_idx > 0) {
-                selected_vm_idx -= 1;
-                needs_redraw = true;
+    // 4. Tab / Shift+Tab Navigation
+    const is_tab = (evt.key_code == .tab or evt.ascii == '\t');
+    const is_shift = ((evt.modifiers & proto_inputd.MOD_SHIFT) != 0);
+
+    if (is_tab) {
+        if (focused_pane == .vm_form) {
+            if (is_shift) {
+                if (@intFromEnum(focused_form_field) > 0) {
+                    focused_form_field = @enumFromInt(@intFromEnum(focused_form_field) - 1);
+                } else {
+                    focused_pane = .varde_shell;
+                }
+            } else {
+                if (@intFromEnum(focused_form_field) < 6) {
+                    focused_form_field = @enumFromInt(@intFromEnum(focused_form_field) + 1);
+                } else {
+                    focused_pane = .vm_manager;
+                }
             }
-            return;
-        }
-        if (evt.key_code == .down) {
-            if (selected_vm_idx + 1 < microvm_count) {
-                selected_vm_idx += 1;
-                needs_redraw = true;
+        } else if (focused_pane == .vm_manager) {
+            if (is_shift) {
+                focused_pane = .vm_form;
+                focused_form_field = .reset_btn;
+            } else {
+                focused_pane = .varde_shell;
             }
-            return;
-        }
-        if (evt.ascii == 's' or evt.ascii == 'S') {
-            if (selected_vm_idx < microvm_count) {
-                const vm = microvm_list[selected_vm_idx];
-                sendVmStart(bs, dma_phys, token, vm.id);
-                setFormStatus("Starting MicroVM...", COLOR_GOLDEN_YELLOW);
-                needs_vm_refresh = true;
-                needs_redraw = true;
+        } else {
+            if (is_shift) {
+                focused_pane = .vm_manager;
+            } else {
+                focused_pane = .vm_form;
+                focused_form_field = .name;
             }
-            return;
         }
-        if (evt.ascii == 'k' or evt.ascii == 'K') {
-            if (selected_vm_idx < microvm_count) {
-                const vm = microvm_list[selected_vm_idx];
-                sendVmStop(bs, dma_phys, token, vm.id);
-                setFormStatus("Stopping MicroVM...", COLOR_GOLDEN_YELLOW);
-                needs_vm_refresh = true;
-                needs_redraw = true;
-            }
-            return;
-        }
-        if (evt.ascii == 'd' or evt.ascii == 'D') {
-            if (selected_vm_idx < microvm_count) {
-                const vm = microvm_list[selected_vm_idx];
-                sendVmDelete(bs, dma_phys, token, vm.id);
-                setFormStatus("Deleted MicroVM.", COLOR_RED);
-                needs_vm_refresh = true;
-                needs_redraw = true;
-            }
-            return;
-        }
+        syncWidgetFocus();
+        damage_tracker.addDamage(left_panel_rect);
+        damage_tracker.addDamage(shell_panel_rect);
+        damage_tracker.addDamage(right_panel_rect);
+        needs_redraw = true;
         return;
     }
 
-    // --- Pane 1: New MicroVM Form ---
-    if (focused_pane == 1) {
-        if (evt.key_code == .up) {
-            if (focused_form_field > 0) {
-                focused_form_field -= 1;
-                needs_redraw = true;
-            }
-            return;
-        }
+    // 5. Left Pane: MicroVM Provisioning Form
+    if (focused_pane == .vm_form) {
+        // Vertical field navigation via Up / Down arrow keys
         if (evt.key_code == .down) {
-            if (focused_form_field < 3) {
-                focused_form_field += 1;
-                needs_redraw = true;
-            }
-            return;
-        }
-
-        // Field 0: Name (Text input)
-        if (focused_form_field == 0) {
-            if (evt.key_code == .backspace or evt.ascii == 0x08) {
-                if (form_name_len > 0) {
-                    form_name_len -= 1;
-                    form_name[form_name_len] = 0;
-                    needs_redraw = true;
-                }
-                return;
-            }
-            if (evt.key_code == .enter or evt.ascii == '\n') {
-                focused_form_field = 1;
-                needs_redraw = true;
-                return;
-            }
-            if (evt.ascii >= 32 and evt.ascii <= 126 and form_name_len < 20) {
-                form_name[form_name_len] = evt.ascii;
-                form_name_len += 1;
-                form_name[form_name_len] = 0;
-                needs_redraw = true;
-                return;
-            }
-            return;
-        }
-
-        // Field 1: vCPUs (1..4)
-        if (focused_form_field == 1) {
-            if (evt.key_code == .left) {
-                if (form_vcpus > 1) {
-                    form_vcpus -= 1;
-                    needs_redraw = true;
-                }
-                return;
-            }
-            if (evt.key_code == .right) {
-                if (form_vcpus < 4) {
-                    form_vcpus += 1;
-                    needs_redraw = true;
-                }
-                return;
-            }
-            if (evt.ascii >= '1' and evt.ascii <= '4') {
-                form_vcpus = evt.ascii - '0';
-                needs_redraw = true;
-                return;
-            }
-            if (evt.key_code == .enter or evt.ascii == '\n') {
-                focused_form_field = 2;
-                needs_redraw = true;
-                return;
-            }
-            return;
-        }
-
-        // Field 2: Memory (16, 32, 64, 128 MB)
-        if (focused_form_field == 2) {
-            if (evt.key_code == .left) {
-                if (form_mem_idx > 0) {
-                    form_mem_idx -= 1;
-                    needs_redraw = true;
-                }
-                return;
-            }
-            if (evt.key_code == .right) {
-                if (form_mem_idx + 1 < MEM_OPTIONS.len) {
-                    form_mem_idx += 1;
-                    needs_redraw = true;
-                }
-                return;
-            }
-            if (evt.key_code == .enter or evt.ascii == '\n') {
-                focused_form_field = 3;
-                needs_redraw = true;
-                return;
-            }
-            return;
-        }
-
-        // Field 3: Action Button (Create & Launch)
-        if (focused_form_field == 3 or evt.key_code == .enter or evt.ascii == '\n') {
-            const name_slice = if (form_name_len > 0) form_name[0..form_name_len] else "guest-vm";
-            sendVmCreate(bs, dma_phys, token, name_slice, form_vcpus, MEM_OPTIONS[form_mem_idx]);
-            setFormStatus("MicroVM provision request dispatched!", COLOR_GREEN);
-            needs_vm_refresh = true;
+            focused_form_field = if (@intFromEnum(focused_form_field) < 6)
+                @enumFromInt(@intFromEnum(focused_form_field) + 1)
+            else
+                .name;
+            syncWidgetFocus();
+            damage_tracker.addDamage(left_panel_rect);
             needs_redraw = true;
             return;
         }
+        if (evt.key_code == .up) {
+            focused_form_field = if (@intFromEnum(focused_form_field) > 0)
+                @enumFromInt(@intFromEnum(focused_form_field) - 1)
+            else
+                .reset_btn;
+            syncWidgetFocus();
+            damage_tracker.addDamage(left_panel_rect);
+            needs_redraw = true;
+            return;
+        }
+
+        // Horizontal toggle between action buttons
+        if (focused_form_field == .create_btn and evt.key_code == .right) {
+            focused_form_field = .reset_btn;
+            syncWidgetFocus();
+            damage_tracker.addDamage(form_create_btn.rect);
+            damage_tracker.addDamage(form_reset_btn.rect);
+            needs_redraw = true;
+            return;
+        }
+        if (focused_form_field == .reset_btn and evt.key_code == .left) {
+            focused_form_field = .create_btn;
+            syncWidgetFocus();
+            damage_tracker.addDamage(form_create_btn.rect);
+            damage_tracker.addDamage(form_reset_btn.rect);
+            needs_redraw = true;
+            return;
+        }
+
+        // Field 0: Name (TextInput)
+        if (focused_form_field == .name) {
+            if (evt.key_code == .enter or evt.ascii == '\n') {
+                focused_form_field = .vcpus;
+                syncWidgetFocus();
+                damage_tracker.addDamage(form_name_input.rect);
+                damage_tracker.addDamage(form_vcpu_spinner.rect);
+                needs_redraw = true;
+                return;
+            }
+            if (form_name_input.handleKey(evt)) {
+                damage_tracker.addDamage(form_name_input.rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        // Field 1: vCPUs (NumberSpinner)
+        if (focused_form_field == .vcpus) {
+            if (evt.key_code == .enter or evt.ascii == '\n') {
+                focused_form_field = .memory;
+                syncWidgetFocus();
+                damage_tracker.addDamage(form_vcpu_spinner.rect);
+                damage_tracker.addDamage(form_mem_select.rect);
+                needs_redraw = true;
+                return;
+            }
+            if (form_vcpu_spinner.handleKey(evt)) {
+                damage_tracker.addDamage(form_vcpu_spinner.rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        // Field 2: Memory (OptionSelect)
+        if (focused_form_field == .memory) {
+            if (evt.key_code == .enter or evt.ascii == '\n') {
+                focused_form_field = .kernel;
+                syncWidgetFocus();
+                damage_tracker.addDamage(form_mem_select.rect);
+                damage_tracker.addDamage(form_kernel_select.rect);
+                needs_redraw = true;
+                return;
+            }
+            if (form_mem_select.handleKey(evt)) {
+                damage_tracker.addDamage(form_mem_select.rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        // Field 3: Kernel (OptionSelect)
+        if (focused_form_field == .kernel) {
+            if (evt.key_code == .enter or evt.ascii == '\n') {
+                focused_form_field = .rootfs;
+                syncWidgetFocus();
+                damage_tracker.addDamage(form_kernel_select.rect);
+                damage_tracker.addDamage(form_rootfs_select.rect);
+                needs_redraw = true;
+                return;
+            }
+            if (form_kernel_select.handleKey(evt)) {
+                damage_tracker.addDamage(form_kernel_select.rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        // Field 4: Rootfs (OptionSelect)
+        if (focused_form_field == .rootfs) {
+            if (evt.key_code == .enter or evt.ascii == '\n') {
+                focused_form_field = .create_btn;
+                syncWidgetFocus();
+                damage_tracker.addDamage(form_rootfs_select.rect);
+                damage_tracker.addDamage(form_create_btn.rect);
+                needs_redraw = true;
+                return;
+            }
+            if (form_rootfs_select.handleKey(evt)) {
+                damage_tracker.addDamage(form_rootfs_select.rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        // Field 5: Action Button: < CREATE & LAUNCH >
+        if (focused_form_field == .create_btn) {
+            const is_action = form_create_btn.handleKey(evt) or
+                evt.key_code == .enter or evt.ascii == '\n' or evt.ascii == ' ';
+            if (is_action) {
+                const name_text = form_name_input.getText();
+                // Validation 1: Non-empty name
+                if (name_text.len == 0) {
+                    setFormStatus("[ERR] Name cannot be empty", color.COLOR_RED);
+                    damage_tracker.addDamage(status_banner_rect);
+                    needs_redraw = true;
+                    return;
+                }
+                // Validation 2: Unique name
+                for (microvm_list[0..microvm_count]) |vm| {
+                    const vlen = lib.nameLen(&vm.name);
+                    if (std.mem.eql(u8, vm.name[0..vlen], name_text)) {
+                        setFormStatus("[ERR] Name already exists", color.COLOR_RED);
+                        damage_tracker.addDamage(status_banner_rect);
+                        needs_redraw = true;
+                        return;
+                    }
+                }
+                // Validation 3: vCPUs limit
+                const vcpu_val = form_vcpu_spinner.getValue();
+                if (vcpu_val > 2) {
+                    setFormStatus("[ERR] vCPUs exceed host core count", color.COLOR_RED);
+                    damage_tracker.addDamage(status_banner_rect);
+                    needs_redraw = true;
+                    return;
+                }
+
+                // Inline Feedback: Status Green
+                setFormStatus("[OK] Valid configuration", color.COLOR_GREEN);
+
+                // Serial Milestone
+                emitMilestoneProvisioned(name_text);
+
+                // Dispatch create_microvm DIPC
+                const mem_mb = MEM_VALUES[form_mem_select.getSelectedIndex()];
+                const rootfs_choice = form_rootfs_select.getSelected();
+                sendVmCreate(bs, dma_phys, token, name_text, vcpu_val, mem_mb, rootfs_choice);
+
+                needs_vm_refresh = true;
+                damage_tracker.addDamage(status_banner_rect);
+                damage_tracker.addDamage(form_create_btn.rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
+
+        // Field 6: Action Button: < RESET >
+        if (focused_form_field == .reset_btn) {
+            const is_action = form_reset_btn.handleKey(evt) or
+                evt.key_code == .enter or evt.ascii == '\n' or evt.ascii == ' ';
+            if (is_action) {
+                form_name_input.setText("alpine-node-01");
+                form_vcpu_spinner.setValue(2);
+                form_mem_select.setSelectedIndex(1); // 32 MB
+                form_kernel_select.setSelectedIndex(0);
+                form_rootfs_select.setSelectedIndex(0);
+                focused_form_field = .name;
+                syncWidgetFocus();
+                form_status_len = 0;
+                damage_tracker.addDamage(left_panel_rect);
+                needs_redraw = true;
+                return;
+            }
+            return;
+        }
         return;
     }
 
-    // --- Pane 2: Varde Shell ---
-    if (focused_pane == 2) {
-        // Scrollback navigation
+    // 6. Right Pane: VM Manager Sidebar & Inspector Card
+    if (focused_pane == .vm_manager) {
+        if (evt.key_code == .up) {
+            if (vm_list_view.moveUp()) {
+                selected_vm_idx = vm_list_view.getSelectedIndex();
+                damage_tracker.addDamage(right_panel_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+        if (evt.key_code == .down) {
+            if (vm_list_view.moveDown()) {
+                selected_vm_idx = vm_list_view.getSelectedIndex();
+                damage_tracker.addDamage(right_panel_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+        if (evt.key_code == .page_up) {
+            if (vm_list_view.pageUp()) {
+                selected_vm_idx = vm_list_view.getSelectedIndex();
+                damage_tracker.addDamage(right_panel_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+        if (evt.key_code == .page_down) {
+            if (vm_list_view.pageDown()) {
+                selected_vm_idx = vm_list_view.getSelectedIndex();
+                damage_tracker.addDamage(right_panel_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+        if (evt.key_code == .home) {
+            if (vm_list_view.moveHome()) {
+                selected_vm_idx = vm_list_view.getSelectedIndex();
+                damage_tracker.addDamage(right_panel_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+        if (evt.key_code == .end) {
+            if (vm_list_view.moveEnd()) {
+                selected_vm_idx = vm_list_view.getSelectedIndex();
+                damage_tracker.addDamage(right_panel_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+
+        // Hotkey: [S] / Enter -> Start MicroVM
+        if (evt.ascii == 's' or evt.ascii == 'S' or evt.key_code == .enter) {
+            if (microvm_count > 0 and selected_vm_idx < microvm_count) {
+                const vm = microvm_list[selected_vm_idx];
+                sendVmStart(bs, dma_phys, token, vm.id);
+                emitMilestoneStarted(vm.id);
+                var status_msg: [48]u8 = undefined;
+                var sp: usize = 0;
+                appendStr(&status_msg, &sp, "Starting MicroVM #");
+                appendDec(&status_msg, &sp, vm.id);
+                appendStr(&status_msg, &sp, "...");
+                setFormStatus(status_msg[0..sp], color.COLOR_GOLDEN_YELLOW);
+                needs_vm_refresh = true;
+                damage_tracker.addDamage(right_panel_rect);
+                damage_tracker.addDamage(status_banner_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+
+        // Hotkey: [K] -> Stop / Kill MicroVM
+        if (evt.ascii == 'k' or evt.ascii == 'K') {
+            if (microvm_count > 0 and selected_vm_idx < microvm_count) {
+                const vm = microvm_list[selected_vm_idx];
+                sendVmStop(bs, dma_phys, token, vm.id);
+                emitMilestoneStopped(vm.id);
+                var status_msg: [48]u8 = undefined;
+                var sp: usize = 0;
+                appendStr(&status_msg, &sp, "Stopping MicroVM #");
+                appendDec(&status_msg, &sp, vm.id);
+                appendStr(&status_msg, &sp, "...");
+                setFormStatus(status_msg[0..sp], color.COLOR_GOLDEN_YELLOW);
+                needs_vm_refresh = true;
+                damage_tracker.addDamage(right_panel_rect);
+                damage_tracker.addDamage(status_banner_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+
+        // Hotkey: [D] -> Delete MicroVM
+        if (evt.ascii == 'd' or evt.ascii == 'D') {
+            if (microvm_count > 0 and selected_vm_idx < microvm_count) {
+                const vm = microvm_list[selected_vm_idx];
+                sendVmDelete(bs, dma_phys, token, vm.id);
+                emitMilestoneDeleted(vm.id);
+                var status_msg: [48]u8 = undefined;
+                var sp: usize = 0;
+                appendStr(&status_msg, &sp, "Deleted MicroVM #");
+                appendDec(&status_msg, &sp, vm.id);
+                appendStr(&status_msg, &sp, ".");
+                setFormStatus(status_msg[0..sp], color.COLOR_RED);
+                needs_vm_refresh = true;
+                damage_tracker.addDamage(right_panel_rect);
+                damage_tracker.addDamage(status_banner_rect);
+                needs_redraw = true;
+            }
+            return;
+        }
+        return;
+    }
+
+    // 7. Bottom-Left Pane: Varde Shell Line Editor, History & Scrollback
+    if (focused_pane == .varde_shell) {
         if (evt.key_code == .page_up) {
             shell_scroll_offset += 6;
             shell_auto_scroll = false;
+            damage_tracker.addDamage(shell_panel_rect);
             needs_redraw = true;
             return;
         }
@@ -456,78 +886,122 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
                 shell_scroll_offset = 0;
                 shell_auto_scroll = true;
             }
+            damage_tracker.addDamage(shell_panel_rect);
             needs_redraw = true;
             return;
         }
-
-        if (evt.key_code == .enter or evt.ascii == '\n') {
-            _ = lib.syscall(SYS_VARDE_INJECT, '\r', 0, token);
-            _ = lib.syscall(SYS_VARDE_INJECT, '\n', 0, token);
-            shell_scroll_offset = 0;
-            shell_auto_scroll = true;
-            return;
-        }
-        if (evt.key_code == .backspace or evt.ascii == 0x08) {
-            _ = lib.syscall(SYS_VARDE_INJECT, 0x08, 0, token);
-            return;
-        }
         if (evt.key_code == .up) {
-            _ = lib.syscall(SYS_VARDE_INJECT, 27, 0, token);
-            _ = lib.syscall(SYS_VARDE_INJECT, '[', 0, token);
-            _ = lib.syscall(SYS_VARDE_INJECT, 'A', 0, token);
+            if (shell_history.recallUp(shell_input.getText(), shell_input.cursor_pos)) |res| {
+                shell_input.setText(res.text);
+                shell_input.cursor_pos = @min(res.cursor, shell_input.len);
+                damage_tracker.addDamage(shell_prompt_rect);
+                needs_redraw = true;
+            }
             return;
         }
         if (evt.key_code == .down) {
-            _ = lib.syscall(SYS_VARDE_INJECT, 27, 0, token);
-            _ = lib.syscall(SYS_VARDE_INJECT, '[', 0, token);
-            _ = lib.syscall(SYS_VARDE_INJECT, 'B', 0, token);
+            if (shell_history.recallDown()) |res| {
+                shell_input.setText(res.text);
+                shell_input.cursor_pos = @min(res.cursor, shell_input.len);
+                damage_tracker.addDamage(shell_prompt_rect);
+                needs_redraw = true;
+            }
             return;
         }
-        if (evt.ascii != 0) {
-            _ = lib.syscall(SYS_VARDE_INJECT, @as(u64, evt.ascii), 0, token);
+        if (evt.key_code == .enter or evt.ascii == '\n' or evt.ascii == '\r') {
+            const cmd = shell_input.getText();
+            shell_history.push(cmd);
+            for (cmd) |ch| {
+                _ = lib.syscall(SYS_VARDE_INJECT, @as(u64, ch), 0, token);
+            }
+            _ = lib.syscall(SYS_VARDE_INJECT, '\n', 0, token);
+            shell_input.clear();
             shell_scroll_offset = 0;
             shell_auto_scroll = true;
+            needs_vm_refresh = true;
+            damage_tracker.addDamage(shell_panel_rect);
+            needs_redraw = true;
+            return;
+        }
+        if (shell_input.handleKey(evt)) {
+            damage_tracker.addDamage(shell_prompt_rect);
+            needs_redraw = true;
             return;
         }
     }
 }
 
+// --- Inbound DIPC Message Dispatcher ---
+
 fn handleMessage(page_va: u64, bs: *const lib.BootstrapDescriptor, dma_phys: u64, token: u64) void {
     const hdr: *const lib.PageHeader = lib.ptrFrom(*const lib.PageHeader, page_va);
     const payload_va = page_va + @as(u64, hdr.header_len);
 
-    if (hdr.src.endpoint == @intFromEnum(lib.ReservedEndpoint.inputd) and
+    if (hdr.src.endpoint == @backingInt(lib.ReservedEndpoint.inputd) and
         hdr.payload_len >= @sizeOf(InputEventPayload))
     {
         const evt: *align(1) const InputEventPayload = @ptrFromInt(payload_va);
+        lib.serialWrite("windowd: input event received\n");
         handleInputEvent(evt.*, bs, dma_phys, token);
         return;
     }
 
-    if (hdr.src.endpoint == @intFromEnum(lib.ReservedEndpoint.dashd) and
+    if (hdr.src.endpoint == @backingInt(lib.ReservedEndpoint.dashd) and
         hdr.payload_len == @sizeOf(proto_dashd.DashdHeader) + @sizeOf(proto_dashd.TelemetrySummaryReply))
     {
         const dh: *align(1) const proto_dashd.DashdHeader = @ptrFromInt(payload_va);
-        if (dh.magic == proto_dashd.MAGIC and dh.op == .telemetry_summary_reply) handleClusterSummary(payload_va);
+        if (dh.magic == proto_dashd.MAGIC and dh.op == .telemetry_summary_reply) {
+            handleClusterSummary(payload_va);
+            damage_tracker.addDamage(header_rect);
+            damage_tracker.addDamage(right_panel_rect);
+            needs_redraw = true;
+        }
         return;
     }
 
-    if (hdr.src.endpoint == @intFromEnum(lib.ReservedEndpoint.kernel_control) and
+    if (hdr.src.endpoint == @backingInt(lib.ReservedEndpoint.kernel_control) and
         hdr.payload_len == @sizeOf(lib.VmSnapshotListPayload))
     {
         const snap: *align(1) const lib.VmSnapshotListPayload = @ptrFromInt(payload_va);
         microvm_count = @min(snap.count, microvm_list.len);
-
         var i: usize = 0;
         while (i < microvm_count) : (i += 1) {
             microvm_list[i].name = snap.entries[i].name;
             microvm_list[i].id = snap.entries[i].instance_id;
             microvm_list[i].state = snap.entries[i].state;
             microvm_list[i].status = vmStateLabel(snap.entries[i].state);
+            microvm_list[i].vcpus = snap.entries[i].vcpus;
+            microvm_list[i].mem_pages = snap.entries[i].mem_pages;
+            microvm_list[i].cpu_cycles = snap.entries[i].cpu_cycles;
+            microvm_list[i].exit_count = snap.entries[i].exit_count;
         }
         if (selected_vm_idx >= microvm_count and microvm_count > 0) {
             selected_vm_idx = microvm_count - 1;
         }
+        vm_list_view.setItemCount(microvm_count);
+        vm_list_view.setSelectedIndex(selected_vm_idx);
+        damage_tracker.addDamage(right_panel_rect);
+        needs_redraw = true;
+        return;
+    }
+
+    if (hdr.src.endpoint == @backingInt(lib.ReservedEndpoint.kernel_control) and
+        hdr.payload_len == @sizeOf(lib.CreateMicrovmResult))
+    {
+        const res: *align(1) const lib.CreateMicrovmResult = @ptrFromInt(payload_va);
+        if (res.status == .ok and res.instance_id != 0) {
+            var msg: [48]u8 = undefined;
+            var p: usize = 0;
+            appendStr(&msg, &p, "Created & started MicroVM #");
+            appendDec(&msg, &p, res.instance_id);
+            setFormStatus(msg[0..p], color.COLOR_GREEN);
+        } else {
+            setFormStatus("MicroVM creation failed (registry full).", color.COLOR_RED);
+        }
+        needs_vm_refresh = true;
+        damage_tracker.addDamage(status_banner_rect);
+        needs_redraw = true;
+        return;
     }
 }
 
@@ -541,11 +1015,19 @@ fn handleClusterSummary(payload_va: u64) void {
         const e = reply.entries[i];
         var row: ?*NodeRow = null;
         for (&node_rows) |*r| {
-            if (r.used and std.mem.eql(u8, &r.addr, &e.node_addr)) { row = r; break; }
+            if (r.used and std.mem.eql(u8, &r.addr, &e.node_addr)) {
+                row = r;
+                break;
+            }
         }
         if (row == null) {
             for (&node_rows) |*r| {
-                if (!r.used) { r.used = true; r.addr = e.node_addr; row = r; break; }
+                if (!r.used) {
+                    r.used = true;
+                    r.addr = e.node_addr;
+                    row = r;
+                    break;
+                }
             }
         }
         if (row) |r| {
@@ -556,7 +1038,7 @@ fn handleClusterSummary(payload_va: u64) void {
     }
 }
 
-// --- Formatting Helpers ---
+// --- Zero-Allocation String Formatting Helpers ---
 
 fn appendStr(buf: []u8, pos: *usize, s: []const u8) void {
     const n = @min(s.len, buf.len - pos.*);
@@ -587,22 +1069,76 @@ fn appendHexByte(buf: []u8, pos: *usize, b: u8) void {
     appendStr(buf, pos, &[_]u8{ hex[b >> 4], hex[b & 0xF] });
 }
 
-// --- Drawing Routine ---
+// --- Flicker-Free Rendering Routine ---
 
 fn drawTui(dma_phys: u64, token: u64) void {
-    const text_phys = dma_phys + DMA_TEXT_SLOT * 4096;
-    const text_va = DMA_BASE_VA + DMA_TEXT_SLOT * 4096;
+    if (!damage_tracker.hasDamage()) return;
 
-    // Header bar (y=0..20) with telemetry gauges
-    lib.fillRect(0, 0, SCREEN_WIDTH, 20, COLOR_TERRACOTTA, token);
-    lib.drawText(text_phys, text_va, 0, 1, COLOR_WHITE, "[C] CATENARY OS", token);
+    const text_phys = dma_phys + DMA_TEXT_SLOT * lib.PAGE_SIZE;
+    const text_va = DMA_BASE_VA + DMA_TEXT_SLOT * lib.PAGE_SIZE;
+    const surface = Surface{
+        .token = token,
+        .dma_phys = text_phys,
+        .dma_va = text_va,
+    };
 
-    // Compute live gauge metrics
+    if (damage_tracker.is_all_dirty) {
+        surface.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, color.COLOR_SEA_GRAY);
+        drawHeader(surface);
+        drawLeftPane(surface);
+        drawShellPane(surface, dma_phys, token);
+        drawRightPane(surface);
+        drawBottomBar(surface);
+        if (help_modal.isOpen()) {
+            drawHelpModal(surface);
+        }
+        damage_tracker.clear();
+        return;
+    }
+
+    // Surgical damage region repaints
+    if (damage_tracker.isDirty(header_rect)) {
+        drawHeader(surface);
+    }
+    if (damage_tracker.isDirty(left_panel_rect)) {
+        drawLeftPane(surface);
+    }
+    if (damage_tracker.isDirty(shell_panel_rect)) {
+        // Check if only the prompt row is dirty vs the full shell panel
+        const log_area = Rect.init(shell_panel_rect.x, shell_panel_rect.y, shell_panel_rect.w, shell_panel_rect.h - 32);
+        if (damage_tracker.isDirty(log_area)) {
+            drawShellPane(surface, dma_phys, token);
+        } else if (damage_tracker.isDirty(shell_prompt_rect)) {
+            drawShellPrompt(surface);
+        } else {
+            drawShellPane(surface, dma_phys, token);
+        }
+    }
+    if (damage_tracker.isDirty(right_panel_rect)) {
+        drawRightPane(surface);
+    }
+    if (damage_tracker.isDirty(bottom_bar_rect)) {
+        drawBottomBar(surface);
+    }
+    if (help_modal.isOpen() and damage_tracker.isDirty(help_modal.rect)) {
+        drawHelpModal(surface);
+    }
+
+    damage_tracker.clear();
+}
+
+fn drawHeader(surface: Surface) void {
+    surface.fillRect(0, 0, SCREEN_WIDTH, 20, color.COLOR_TERRACOTTA);
+    surface.drawText(0, 1, color.COLOR_WHITE, color.COLOR_TERRACOTTA, "[C] CATENARY OS");
+
+    // Gauges
     var total_vms: u32 = 0;
-    for (&node_rows) |*r| if (r.used) { total_vms += r.vms; };
+    for (&node_rows) |*r| if (r.used) {
+        total_vms += r.vms;
+    };
     if (total_vms < @as(u32, @intCast(microvm_count))) total_vms = @as(u32, @intCast(microvm_count));
 
-    // Draw Top Gauges (CPU: [||||....] 40% | RAM: [||......] 25%)
+    // CPU gauge
     const cpu_bars = @min(@as(usize, total_vms) * 2 + 3, 10);
     var cpu_gauge: [32]u8 = undefined;
     var gp: usize = 0;
@@ -614,10 +1150,10 @@ fn drawTui(dma_phys: u64, token: u64) void {
     appendStr(&cpu_gauge, &gp, "] ");
     appendDec(&cpu_gauge, &gp, @as(u64, cpu_bars) * 10);
     appendStr(&cpu_gauge, &gp, "%");
-    lib.drawText(text_phys, text_va, 0, 22, COLOR_GOLDEN_YELLOW, cpu_gauge[0..gp], token);
+    surface.drawText(0, 22, color.COLOR_GOLDEN_YELLOW, color.COLOR_TERRACOTTA, cpu_gauge[0..gp]);
 
-    // RAM Gauge
-    const mem_bars = @min(@as(usize, total_vms) * 3 + 2, 10);
+    // RAM gauge
+    const mem_bars = @min(@as(usize, total_vms) * 2 + 2, 10);
     var mem_gauge: [32]u8 = undefined;
     var mp: usize = 0;
     appendStr(&mem_gauge, &mp, "RAM: [");
@@ -628,217 +1164,120 @@ fn drawTui(dma_phys: u64, token: u64) void {
     appendStr(&mem_gauge, &mp, "] ");
     appendDec(&mem_gauge, &mp, @as(u64, mem_bars) * 10);
     appendStr(&mem_gauge, &mp, "%");
-    lib.drawText(text_phys, text_va, 0, 48, COLOR_HIGHLIGHT, mem_gauge[0..mp], token);
+    surface.drawText(0, 48, color.COLOR_HIGHLIGHT, color.COLOR_TERRACOTTA, mem_gauge[0..mp]);
 
-    // Node Count in Header
-    lib.drawText(text_phys, text_va, 0, 74, COLOR_WHITE, "SMP: 2 Cores | IPv6 Ready", token);
-
-    const sidebar_w: u32 = 250;
-    const form_h: u32 = 180;
-    const main_w: u32 = SCREEN_WIDTH - sidebar_w;
-    const status_h: u32 = 22;
-    const work_h: u32 = SCREEN_HEIGHT - 20 - status_h;
-
-    // 1. Sidebar - VM Manager Panel
-    drawPanel(text_phys, text_va, 0, 20, sidebar_w, 320, "VM Manager (F2)", focused_pane == 0, token);
-    drawVmList(text_phys, text_va, token);
-
-    // 2. Sidebar - Cluster Topology Panel
-    drawPanel(text_phys, text_va, 0, 340, sidebar_w, work_h - 320, "Cluster Topology", false, token);
-    drawClusterNodes(text_phys, text_va, token);
-
-    // 3. Top-Right: New MicroVM Form Panel
-    drawPanel(text_phys, text_va, sidebar_w, 20, main_w, form_h, "New MicroVM (F3)", focused_pane == 1, token);
-    drawNewVmForm(text_phys, text_va, sidebar_w, 20, token);
-
-    // 4. Bottom-Right: Varde Shell Panel
-    const shell_y = 20 + form_h;
-    const shell_h = work_h - form_h;
-    drawPanel(text_phys, text_va, sidebar_w, shell_y, main_w, shell_h, "Varde Shell (F4) [PgUp/PgDn: Scroll]", focused_pane == 2, token);
-    drawShellLog(dma_phys, text_phys, text_va, sidebar_w, shell_y, shell_h, token);
-
-    // 5. Global Shortcut / Status Bar (Bottom 20px)
-    drawBottomBar(text_phys, text_va, token);
-
-    // 6. Help Modal Overlay (when active)
-    if (show_help_modal) {
-        drawHelpModal(text_phys, text_va, token);
-    }
+    // SMP & Network info
+    surface.drawText(0, 72, color.COLOR_WHITE, color.COLOR_TERRACOTTA, "SMP: 2 Cores | IPv6 Ready");
 }
 
-fn drawPanel(text_phys: u64, text_va: u64, x: u32, y: u32, w: u32, h: u32, title: []const u8, is_focused: bool, token: u64) void {
-    lib.fillRect(x, y, w, h, COLOR_PANEL_BG, token);
-    const title_bg = if (is_focused) COLOR_HIGHLIGHT else COLOR_TERRACOTTA;
-    lib.fillRect(x, y, w, 20, title_bg, token);
-    const title_fg = if (is_focused) COLOR_INPUT_BG else COLOR_WHITE;
-    lib.drawTextBg(text_phys, text_va, y / 8 + 1, x / 8 + 1, title_fg, title_bg, title, token);
-}
+fn drawLeftPane(surface: Surface) void {
+    left_panel.render(surface);
 
-fn drawVmList(text_phys: u64, text_va: u64, token: u64) void {
-    lib.drawText(text_phys, text_va, 5, 2, COLOR_GOLDEN_YELLOW, "Name          State   ID", token);
-
-    var i: usize = 0;
-    while (i < microvm_count and i < 10) : (i += 1) {
-        const row: u32 = 7 + @as(u32, @intCast(i)) * 2;
-        const is_selected = (i == selected_vm_idx and focused_pane == 0);
-
-        var line: [32]u8 = undefined;
-        var p: usize = 0;
-        appendStr(&line, &p, if (is_selected) "> " else "  ");
-        const name_len = lib.nameLen(microvm_list[i].name[0..]);
-        const disp_len = @min(name_len, 10);
-        appendStr(&line, &p, microvm_list[i].name[0..disp_len]);
-        while (p < 14) : (p += 1) line[p] = ' ';
-
-        const fg_color = if (is_selected) COLOR_GOLDEN_YELLOW else COLOR_WHITE;
-        lib.drawText(text_phys, text_va, row, 1, fg_color, line[0..p], token);
-
-        const state_color = if (microvm_list[i].state == 2) COLOR_GREEN else COLOR_DIM;
-        lib.drawText(text_phys, text_va, row, 16, state_color, microvm_list[i].status, token);
-
-        var id_buf: [8]u8 = undefined;
-        var id_p: usize = 0;
-        appendDec(&id_buf, &id_p, microvm_list[i].id);
-        lib.drawText(text_phys, text_va, row, 25, COLOR_HIGHLIGHT, id_buf[0..id_p], token);
-    }
-
-    if (microvm_count == 0) {
-        lib.drawText(text_phys, text_va, 8, 2, COLOR_DIM, "(No MicroVMs discovered)", token);
-    }
-
-    // Controls hint
-    lib.drawText(text_phys, text_va, 28, 2, COLOR_GOLDEN_YELLOW, "VM Controls:", token);
-    lib.drawText(text_phys, text_va, 30, 2, COLOR_WHITE, "[S]tart  [K]ill  [D]elete", token);
-}
-
-fn drawClusterNodes(text_phys: u64, text_va: u64, token: u64) void {
-    const base_row: u32 = 45;
-    lib.drawText(text_phys, text_va, base_row, 2, COLOR_GOLDEN_YELLOW, "St  Node ID        VMs  Exits", token);
-
-    var shown: u32 = 0;
-    for (&node_rows) |*r| {
-        if (!r.used) continue;
-        var line: [64]u8 = undefined;
-        var p: usize = 0;
-        var is_local = true;
-        for (r.addr) |b| if (b != 0) { is_local = false; break; };
-
-        // Status badge: ● (active/green)
-        appendStr(&line, &p, "*   ");
-
-        if (is_local) {
-            appendStr(&line, &p, "local-node    ");
-        } else {
-            for (r.addr[12..16]) |b| appendHexByte(&line, &p, b);
-            appendStr(&line, &p, "      ");
-        }
-        appendDec(&line, &p, r.vms);
-        while (p < 24) : (p += 1) line[p] = ' ';
-        appendDec(&line, &p, r.exits);
-
-        // Draw active dot in green
-        lib.drawText(text_phys, text_va, base_row + 2 + shown * 2, 2, COLOR_GREEN, "*", token);
-        // Draw rest of line in highlight
-        lib.drawText(text_phys, text_va, base_row + 2 + shown * 2, 6, COLOR_HIGHLIGHT, line[4..p], token);
-        shown += 1;
-    }
-    if (shown == 0) {
-        lib.drawText(text_phys, text_va, base_row + 2, 2, COLOR_DIM, "Awaiting node telemetry...", token);
-    }
-}
-
-fn drawNewVmForm(text_phys: u64, text_va: u64, start_x: u32, start_y: u32, token: u64) void {
-    _ = start_x;
-    const base_row: u32 = start_y / 8 + 4;
-    const col_lbl: u32 = 34;
-    const col_input: u32 = 50;
+    const is_form = (focused_pane == .vm_form);
 
     // Field 0: Name
-    const is_f0 = (focused_pane == 1 and focused_form_field == 0);
-    lib.drawText(text_phys, text_va, base_row, col_lbl, if (is_f0) COLOR_GOLDEN_YELLOW else COLOR_WHITE, "VM Name   :", token);
-
-    var name_field: [32]u8 = undefined;
-    var np: usize = 0;
-    appendStr(&name_field, &np, "[ ");
-    appendStr(&name_field, &np, form_name[0..form_name_len]);
-    if (is_f0) appendStr(&name_field, &np, "_");
-    appendStr(&name_field, &np, " ]");
-    lib.drawText(text_phys, text_va, base_row, col_input, if (is_f0) COLOR_HIGHLIGHT else COLOR_WHITE, name_field[0..np], token);
+    surface.drawText(6, 3, if (is_form and focused_form_field == .name) color.COLOR_GOLDEN_YELLOW else color.COLOR_WHITE, color.COLOR_PANEL_BG, "VM Name   :");
+    form_name_input.render(surface);
 
     // Field 1: vCPUs
-    const is_f1 = (focused_pane == 1 and focused_form_field == 1);
-    lib.drawText(text_phys, text_va, base_row + 3, col_lbl, if (is_f1) COLOR_GOLDEN_YELLOW else COLOR_WHITE, "vCPUs     :", token);
-
-    var vcpu_field: [32]u8 = undefined;
-    var vp: usize = 0;
-    appendStr(&vcpu_field, &vp, "[< ");
-    appendDec(&vcpu_field, &vp, form_vcpus);
-    appendStr(&vcpu_field, &vp, " core >]");
-    lib.drawText(text_phys, text_va, base_row + 3, col_input, if (is_f1) COLOR_HIGHLIGHT else COLOR_WHITE, vcpu_field[0..vp], token);
+    surface.drawText(9, 3, if (is_form and focused_form_field == .vcpus) color.COLOR_GOLDEN_YELLOW else color.COLOR_WHITE, color.COLOR_PANEL_BG, "vCPUs     :");
+    form_vcpu_spinner.render(surface);
 
     // Field 2: Memory
-    const is_f2 = (focused_pane == 1 and focused_form_field == 2);
-    lib.drawText(text_phys, text_va, base_row + 6, col_lbl, if (is_f2) COLOR_GOLDEN_YELLOW else COLOR_WHITE, "Memory    :", token);
+    surface.drawText(12, 3, if (is_form and focused_form_field == .memory) color.COLOR_GOLDEN_YELLOW else color.COLOR_WHITE, color.COLOR_PANEL_BG, "Memory    :");
+    form_mem_select.render(surface);
 
-    var mem_field: [32]u8 = undefined;
-    var mp: usize = 0;
-    appendStr(&mem_field, &mp, "[< ");
-    appendDec(&mem_field, &mp, MEM_OPTIONS[form_mem_idx]);
-    appendStr(&mem_field, &mp, " MB >]");
-    lib.drawText(text_phys, text_va, base_row + 6, col_input, if (is_f2) COLOR_HIGHLIGHT else COLOR_WHITE, mem_field[0..mp], token);
+    // Field 3: Kernel
+    surface.drawText(15, 3, if (is_form and focused_form_field == .kernel) color.COLOR_GOLDEN_YELLOW else color.COLOR_WHITE, color.COLOR_PANEL_BG, "Kernel    :");
+    form_kernel_select.render(surface);
 
-    // Field 3: Action Button
-    const is_f3 = (focused_pane == 1 and focused_form_field == 3);
-    const btn_text = "< CREATE & LAUNCH MICROVM >";
-    const btn_color = if (is_f3) COLOR_GOLDEN_YELLOW else COLOR_TERRACOTTA;
-    lib.drawText(text_phys, text_va, base_row + 10, col_lbl + 4, btn_color, btn_text, token);
+    // Field 4: Rootfs
+    surface.drawText(18, 3, if (is_form and focused_form_field == .rootfs) color.COLOR_GOLDEN_YELLOW else color.COLOR_WHITE, color.COLOR_PANEL_BG, "Rootfs    :");
+    form_rootfs_select.render(surface);
+
+    // Action buttons
+    form_create_btn.render(surface);
+    form_reset_btn.render(surface);
 
     // Status Banner
+    surface.fillRect(status_banner_rect.x, status_banner_rect.y, status_banner_rect.w, status_banner_rect.h, color.COLOR_PANEL_BG);
     if (form_status_len > 0) {
-        lib.drawText(text_phys, text_va, base_row + 13, col_lbl, form_status_color, form_status_buf[0..form_status_len], token);
+        surface.drawText(27, 3, form_status_color, color.COLOR_PANEL_BG, form_status_buf[0..form_status_len]);
+    }
+
+    // Compact Form Hints
+    surface.drawText(31, 3, color.COLOR_GOLDEN_YELLOW, color.COLOR_PANEL_BG, "Hints: [Tab]/[Up]/[Down] Field | [Left]/[Right] Step");
+    surface.drawText(33, 3, color.COLOR_WHITE, color.COLOR_PANEL_BG, "[F2] Form  [F3] VMs  [F4] Shell  [F1] Help");
+}
+
+fn drawShellPrompt(surface: Surface) void {
+    surface.fillRect(shell_prompt_rect.x, shell_prompt_rect.y, shell_prompt_rect.w, shell_prompt_rect.h, color.COLOR_INPUT_BG);
+    const prompt_row: u32 = shell_prompt_rect.y / 8;
+    const is_shell = (focused_pane == .varde_shell);
+    const prompt_fg = if (is_shell) color.COLOR_GOLDEN_YELLOW else color.COLOR_DIM;
+    surface.drawText(prompt_row, 2, prompt_fg, color.COLOR_INPUT_BG, "catenary> ");
+
+    const text = shell_input.getText();
+    const max_vis: usize = 34;
+    const vis_len = @min(text.len, max_vis);
+    if (vis_len > 0) {
+        surface.drawText(prompt_row, 12, color.COLOR_WHITE, color.COLOR_INPUT_BG, text[0..vis_len]);
+    }
+    if (is_shell) {
+        const cur_col: u32 = 12 + @as(u32, @intCast(@min(shell_input.cursor_pos, max_vis)));
+        if (shell_input.cursor_pos < vis_len) {
+            const ch_slice = text[shell_input.cursor_pos .. shell_input.cursor_pos + 1];
+            surface.drawText(prompt_row, cur_col, color.COLOR_INPUT_BG, color.COLOR_HIGHLIGHT, ch_slice);
+        } else {
+            surface.drawText(prompt_row, cur_col, color.COLOR_HIGHLIGHT, color.COLOR_INPUT_BG, "_");
+        }
     }
 }
 
-fn drawShellLog(dma_phys: u64, text_phys: u64, text_va: u64, start_x: u32, start_y: u32, h: u32, token: u64) void {
-    _ = start_x;
+fn drawShellPane(surface: Surface, dma_phys: u64, token: u64) void {
+    shell_panel.render(surface);
+
     const log_phys = dma_phys + DMA_LOG_SLOT * lib.PAGE_SIZE;
-    const log_va = DMA_BASE_VA + DMA_LOG_SLOT * 4096;
-    _ = lib.syscall(SYS_GET_VARDE_LOG, log_phys, 0, token);
+    const log_va = DMA_BASE_VA + DMA_LOG_SLOT * lib.PAGE_SIZE;
+    const log_len = @min(@as(usize, @intCast(lib.syscall(SYS_GET_VARDE_LOG, log_phys, 0, token))), 4095);
+    last_seen_shell_len = log_len;
     const log_ptr = lib.ptrFrom([*]const u8, log_va);
 
-    const base_row: u32 = start_y / 8 + 3;
-    const max_rows: u32 = (h / 8) - 5;
+    const base_row: u32 = 42;
+    const max_rows: u32 = 24;
+    const max_cols: usize = 46;
 
-    // Scan all lines from the log
+    // Parse lines from kernel varde_shell log
     var line_offsets: [128]usize = undefined;
     var line_lens: [128]usize = undefined;
     var total_lines: usize = 0;
 
     var cur_start: usize = 0;
     var idx: usize = 0;
-    while (idx < 4000) : (idx += 1) {
-        const c = log_ptr[idx];
-        if (c == 0 or c == '\n') {
-            if (total_lines < line_offsets.len) {
-                line_offsets[total_lines] = cur_start;
-                line_lens[total_lines] = idx - cur_start;
-                total_lines += 1;
-            } else {
-                // Shift back by one to keep recent lines
-                var s: usize = 0;
-                while (s + 1 < line_offsets.len) : (s += 1) {
-                    line_offsets[s] = line_offsets[s + 1];
-                    line_lens[s] = line_lens[s + 1];
+    while (idx <= log_len) : (idx += 1) {
+        const is_end = (idx == log_len);
+        const c = if (is_end) @as(u8, 0) else log_ptr[idx];
+        if (is_end or c == 0 or c == '\n') {
+            if (!is_end or idx > cur_start) {
+                if (total_lines < line_offsets.len) {
+                    line_offsets[total_lines] = cur_start;
+                    line_lens[total_lines] = idx - cur_start;
+                    total_lines += 1;
+                } else {
+                    var s: usize = 0;
+                    while (s + 1 < line_offsets.len) : (s += 1) {
+                        line_offsets[s] = line_offsets[s + 1];
+                        line_lens[s] = line_lens[s + 1];
+                    }
+                    line_offsets[line_offsets.len - 1] = cur_start;
+                    line_lens[line_offsets.len - 1] = idx - cur_start;
                 }
-                line_offsets[line_offsets.len - 1] = cur_start;
-                line_lens[line_offsets.len - 1] = idx - cur_start;
             }
             cur_start = idx + 1;
-            if (c == 0) break;
+            if (is_end or c == 0) break;
         }
     }
 
-    // Clamp scroll offset
     if (total_lines <= max_rows) {
         shell_scroll_offset = 0;
     } else {
@@ -846,6 +1285,17 @@ fn drawShellLog(dma_phys: u64, text_phys: u64, text_va: u64, start_x: u32, start
         if (shell_scroll_offset > max_scroll) {
             shell_scroll_offset = max_scroll;
         }
+    }
+
+    if (shell_scroll_offset > 0) {
+        var scroll_badge: [32]u8 = undefined;
+        var sp: usize = 0;
+        appendStr(&scroll_badge, &sp, "[SCROLLED -");
+        appendDec(&scroll_badge, &sp, shell_scroll_offset);
+        appendStr(&scroll_badge, &sp, "L]");
+        const badge_bg = if (focused_pane == .varde_shell) color.COLOR_HIGHLIGHT else color.COLOR_TERRACOTTA;
+        const badge_fg = if (focused_pane == .varde_shell) color.COLOR_INPUT_BG else color.COLOR_GOLDEN_YELLOW;
+        surface.drawText(39, 34, badge_fg, badge_bg, scroll_badge[0..sp]);
     }
 
     const lines_to_show = @min(total_lines, max_rows);
@@ -856,67 +1306,230 @@ fn drawShellLog(dma_phys: u64, text_phys: u64, text_va: u64, start_x: u32, start
         const l_idx = start_show + r;
         if (l_idx >= total_lines) break;
         const off = line_offsets[l_idx];
-        const len = @min(line_lens[l_idx], 65);
+        const len = @min(line_lens[l_idx], max_cols);
         if (len > 0) {
-            lib.drawText(text_phys, text_va, base_row + r, 34, COLOR_WHITE, log_ptr[off .. off + len], token);
+            const line_slice = log_ptr[off .. off + len];
+            const is_prompt = std.mem.startsWith(u8, line_slice, "catenary> ");
+            const fg = if (is_prompt) color.COLOR_GOLDEN_YELLOW else color.COLOR_WHITE;
+            surface.drawText(base_row + r, 2, fg, color.COLOR_PANEL_BG, line_slice);
         }
     }
 
-    // Bottom interactive indicator
-    const prompt_row = base_row + lines_to_show + 1;
-    if (focused_pane == 2) {
-        if (shell_scroll_offset > 0) {
-            var scroll_msg: [32]u8 = undefined;
-            var sp: usize = 0;
-            appendStr(&scroll_msg, &sp, "varde [SCROLLED -");
-            appendDec(&scroll_msg, &sp, shell_scroll_offset);
-            appendStr(&scroll_msg, &sp, " L] > _");
-            lib.drawText(text_phys, text_va, prompt_row, 34, COLOR_GOLDEN_YELLOW, scroll_msg[0..sp], token);
+    drawShellPrompt(surface);
+}
+
+fn drawRightPane(surface: Surface) void {
+    right_panel.render(surface);
+
+    // ListView Header
+    surface.drawText(6, 52, color.COLOR_GOLDEN_YELLOW, color.COLOR_PANEL_BG, "Sel  Name          State       ID    vCPU");
+
+    // MicroVM list rows
+    if (microvm_count == 0) {
+        surface.drawText(8, 54, color.COLOR_DIM, color.COLOR_PANEL_BG, "(No MicroVMs discovered)");
+    } else {
+        const top = vm_list_view.top_idx;
+        const visible_end = @min(microvm_count, top + vm_list_view.visible_rows);
+        var i = top;
+        while (i < visible_end) : (i += 1) {
+            const row: u32 = 8 + @as(u32, @intCast(i - top)) * 2;
+            const is_selected = (i == selected_vm_idx);
+
+            var line: [32]u8 = undefined;
+            var p: usize = 0;
+            appendStr(&line, &p, if (is_selected) "> " else "  ");
+            const vname_len = lib.nameLen(&microvm_list[i].name);
+            const disp_len = @min(vname_len, 12);
+            appendStr(&line, &p, microvm_list[i].name[0..disp_len]);
+            while (p < 16) : (p += 1) line[p] = ' ';
+
+            const fg_color = if (is_selected and focused_pane == .vm_manager)
+                color.COLOR_GOLDEN_YELLOW
+            else if (is_selected)
+                color.COLOR_HIGHLIGHT
+            else
+                color.COLOR_WHITE;
+            surface.drawText(row, 52, fg_color, color.COLOR_PANEL_BG, line[0..p]);
+
+            // State badges
+            const state_badge = switch (microvm_list[i].state) {
+                2 => "[RUNNING]",
+                3 => "[STOPPED]",
+                1 => "[CREATED]",
+                else => "[UNKNOWN]",
+            };
+            const state_color = switch (microvm_list[i].state) {
+                2 => color.COLOR_GREEN,
+                3 => color.COLOR_RED,
+                1 => color.COLOR_GOLDEN_YELLOW,
+                else => color.COLOR_DIM,
+            };
+            surface.drawText(row, 69, state_color, color.COLOR_PANEL_BG, state_badge);
+
+            // ID
+            var id_buf: [12]u8 = undefined;
+            var ip: usize = 0;
+            appendStr(&id_buf, &ip, "#");
+            appendDec(&id_buf, &ip, microvm_list[i].id);
+            surface.drawText(row, 81, color.COLOR_HIGHLIGHT, color.COLOR_PANEL_BG, id_buf[0..ip]);
+
+            // vCPUs
+            var vcpu_buf: [12]u8 = undefined;
+            var vp: usize = 0;
+            appendDec(&vcpu_buf, &vp, microvm_list[i].vcpus);
+            appendStr(&vcpu_buf, &vp, " vCPU");
+            surface.drawText(row, 88, color.COLOR_WHITE, color.COLOR_PANEL_BG, vcpu_buf[0..vp]);
+        }
+    }
+
+    // Lifecycle Controls Hint Bar
+    surface.drawText(23, 52, color.COLOR_GOLDEN_YELLOW, color.COLOR_PANEL_BG, "VM Lifecycle Controls (in VM Manager):");
+    surface.drawText(25, 52, color.COLOR_WHITE, color.COLOR_PANEL_BG, "[S]tart / Enter   [K]ill / Stop   [D]elete   [F5]Refresh");
+
+    // Telemetry Inspector Card
+    surface.fillRect(412, 224, 376, 216, color.COLOR_INPUT_BG);
+    surface.drawText(29, 53, color.COLOR_GOLDEN_YELLOW, color.COLOR_INPUT_BG, "--- Selected MicroVM Telemetry ---");
+
+    if (microvm_count == 0) {
+        surface.drawText(33, 55, color.COLOR_DIM, color.COLOR_INPUT_BG, "No MicroVM selected.");
+    } else if (selected_vm_idx < microvm_count) {
+        const sel = microvm_list[selected_vm_idx];
+
+        // ID
+        var id_line: [32]u8 = undefined;
+        var p: usize = 0;
+        appendStr(&id_line, &p, "ID         : #");
+        appendDec(&id_line, &p, sel.id);
+        surface.drawText(31, 53, color.COLOR_HIGHLIGHT, color.COLOR_INPUT_BG, id_line[0..p]);
+
+        // Name
+        var name_line: [48]u8 = undefined;
+        p = 0;
+        appendStr(&name_line, &p, "Name       : ");
+        const nlen = lib.nameLen(&sel.name);
+        appendStr(&name_line, &p, sel.name[0..nlen]);
+        surface.drawText(33, 53, color.COLOR_WHITE, color.COLOR_INPUT_BG, name_line[0..p]);
+
+        // State
+        var state_line: [32]u8 = undefined;
+        p = 0;
+        appendStr(&state_line, &p, "State      : ");
+        const state_badge = switch (sel.state) {
+            2 => "[RUNNING]",
+            3 => "[STOPPED]",
+            1 => "[CREATED]",
+            else => "[UNKNOWN]",
+        };
+        const state_color = switch (sel.state) {
+            2 => color.COLOR_GREEN,
+            3 => color.COLOR_RED,
+            1 => color.COLOR_GOLDEN_YELLOW,
+            else => color.COLOR_DIM,
+        };
+        appendStr(&state_line, &p, state_badge);
+        surface.drawText(35, 53, state_color, color.COLOR_INPUT_BG, state_line[0..p]);
+
+        // vCPUs
+        var vcpu_line: [48]u8 = undefined;
+        p = 0;
+        appendStr(&vcpu_line, &p, "vCPUs      : ");
+        appendDec(&vcpu_line, &p, sel.vcpus);
+        appendStr(&vcpu_line, &p, " cores (AP core 1)");
+        surface.drawText(37, 53, color.COLOR_WHITE, color.COLOR_INPUT_BG, vcpu_line[0..p]);
+
+        // RAM
+        var ram_line: [48]u8 = undefined;
+        p = 0;
+        appendStr(&ram_line, &p, "RAM        : ");
+        appendDec(&ram_line, &p, sel.mem_pages / 256);
+        appendStr(&ram_line, &p, " MB (");
+        appendDec(&ram_line, &p, sel.mem_pages);
+        appendStr(&ram_line, &p, " pages)");
+        surface.drawText(39, 53, color.COLOR_WHITE, color.COLOR_INPUT_BG, ram_line[0..p]);
+
+        // Host Cycles
+        var cyc_line: [48]u8 = undefined;
+        p = 0;
+        appendStr(&cyc_line, &p, "Host Cycles: ");
+        appendDec(&cyc_line, &p, sel.cpu_cycles);
+        appendStr(&cyc_line, &p, " TSC cycles");
+        surface.drawText(41, 53, color.COLOR_GOLDEN_YELLOW, color.COLOR_INPUT_BG, cyc_line[0..p]);
+
+        // VM-Exits
+        var exit_line: [48]u8 = undefined;
+        p = 0;
+        appendStr(&exit_line, &p, "VM-Exits   : ");
+        appendDec(&exit_line, &p, sel.exit_count);
+        appendStr(&exit_line, &p, " exits");
+        surface.drawText(43, 53, color.COLOR_HIGHLIGHT, color.COLOR_INPUT_BG, exit_line[0..p]);
+
+        // Kernel & Rootfs
+        surface.drawText(45, 53, color.COLOR_WHITE, color.COLOR_INPUT_BG, "Kernel     : Embedded Linux (x86_64 6.6)");
+        surface.drawText(47, 53, color.COLOR_WHITE, color.COLOR_INPUT_BG, "Rootfs     : In-Memory OCI Initramfs");
+    }
+
+    // Cluster Status Mini-Bar
+    surface.fillRect(412, 456, 376, 116, color.COLOR_PANEL_BG);
+    surface.drawText(58, 52, color.COLOR_GOLDEN_YELLOW, color.COLOR_PANEL_BG, "Cluster Node Telemetry:");
+
+    var shown: u32 = 0;
+    for (&node_rows) |*r| {
+        if (!r.used) continue;
+        var line: [64]u8 = undefined;
+        var p: usize = 0;
+        var is_local = true;
+        for (r.addr) |b| if (b != 0) {
+            is_local = false;
+            break;
+        };
+
+        if (is_local) {
+            appendStr(&line, &p, "* local-node (Active)  | VMs: ");
         } else {
-            lib.drawText(text_phys, text_va, prompt_row, 34, COLOR_GOLDEN_YELLOW, "varde (active) > _", token);
+            appendStr(&line, &p, "* node-peer (");
+            for (r.addr[12..16]) |b| appendHexByte(&line, &p, b);
+            appendStr(&line, &p, ")   | VMs: ");
         }
+        appendDec(&line, &p, r.vms);
+        appendStr(&line, &p, " | Exits: ");
+        appendDec(&line, &p, r.exits);
+
+        surface.drawText(61 + shown * 2, 52, color.COLOR_GREEN, color.COLOR_PANEL_BG, "*");
+        surface.drawText(61 + shown * 2, 54, color.COLOR_HIGHLIGHT, color.COLOR_PANEL_BG, line[2..p]);
+        shown += 1;
     }
+    if (shown == 0) {
+        surface.drawText(61, 52, color.COLOR_DIM, color.COLOR_PANEL_BG, "Awaiting node telemetry from dashd...");
+    }
+    surface.drawText(66, 52, color.COLOR_DIM, color.COLOR_PANEL_BG, "Virtio-Net NDP Active | IPv6 Loopback Ready");
 }
 
-fn drawBottomBar(text_phys: u64, text_va: u64, token: u64) void {
-    const y: u32 = SCREEN_HEIGHT - 20;
-    lib.fillRect(0, y, SCREEN_WIDTH, 20, COLOR_SEA_GRAY, token);
-    const bar_text = " [F1] Help | [Tab] Pane | [F2] VMs | [F3] Form | [F4] Shell | [S]tart | [K]ill | [D]elete | [Enter] Ok";
-    lib.drawText(text_phys, text_va, y / 8 + 1, 1, COLOR_WHITE, bar_text, token);
+fn drawBottomBar(surface: Surface) void {
+    surface.fillRect(bottom_bar_rect.x, bottom_bar_rect.y, bottom_bar_rect.w, bottom_bar_rect.h, color.COLOR_SEA_GRAY);
+    surface.drawText(73, 1, color.COLOR_WHITE, color.COLOR_SEA_GRAY, " [Tab] Pane [F1] Help [F2] Form [F3] VMs [F4] Shell [S]tart [K]ill [D]el");
 }
 
-fn drawHelpModal(text_phys: u64, text_va: u64, token: u64) void {
-    const modal_x: u32 = 120;
-    const modal_y: u32 = 80;
-    const modal_w: u32 = 560;
-    const modal_h: u32 = 420;
+fn drawHelpModal(surface: Surface) void {
+    help_modal.render(surface);
 
-    // Modal background & gold border
-    lib.fillRect(modal_x - 2, modal_y - 2, modal_w + 4, modal_h + 4, COLOR_GOLDEN_YELLOW, token);
-    lib.fillRect(modal_x, modal_y, modal_w, modal_h, COLOR_MODAL_BG, token);
+    const base_row: u32 = 14;
+    const col: u32 = 18;
 
-    // Modal header banner
-    lib.fillRect(modal_x, modal_y, modal_w, 24, COLOR_TERRACOTTA, token);
-    lib.drawTextBg(text_phys, text_va, modal_y / 8 + 1, modal_x / 8 + 2, COLOR_WHITE, COLOR_TERRACOTTA, "Catenary OS — Interactive Help & Keyboard Shortcuts", token);
+    surface.drawText(base_row + 0, col, color.COLOR_GOLDEN_YELLOW, color.COLOR_MODAL_BG, "KEYBOARD NAVIGATION & SHORTCUTS:");
+    surface.drawText(base_row + 2, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [Tab] / [S-Tab]   Navigate Form fields & switch to VM Manager");
+    surface.drawText(base_row + 4, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [F2] / [F3]       Direct jump to Form / VM Manager pane");
+    surface.drawText(base_row + 6, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [Up] / [Down]     Navigate form fields or select VM in list");
+    surface.drawText(base_row + 8, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [Left] / [Right]  Adjust vCPUs stepper or cycle OptionSelect");
 
-    const base_row = modal_y / 8 + 4;
-    const col = modal_x / 8 + 3;
+    surface.drawText(base_row + 11, col, color.COLOR_GOLDEN_YELLOW, color.COLOR_MODAL_BG, "MICROVM PROVISIONING & ACTIONS:");
+    surface.drawText(base_row + 13, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  < CREATE & LAUNCH >  Validate configuration & launch MicroVM");
+    surface.drawText(base_row + 15, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  < RESET >            Restore default form configuration");
+    surface.drawText(base_row + 17, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [S]tart / Enter      Start / resume selected MicroVM");
+    surface.drawText(base_row + 19, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [K]ill / Stop        Stop / terminate running MicroVM");
+    surface.drawText(base_row + 21, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [D]elete             Delete selected MicroVM from registry");
 
-    lib.drawText(text_phys, text_va, base_row + 0, col, COLOR_GOLDEN_YELLOW, "NAVIGATION & PANES:", token);
-    lib.drawText(text_phys, text_va, base_row + 2, col, COLOR_WHITE, "  [Tab]         Cycle through VM Manager, Form, & Shell", token);
-    lib.drawText(text_phys, text_va, base_row + 4, col, COLOR_WHITE, "  [F2]          Focus VM Manager (Sidebar)", token);
-    lib.drawText(text_phys, text_va, base_row + 6, col, COLOR_WHITE, "  [F3]          Focus New MicroVM Form", token);
-    lib.drawText(text_phys, text_va, base_row + 8, col, COLOR_WHITE, "  [F4]          Focus Varde Interactive Shell", token);
+    surface.drawText(base_row + 24, col, color.COLOR_GOLDEN_YELLOW, color.COLOR_MODAL_BG, "SYSTEM SHORTCUTS:");
+    surface.drawText(base_row + 26, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [F5] Refresh telemetry  |  [F12] Quit  |  [F1] / '?' Help");
 
-    lib.drawText(text_phys, text_va, base_row + 11, col, COLOR_GOLDEN_YELLOW, "MICROVM CONTROLS (in VM Manager pane):", token);
-    lib.drawText(text_phys, text_va, base_row + 13, col, COLOR_WHITE, "  [Up] / [Down] Navigate VM selection list", token);
-    lib.drawText(text_phys, text_va, base_row + 15, col, COLOR_WHITE, "  [S]           Start selected MicroVM", token);
-    lib.drawText(text_phys, text_va, base_row + 17, col, COLOR_WHITE, "  [K]           Stop/Kill selected MicroVM", token);
-    lib.drawText(text_phys, text_va, base_row + 19, col, COLOR_WHITE, "  [D]           Delete selected MicroVM from registry", token);
-
-    lib.drawText(text_phys, text_va, base_row + 22, col, COLOR_GOLDEN_YELLOW, "VARDE SHELL COMMANDS (in Shell pane):", token);
-    lib.drawText(text_phys, text_va, base_row + 24, col, COLOR_WHITE, "  help, status, services/ps, vms/vmlist, top, memory, clear", token);
-    lib.drawText(text_phys, text_va, base_row + 26, col, COLOR_WHITE, "  [PgUp] / [PgDn] Scroll through shell history and logs", token);
-
-    lib.drawText(text_phys, text_va, base_row + 30, col + 12, COLOR_HIGHLIGHT, "Press [Esc], [F1], or [Enter] to Close", token);
+    surface.drawText(base_row + 30, col + 12, color.COLOR_HIGHLIGHT, color.COLOR_MODAL_BG, "Press [Esc] or [Enter] to Close Help");
 }

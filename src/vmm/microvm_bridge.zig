@@ -9,6 +9,9 @@ const pmm = @import("../kernel/pmm.zig");
 
 pub const QueueError = error{ Busy, InvalidGpa, InvalidDescriptor };
 
+const virtio_queue_size_max: u32 = 256;
+const virtio_desc_size: usize = 16;
+
 pub const Entry = struct {
     microvm_id: identity.MicrovmId,
     page_phys: u64,
@@ -62,51 +65,187 @@ pub fn descriptorForEntry(
 var bridge_hhdm_offset: u64 = 0;
 var bridge_endpoint_table: ?*const endpoint_table.EndpointTable = null;
 
+pub var gpa_to_hpa_fn: ?*const fn (vmid: u32, gpa: u64) ?u64 = null;
+pub var inject_irq_fn: ?*const fn (vmid: u32, vector: u8) void = null;
+
 pub fn setBridgeContext(hhdm_offset: u64, table: *const endpoint_table.EndpointTable) void {
     bridge_hhdm_offset = hhdm_offset;
     bridge_endpoint_table = table;
 }
 
+fn translateGuestPageHpa(vmid: u32, page_gpa: u64) ?u64 {
+    const aligned = page_gpa & ~@as(u64, 0xFFF);
+    if (gpa_to_hpa_fn) |translate| {
+        const raw = translate(vmid, aligned) orelse return null;
+        return raw & ~@as(u64, 0xFFF);
+    }
+    if (!@import("builtin").is_test) {
+        const vmx = @import("../arch/x86_64/vmx.zig");
+        return vmx.findGuestPageHpaPublic(aligned);
+    }
+    return null;
+}
+
+fn injectGuestIrq(vmid: u32, vector: u8) void {
+    if (inject_irq_fn) |inject| {
+        inject(vmid, vector);
+        return;
+    }
+    if (!@import("builtin").is_test) {
+        const vmx = @import("../arch/x86_64/vmx.zig");
+        vmx.injectGuestInterrupt(vmid, vector);
+    }
+}
+
+pub fn validateGuestSpan(vmid: u32, gpa: u64, len: usize) bool {
+    if (len == 0) return true;
+    const end = std.math.add(u64, gpa, @as(u64, @intCast(len - 1))) catch return false;
+    var cur_page = gpa & ~@as(u64, 0xFFF);
+    const end_page = end & ~@as(u64, 0xFFF);
+    while (true) {
+        if (translateGuestPageHpa(vmid, cur_page) == null) return false;
+        if (cur_page == end_page) break;
+        cur_page = std.math.add(u64, cur_page, pmm.PAGE_SIZE) catch return false;
+    }
+    return true;
+}
+
+fn validateContiguousGuestSpanHpa(vmid: u32, gpa: u64, len: usize) ?u64 {
+    if (len == 0) {
+        const page_hpa = translateGuestPageHpa(vmid, gpa) orelse return null;
+        return page_hpa + (gpa & 0xFFF);
+    }
+    const end = std.math.add(u64, gpa, @as(u64, @intCast(len - 1))) catch return null;
+    const first_page = gpa & ~@as(u64, 0xFFF);
+    const end_page = end & ~@as(u64, 0xFFF);
+    const first_hpa = translateGuestPageHpa(vmid, first_page) orelse return null;
+
+    var cur_page = first_page;
+    var expected_hpa = first_hpa;
+    while (true) {
+        const hpa = translateGuestPageHpa(vmid, cur_page) orelse return null;
+        if (hpa != expected_hpa) return null;
+        if (cur_page == end_page) break;
+        cur_page = std.math.add(u64, cur_page, pmm.PAGE_SIZE) catch return null;
+        expected_hpa = std.math.add(u64, expected_hpa, pmm.PAGE_SIZE) catch return null;
+    }
+    return first_hpa + (gpa & 0xFFF);
+}
+
+fn readGuestBytes(hhdm: u64, vmid: u32, gpa: u64, out: []u8) bool {
+    var offset: usize = 0;
+    while (offset < out.len) {
+        const cur_gpa = std.math.add(u64, gpa, @as(u64, @intCast(offset))) catch return false;
+        const page_hpa = translateGuestPageHpa(vmid, cur_gpa) orelse return false;
+        const page_off = @as(usize, @intCast(cur_gpa & 0xFFF));
+        const chunk = @min(pmm.PAGE_SIZE - page_off, out.len - offset);
+        const src: [*]const u8 = @ptrFromInt(page_hpa + hhdm + page_off);
+        @memcpy(out[offset .. offset + chunk], src[0..chunk]);
+        offset += chunk;
+    }
+    return true;
+}
+
+fn writeGuestBytes(hhdm: u64, vmid: u32, gpa: u64, data: []const u8) bool {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const cur_gpa = std.math.add(u64, gpa, @as(u64, @intCast(offset))) catch return false;
+        const page_hpa = translateGuestPageHpa(vmid, cur_gpa) orelse return false;
+        const page_off = @as(usize, @intCast(cur_gpa & 0xFFF));
+        const chunk = @min(pmm.PAGE_SIZE - page_off, data.len - offset);
+        const dst: [*]u8 = @ptrFromInt(page_hpa + hhdm + page_off);
+        @memcpy(dst[0..chunk], data[offset .. offset + chunk]);
+        offset += chunk;
+    }
+    return true;
+}
+
+fn readGuestInt(comptime T: type, hhdm: u64, vmid: u32, gpa: u64) ?T {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    if (!readGuestBytes(hhdm, vmid, gpa, &bytes)) return null;
+    return std.mem.readInt(T, &bytes, .little);
+}
+
+fn writeGuestInt(comptime T: type, hhdm: u64, vmid: u32, gpa: u64, val: T) bool {
+    var bytes: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &bytes, val, .little);
+    return writeGuestBytes(hhdm, vmid, gpa, &bytes);
+}
+
+fn validateQueueMemory(vmid: u32, q: *const virtio_blk.QueueState, event_idx: bool) bool {
+    if (!isQueueValid(q)) return false;
+    if ((q.desc_addr & (virtio_desc_size - 1)) != 0) return false;
+    if ((q.driver_addr & 0x1) != 0) return false;
+    if ((q.device_addr & 0x3) != 0) return false;
+
+    const desc_bytes = @as(usize, q.num) * virtio_desc_size;
+    const avail_bytes = 4 + (@as(usize, q.num) * 2) + (if (event_idx) @as(usize, 2) else 0);
+    const used_bytes = 4 + (@as(usize, q.num) * 8) + (if (event_idx) @as(usize, 2) else 0);
+
+    return validateGuestSpan(vmid, q.desc_addr, desc_bytes) and
+        validateGuestSpan(vmid, q.driver_addr, avail_bytes) and
+        validateGuestSpan(vmid, q.device_addr, used_bytes);
+}
+
 /// When the guest triggers a virtio-blk queue notify via MMIO, the VM-Exit handler
 /// calls this routine to package the read/write request into a DIPC page targeted at `storaged`.
 pub fn routeVirtioBlkNotify(vmid: u32, queue_idx: u16) void {
-    const vmx = @import("../arch/x86_64/vmx.zig");
-    _ = queue_idx; // Blk usually has 1 queue
+    if (queue_idx != 0) return;
 
     const inst = virtio_blk.getInstance(vmid) orelse return;
     const q = &inst.queues[0];
-    if (!q.ready) return;
+    const event_idx = inst.hasEventIdx();
+    if (!validateQueueMemory(vmid, q, event_idx)) return;
 
-    // 1. Access guest memory to read the available ring.
-    // Note: We need the HHDM offset to access our own physical pages
-    // that hold mapping for the guest's physical ring.
     const hhdm = bridge_hhdm_offset;
-
-    // Guest Virtqueue layout:
-    // Descriptor Table: [num] * Descriptor
-    // Available Ring: [2]u16 + [num]u16 + [1]u16
-    // Used Ring: [2]u16 + [num] * UsedElem + [1]u16
-
-    const avail_hpa = vmx.findGuestPageHpaPublic(q.driver_addr) orelse return;
-    const avail_ptr: [*]const u8 = @ptrFromInt(avail_hpa + hhdm + (q.driver_addr & 0xFFF));
-
-    const flags = std.mem.readInt(u16, avail_ptr[0..2][0..2], .little);
-    const idx = std.mem.readInt(u16, avail_ptr[2..4][0..2], .little);
-    _ = flags;
+    const idx = readGuestInt(u16, hhdm, vmid, q.driver_addr + 2) orelse return;
+    const pending = idx -% q.last_avail_idx;
+    if (pending > @as(u16, @intCast(q.num))) return;
 
     // Process new descriptors from last_avail_idx to current idx
-    var cur = q.last_avail_idx;
-    while (cur != idx) : (cur +%= 1) {
-        const ring_off = 4 + (@as(usize, cur % q.num) * 2);
-        const head_idx = std.mem.readInt(u16, avail_ptr[ring_off .. ring_off + 2][0..2], .little);
+    while (q.last_avail_idx != idx) {
+        const ring_gpa = q.driver_addr + 4 + (@as(u64, q.last_avail_idx % @as(u16, @intCast(q.num))) * 2);
+        const head_idx = readGuestInt(u16, hhdm, vmid, ring_gpa) orelse return;
+        q.last_avail_idx +%= 1;
+
+        if (event_idx) {
+            const avail_event_gpa = q.device_addr + 4 + (@as(u64, q.num) * 8);
+            _ = writeGuestInt(u16, hhdm, vmid, avail_event_gpa, q.last_avail_idx);
+        }
 
         // Walk descriptor chain starting at head_idx
-        processDescriptorChain(vmid, inst, q, head_idx) catch {
-            // Log error and continue to avoid blocking the host
-            // (In a real system we'd inject a device error status)
+        processDescriptorChain(vmid, inst, q, head_idx) catch |err| {
+            completeBlkRequestOnError(hhdm, vmid, inst, q, head_idx, err);
         };
     }
-    q.last_avail_idx = idx;
+}
+
+fn isQueueValid(q: *const virtio_blk.QueueState) bool {
+    return q.ready and q.num > 0 and q.num <= virtio_queue_size_max;
+}
+
+fn isDescriptorIndexValid(q: *const virtio_blk.QueueState, index: u16) bool {
+    return @as(u32, index) < q.num;
+}
+
+const RawDescriptor = struct {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+};
+
+fn readDescriptor(hhdm: u64, vmid: u32, q: *const virtio_blk.QueueState, idx: u16) ?RawDescriptor {
+    if (!isDescriptorIndexValid(q, idx)) return null;
+    const d_gpa = q.desc_addr + (@as(u64, idx) * virtio_desc_size);
+    var raw: [16]u8 = undefined;
+    if (!readGuestBytes(hhdm, vmid, d_gpa, &raw)) return null;
+    return .{
+        .addr = std.mem.readInt(u64, raw[0..8], .little),
+        .len = std.mem.readInt(u32, raw[8..12], .little),
+        .flags = std.mem.readInt(u16, raw[12..14], .little),
+        .next = std.mem.readInt(u16, raw[14..16], .little),
+    };
 }
 
 const DescriptorChainInfo = struct {
@@ -116,68 +255,142 @@ const DescriptorChainInfo = struct {
     status_addr: u64,
 };
 
-fn decodeDescriptorChain(hhdm: u64, q: *virtio_blk.QueueState, chain_head: u16) !DescriptorChainInfo {
-    const vmx = @import("../arch/x86_64/vmx.zig");
+fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_head: u16) !DescriptorChainInfo {
+    if (!isQueueValid(q) or !isDescriptorIndexValid(q, chain_head)) return error.InvalidDescriptor;
+    if ((q.desc_addr & (virtio_desc_size - 1)) != 0) return error.InvalidDescriptor;
 
-    const desc_hpa = vmx.findGuestPageHpaPublic(q.desc_addr) orelse return error.InvalidGpa;
-    const desc_ptr: [*]const u8 = @ptrFromInt(desc_hpa + hhdm + (q.desc_addr & 0xFFF));
+    const d1 = readDescriptor(hhdm, vmid, q, chain_head) orelse return error.InvalidGpa;
+    if ((d1.flags & virtio_blk.VIRTQ_DESC_F_INDIRECT) != 0) return error.InvalidDescriptor;
+    if ((d1.flags & virtio_blk.VIRTQ_DESC_F_WRITE) != 0) return error.InvalidDescriptor;
+    if ((d1.flags & virtio_blk.VIRTQ_DESC_F_NEXT) == 0) return error.InvalidDescriptor;
+    if (d1.len < @sizeOf(virtio_blk.RequestHeader)) return error.InvalidDescriptor;
 
-    // Virtio Descriptor is 16 bytes: addr(8), len(4), flags(2), next(2)
-    const d_off = @as(usize, chain_head) * 16;
-    const d_addr = std.mem.readInt(u64, desc_ptr[d_off .. d_off + 8][0..8], .little);
-    const d_flags = std.mem.readInt(u16, desc_ptr[d_off + 12 .. d_off + 14][0..2], .little);
-    const d_next = std.mem.readInt(u16, desc_ptr[d_off + 14 .. d_off + 16][0..2], .little);
+    var hdr_bytes: [@sizeOf(virtio_blk.RequestHeader)]u8 = undefined;
+    if (!readGuestBytes(hhdm, vmid, d1.addr, &hdr_bytes)) return error.InvalidGpa;
+    const req = std.mem.bytesToValue(virtio_blk.RequestHeader, &hdr_bytes);
 
     var info = DescriptorChainInfo{
-        .request = undefined,
+        .request = req,
         .data_hpa = 0,
         .data_len = 0,
         .status_addr = 0,
     };
 
-    if ((d_flags & 1) != 0) {
-        const d2_off = @as(usize, d_next) * 16;
-        const d2_addr = std.mem.readInt(u64, desc_ptr[d2_off .. d2_off + 8][0..8], .little);
-        const d2_len = std.mem.readInt(u32, desc_ptr[d2_off + 8 .. d2_off + 12][0..4], .little);
-        const d2_flags = std.mem.readInt(u16, desc_ptr[d2_off + 12 .. d2_off + 14][0..2], .little);
+    const d2 = readDescriptor(hhdm, vmid, q, d1.next) orelse return error.InvalidDescriptor;
+    if ((d2.flags & virtio_blk.VIRTQ_DESC_F_INDIRECT) != 0) return error.InvalidDescriptor;
 
-        if ((d2_flags & 1) != 0) {
-            info.data_len = d2_len;
-            if (vmx.findGuestPageHpaPublic(d2_addr)) |hpa_base| {
-                info.data_hpa = hpa_base + (d2_addr & 0xFFF);
-            }
-            const d3_idx = std.mem.readInt(u16, desc_ptr[d2_off + 14 .. d2_off + 16][0..2], .little);
-            const d3_off = @as(usize, d3_idx) * 16;
-            info.status_addr = std.mem.readInt(u64, desc_ptr[d3_off .. d3_off + 8][0..8], .little);
-        } else {
-            info.status_addr = d2_addr;
+    if ((d2.flags & virtio_blk.VIRTQ_DESC_F_NEXT) != 0) {
+        if (d2.len == 0) return error.InvalidDescriptor;
+        if (req.type == virtio_blk.VIRTIO_BLK_T_IN and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0) {
+            return error.InvalidDescriptor;
         }
+        if (req.type == virtio_blk.VIRTIO_BLK_T_OUT and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) != 0) {
+            return error.InvalidDescriptor;
+        }
+        info.data_len = d2.len;
+        info.data_hpa = validateContiguousGuestSpanHpa(vmid, d2.addr, d2.len) orelse return error.InvalidGpa;
+
+        const d3 = readDescriptor(hhdm, vmid, q, d2.next) orelse return error.InvalidDescriptor;
+        if ((d3.flags & virtio_blk.VIRTQ_DESC_F_INDIRECT) != 0) return error.InvalidDescriptor;
+        if ((d3.flags & virtio_blk.VIRTQ_DESC_F_NEXT) != 0) return error.InvalidDescriptor;
+        if ((d3.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0 or d3.len < 1) return error.InvalidDescriptor;
+        if (!validateGuestSpan(vmid, d3.addr, 1)) return error.InvalidGpa;
+        info.status_addr = d3.addr;
+    } else {
+        if ((d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0 or d2.len < 1) return error.InvalidDescriptor;
+        if (!validateGuestSpan(vmid, d2.addr, 1)) return error.InvalidGpa;
+        info.status_addr = d2.addr;
     }
 
-    const hdr_hpa = vmx.findGuestPageHpaPublic(d_addr) orelse return error.InvalidGpa;
-    const hdr_ptr: [*]const virtio_blk.RequestHeader = @ptrFromInt(hdr_hpa + hhdm + (d_addr & 0xFFF));
-    info.request = hdr_ptr[0];
+    if (req.type != virtio_blk.VIRTIO_BLK_T_IN and
+        req.type != virtio_blk.VIRTIO_BLK_T_OUT and
+        req.type != virtio_blk.VIRTIO_BLK_T_FLUSH)
+    {
+        return error.UnsupportedOperation;
+    }
+
     return info;
+}
+
+fn findStatusDescriptorAddr(hhdm: u64, vmid: u32, q: *const virtio_blk.QueueState, chain_head: u16) ?u64 {
+    var curr = chain_head;
+    var steps: u32 = 0;
+    while (steps < q.num) : (steps += 1) {
+        const d = readDescriptor(hhdm, vmid, q, curr) orelse return null;
+        if ((d.flags & virtio_blk.VIRTQ_DESC_F_INDIRECT) != 0) return null;
+        if ((d.flags & virtio_blk.VIRTQ_DESC_F_NEXT) == 0) {
+            if ((d.flags & virtio_blk.VIRTQ_DESC_F_WRITE) != 0 and d.len >= 1 and validateGuestSpan(vmid, d.addr, 1)) {
+                return d.addr;
+            }
+            return null;
+        }
+        curr = d.next;
+    }
+    return null;
+}
+
+fn shouldNotifyDriver(hhdm: u64, vmid: u32, inst: *const virtio_blk.DeviceInstance, q: *const virtio_blk.QueueState, old_used_idx: u16, new_used_idx: u16) bool {
+    if (inst.hasEventIdx()) {
+        const used_event_gpa = q.driver_addr + 4 + (@as(u64, q.num) * 2);
+        const used_event = readGuestInt(u16, hhdm, vmid, used_event_gpa) orelse return false;
+        return (new_used_idx -% used_event -% 1) < (new_used_idx -% old_used_idx);
+    }
+    const avail_flags = readGuestInt(u16, hhdm, vmid, q.driver_addr) orelse return false;
+    return (avail_flags & virtio_blk.VIRTQ_AVAIL_F_NO_INTERRUPT) == 0;
+}
+
+fn pushUsedAndNotify(hhdm: u64, vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virtio_blk.QueueState, head_idx: u16, used_len: u32) void {
+    if (!isDescriptorIndexValid(q, head_idx)) return;
+    const old_used_idx = readGuestInt(u16, hhdm, vmid, q.device_addr + 2) orelse return;
+    const elem_gpa = q.device_addr + 4 + (@as(u64, old_used_idx % @as(u16, @intCast(q.num))) * 8);
+
+    if (!writeGuestInt(u32, hhdm, vmid, elem_gpa, @as(u32, head_idx))) return;
+    if (!writeGuestInt(u32, hhdm, vmid, elem_gpa + 4, used_len)) return;
+
+    const new_used_idx = old_used_idx +% 1;
+    if (!writeGuestInt(u16, hhdm, vmid, q.device_addr + 2, new_used_idx)) return;
+    q.last_used_idx = new_used_idx;
+
+    if (shouldNotifyDriver(hhdm, vmid, inst, q, old_used_idx, new_used_idx)) {
+        inst.interrupt_status |= 1;
+        injectGuestIrq(vmid, 14);
+    }
+}
+
+fn completeBlkRequestOnError(hhdm: u64, vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virtio_blk.QueueState, head_idx: u16, err: anyerror) void {
+    if (!isDescriptorIndexValid(q, head_idx)) return;
+    const status_byte: u8 = if (err == error.UnsupportedOperation)
+        virtio_blk.VIRTIO_BLK_S_UNSUPP
+    else
+        virtio_blk.VIRTIO_BLK_S_IOERR;
+
+    var used_len: u32 = 0;
+    if (findStatusDescriptorAddr(hhdm, vmid, q, head_idx)) |status_gpa| {
+        if (writeGuestInt(u8, hhdm, vmid, status_gpa, status_byte)) {
+            used_len = 1;
+        }
+    }
+    pushUsedAndNotify(hhdm, vmid, inst, q, head_idx, used_len);
 }
 
 fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virtio_blk.QueueState, chain_head: u16) !void {
     _ = inst;
     const hhdm = bridge_hhdm_offset;
-    const info = try decodeDescriptorChain(hhdm, q, chain_head);
+    const info = try decodeDescriptorChain(hhdm, vmid, q, chain_head);
 
     // Allocate DIPC page for storaged
-    const table = bridge_endpoint_table orelse return;
+    const table = bridge_endpoint_table orelse return error.NoRoute;
     const storaged_addr = dipc.Address{
         .node = dipc.Ipv6Addr.loopback(),
-        .endpoint = @intFromEnum(identity.ReservedEndpoint.storaged),
+        .endpoint = @backingInt(identity.ReservedEndpoint.storaged),
     };
     const kernel_addr = dipc.Address{
         .node = dipc.Ipv6Addr.loopback(),
-        .endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
+        .endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
     };
 
     // Format payload: RequestHeader + metadata
-    var payload: [64]u8 = [_]u8{0} ** 64;
+    var payload: [64]u8 = @splat(0);
     std.mem.copyForwards(u8, payload[0..@sizeOf(virtio_blk.RequestHeader)], std.mem.asBytes(&info.request));
     // Additional metadata: VMID (32..36), chain_head (36..38), data_len (38..40), data_hpa (40..48)
     std.mem.writeInt(u32, payload[32..36][0..4], vmid, .little);
@@ -188,6 +401,7 @@ fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virti
     std.mem.writeInt(u64, payload[48..56][0..8], info.status_addr, .little);
 
     const msg_page = try dipc.allocPageMessage(hhdm, kernel_addr, storaged_addr, &payload);
+    errdefer dipc.freePageMessage(msg_page);
 
     // Send to storaged via router
     _ = try router.routePageWithLocalNode(hhdm, table, msg_page);
@@ -204,7 +418,7 @@ pub fn broadcastTelemetryFromContext() void {
 }
 
 pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable) void {
-    const dashd_entity = table.lookup(@intFromEnum(identity.ReservedEndpoint.dashd)) orelse return;
+    const dashd_entity = table.lookup(@backingInt(identity.ReservedEndpoint.dashd)) orelse return;
     const dashd_sid = switch (dashd_entity) {
         .service => |sid| sid,
         else => return,
@@ -218,14 +432,14 @@ pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable)
 
         const dashd_addr = dipc.Address{
             .node = dipc.Ipv6Addr.loopback(),
-            .endpoint = @intFromEnum(identity.ReservedEndpoint.dashd),
+            .endpoint = @backingInt(identity.ReservedEndpoint.dashd),
         };
         const kernel_addr = dipc.Address{
             .node = dipc.Ipv6Addr.loopback(),
-            .endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
+            .endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
         };
 
-        var payload: [64]u8 = [_]u8{0} ** 64;
+        var payload: [64]u8 = @splat(0);
         const telem = control_protocol.TelemetryUpdatePayload{
             .instance_id = inst.instance_id,
             .cpu_cycles = inst.cpu_cycles,
@@ -243,36 +457,146 @@ pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable)
 
 /// Receives block I/O completions from `storaged`.
 pub fn handleVirtioBlkResponse(vmid: u32, head_idx: u16, io_status: u8) void {
-    const vmx = @import("../arch/x86_64/vmx.zig");
     const hhdm = bridge_hhdm_offset;
 
     const inst = virtio_blk.getInstance(vmid) orelse return;
     const q = &inst.queues[0];
-    const info = decodeDescriptorChain(hhdm, q, head_idx) catch return;
+    if (!validateQueueMemory(vmid, q, inst.hasEventIdx()) or !isDescriptorIndexValid(q, head_idx)) return;
 
-    // Write io_status to guest status descriptor memory
-    if (vmx.findGuestPageHpaPublic(info.status_addr)) |status_hpa| {
-        const status_ptr: [*]u8 = @ptrFromInt(status_hpa + hhdm + (info.status_addr & 0xFFF));
-        status_ptr[0] = io_status;
+    const info = decodeDescriptorChain(hhdm, vmid, q, head_idx) catch {
+        completeBlkRequestOnError(hhdm, vmid, inst, q, head_idx, error.InvalidDescriptor);
+        return;
+    };
+
+    const wrote_status = writeGuestInt(u8, hhdm, vmid, info.status_addr, io_status);
+    const used_len: u32 = if (!wrote_status)
+        0
+    else if (io_status == virtio_blk.VIRTIO_BLK_S_OK and info.request.type == virtio_blk.VIRTIO_BLK_T_IN)
+        info.data_len + 1
+    else
+        1;
+
+    pushUsedAndNotify(hhdm, vmid, inst, q, head_idx, used_len);
+}
+
+const limine = @import("../kernel/limine.zig");
+
+var test_backing: [16][4096]u8 align(4096) = undefined;
+var test_irq_count: usize = 0;
+
+fn testTranslateDiscontiguous(_: u32, gpa: u64) ?u64 {
+    const page = gpa & ~@as(u64, 0xFFF);
+    // Deliberately map GPA pages 0..3 to reversed host pages 4..1 so cross-page
+    // accesses fail if code assumes contiguous host physical memory.
+    return switch (page) {
+        0x1000 => 4 * pmm.PAGE_SIZE,
+        0x2000 => 3 * pmm.PAGE_SIZE,
+        0x3000 => 2 * pmm.PAGE_SIZE,
+        0x4000 => 1 * pmm.PAGE_SIZE,
+        else => null,
+    };
+}
+
+fn testRecordIrq(_: u32, _: u8) void {
+    test_irq_count += 1;
+}
+
+test "virtio-blk cross-page rings, failure completion, and event-idx suppression" {
+    @memset(std.mem.asBytes(&test_backing), 0);
+    const hhdm = @intFromPtr(&test_backing);
+    var entry = limine.MemmapEntry{
+        .base = 0,
+        .length = @sizeOf(@TypeOf(test_backing)),
+        .kind = limine.MEMMAP_USABLE,
+    };
+    var entries = [_]*limine.MemmapEntry{&entry};
+    var memmap = limine.MemmapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = @ptrCast(&entries),
+    };
+    pmm.init(&memmap, hhdm);
+    for (1..5) |p| pmm.setBit(p);
+
+    test_irq_count = 0;
+    virtio_blk.init();
+    gpa_to_hpa_fn = testTranslateDiscontiguous;
+    inject_irq_fn = testRecordIrq;
+    defer {
+        gpa_to_hpa_fn = null;
+        inject_irq_fn = null;
+        bridge_hhdm_offset = 0;
+        bridge_endpoint_table = null;
     }
 
-    // Used Ring: [2]u16 flags/idx, then [num] * UsedElem{id(4), len(4)}
-    const used_hpa = vmx.findGuestPageHpaPublic(q.device_addr) orelse return;
-    const used_ptr: [*]u8 = @ptrFromInt(used_hpa + hhdm + (q.device_addr & 0xFFF));
+    var table: endpoint_table.EndpointTable = undefined;
+    table.init();
+    setBridgeContext(hhdm, &table);
 
-    const used_idx_ptr = used_ptr[2..4];
-    const current_used_idx = std.mem.readInt(u16, used_idx_ptr[0..2], .little);
+    const vmid: u32 = 1;
+    const inst = virtio_blk.getInstance(vmid).?;
+    inst.driver_features = virtio_blk.VIRTIO_F_EVENT_IDX;
+    const q = &inst.queues[0];
+    q.* = .{
+        .ready = true,
+        .num = 4,
+        // Place descriptor table, avail ring, and used ring across 4 KiB page boundaries!
+        .desc_addr = 0x1FE0, // 2 descriptors on page 0x1000, 2 descriptors on page 0x2000
+        .driver_addr = 0x2FFA, // flags+idx+ring[0] on 0x2000, ring[1..3]+used_event on 0x3000
+        .device_addr = 0x3FF8, // flags+idx+ring[0].id on 0x3000, ring[0].len+ring[1..3]+avail_event on 0x4000
+    };
 
-    const elem_off = 4 + (@as(usize, current_used_idx % q.num) * 8);
-    const used_len: u32 = if (info.request.type == virtio_blk.VIRTIO_BLK_T_IN) info.data_len + 1 else 1;
-    // Write UsedElem: id (4 bytes), len (4 bytes)
-    std.mem.writeInt(u32, used_ptr[elem_off .. elem_off + 4][0..4], head_idx, .little);
-    std.mem.writeInt(u32, used_ptr[elem_off + 4 .. elem_off + 8][0..4], used_len, .little);
+    try std.testing.expect(validateQueueMemory(vmid, q, true));
 
-    // Update used index
-    std.mem.writeInt(u16, used_idx_ptr[0..2], current_used_idx +% 1, .little);
-    q.last_used_idx = current_used_idx +% 1;
+    // Set up a 3-descriptor READ chain (0 -> 1 -> 2) where descriptor 2 is across page 0x2000
+    // Desc 0 (at 0x1FE0): header at GPA 0x1100, len 16, NEXT -> 1
+    _ = writeGuestInt(u64, hhdm, vmid, 0x1FE0 + 0, 0x1100);
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1FE0 + 8, 16);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FE0 + 12, virtio_blk.VIRTQ_DESC_F_NEXT);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FE0 + 14, 1);
 
-    inst.interrupt_status |= 1;
-    vmx.injectGuestInterrupt(vmid, 14);
+    // Desc 1 (at 0x1FF0): data at GPA 0x1200, len 512, WRITE | NEXT -> 2
+    _ = writeGuestInt(u64, hhdm, vmid, 0x1FF0 + 0, 0x1200);
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1FF0 + 8, 512);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FF0 + 12, virtio_blk.VIRTQ_DESC_F_WRITE | virtio_blk.VIRTQ_DESC_F_NEXT);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FF0 + 14, 2);
+
+    // Desc 2 (at 0x2000, across page boundary!): status at GPA 0x1400, len 1, WRITE
+    _ = writeGuestInt(u64, hhdm, vmid, 0x2000 + 0, 0x1400);
+    _ = writeGuestInt(u32, hhdm, vmid, 0x2000 + 8, 1);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x2000 + 12, virtio_blk.VIRTQ_DESC_F_WRITE);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x2000 + 14, 0);
+
+    // Write valid RequestHeader (VIRTIO_BLK_T_IN, sector 0) at 0x1100
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1100, virtio_blk.VIRTIO_BLK_T_IN);
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1104, 0);
+    _ = writeGuestInt(u64, hhdm, vmid, 0x1108, 0);
+    _ = writeGuestInt(u8, hhdm, vmid, 0x1400, 0xFF);
+
+    // Populate avail ring: idx = 1, ring[0] = 0, used_event = 1 (suppresses idx 0->1 interrupt!)
+    _ = writeGuestInt(u16, hhdm, vmid, q.driver_addr + 0, 0);
+    _ = writeGuestInt(u16, hhdm, vmid, q.driver_addr + 2, 1);
+    _ = writeGuestInt(u16, hhdm, vmid, q.driver_addr + 4, 0);
+    const used_event_gpa = q.driver_addr + 4 + (4 * 2);
+    _ = writeGuestInt(u16, hhdm, vmid, used_event_gpa, 1);
+
+    // Because storaged is not registered in `table`, routing fails -> must complete with IOERR (status=1, used_len=1)
+    // and update avail_event = 1 without firing an IRQ (since used_event == 1, old_used_idx == 0).
+    routeVirtioBlkNotify(vmid, 0);
+
+    try std.testing.expectEqual(@as(u8, virtio_blk.VIRTIO_BLK_S_IOERR), readGuestInt(u8, hhdm, vmid, 0x1400).?);
+    try std.testing.expectEqual(@as(u16, 1), readGuestInt(u16, hhdm, vmid, q.device_addr + 2).?);
+    try std.testing.expectEqual(@as(u32, 0), readGuestInt(u32, hhdm, vmid, q.device_addr + 4).?);
+    try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 8).?);
+    try std.testing.expectEqual(@as(u16, 1), readGuestInt(u16, hhdm, vmid, q.device_addr + 4 + (4 * 8)).?);
+    try std.testing.expectEqual(@as(usize, 0), test_irq_count);
+
+    // Now test handleVirtioBlkResponse with IOERR when used_event matches old_used_idx (1):
+    // must report used_len = 1 (not 513!) and trigger IRQ!
+    _ = writeGuestInt(u8, hhdm, vmid, 0x1400, 0xFF);
+    handleVirtioBlkResponse(vmid, 0, virtio_blk.VIRTIO_BLK_S_IOERR);
+    try std.testing.expectEqual(@as(u8, virtio_blk.VIRTIO_BLK_S_IOERR), readGuestInt(u8, hhdm, vmid, 0x1400).?);
+    try std.testing.expectEqual(@as(u16, 2), readGuestInt(u16, hhdm, vmid, q.device_addr + 2).?);
+    try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 4 + 8 + 4).?);
+    try std.testing.expectEqual(@as(usize, 1), test_irq_count);
 }

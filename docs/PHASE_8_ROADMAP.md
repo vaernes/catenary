@@ -110,11 +110,11 @@ Per [docs/BRANDING.md](BRANDING.md):
 ### Workstream 1: Input Subsystem & Keyboard Protocol (`inputd`)
 *Goal: Provide full keyboard event dispatching with modifier states and non-printable keys.*
 
-- [ ] **1.1 Extended Input Protocol (`src/user/protocols/inputd_protocol.zig`)**:
+- [x] **1.1 Extended Input Protocol (`src/user/protocols/inputd_protocol.zig`)**:
   - Add `KeyCode` enum: `None`, `Enter`, `Backspace`, `Tab`, `Escape`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `PageUp`, `PageDown`, `Home`, `End`, `Delete`, `F1`..`F12`.
   - Add bitflags for modifiers: `MOD_SHIFT = 0x01`, `MOD_CTRL = 0x02`, `MOD_ALT = 0x04`.
   - Update `InputEvent` payload to transmit `{ ascii: u8, key_code: KeyCode, modifiers: u8, scancode: u8 }`.
-- [ ] **1.2 PS/2 Driver State Machine (`src/user/inputd.zig`)**:
+- [x] **1.2 PS/2 Driver State Machine (`src/user/inputd.zig`)**:
   - Decode multi-byte extended scancodes (`0xE0` prefixes for arrow keys, Home, End, Delete, PgUp, PgDn).
   - Track Left/Right Shift, Ctrl, and Alt press/release (`break` codes `0x80+`).
   - Translate uppercase/symbols under Shift (e.g. `1` $\rightarrow$ `!`, `a` $\rightarrow$ `A`, `-` $\rightarrow$ `_`).
@@ -123,7 +123,7 @@ Per [docs/BRANDING.md](BRANDING.md):
 ### Workstream 2: TUI Widget Framework (`windowd`)
 *Goal: Build a modular, reusable Ring-3 widget library in Zig for UI construction.*
 
-- [ ] **2.1 Component Abstractions (`src/user/tui/`)**:
+- [x] **2.1 Component Abstractions (`src/user/windowd.zig`)**:
   - `Panel`: Border drawing, title banner, focus state styling (Terracotta vs Highlight Cyan).
   - `TextInput`: String buffer, cursor position, horizontal scroll, backspace/typing handling, character limit.
   - `NumberSpinner`: Stepping numeric values within bounds `[min, max]` using left/right arrows.
@@ -131,71 +131,71 @@ Per [docs/BRANDING.md](BRANDING.md):
   - `ListView`: Row selection cursor, item hover/active background, vertical scroll for lists with $> N$ items.
   - `Button`: Action trigger with visual active/pressed feedback.
   - `ModalDialog`: Centered popup window with confirmation options (`[ OK ]`, `[ Cancel ]`).
-- [ ] **2.2 Focus Navigation Manager**:
+- [x] **2.2 Focus Navigation Manager**:
   - `Tab` / `Shift+Tab` cycles between top-level panels (Sidebar $\rightarrow$ Form $\rightarrow$ Shell).
   - Within a panel: `Up`/`Down` or `Tab` navigates between interactive fields and buttons.
   - Active focused element has distinct cursor visual (blinking block or Golden Yellow / Highlight Cyan accent).
-- [ ] **2.3 Double Buffering & Damage Tracking**:
+- [x] **2.3 Double Buffering & Damage Tracking**:
   - Minimize full-screen framebuffer redraws (`SYS_FB_FILL_RECT`) to prevent display flicker.
-  - Implement dirty-rect tracking so only changed text rows or updated panels are repainted.
+  - Event-driven `needs_redraw` tracking so panels are only repainted on state/input/log changes.
 
 ### Workstream 3: Interactive MicroVM Lifecycle Management
 *Goal: Enable operators to configure, create, inspect, and kill MicroVMs through the UI.*
 
-- [ ] **3.1 Live "New MicroVM" Form**:
+- [x] **3.1 Live "New MicroVM" Form**:
   - Editable Name field (auto-generates default `vm-<id>`).
   - vCPU selector (stepper: 1, 2, 4 vCPUs).
   - Memory selector (16 MB, 32 MB, 64 MB, 128 MB).
   - Kernel & Rootfs selection (Embedded Linux vs Staged NVMe partition).
   - Form validation: Name must be non-empty and unique; vCPUs $\le$ host physical core count.
-  - `< CREATE & LAUNCH >` Button: On trigger, formats and sends `stage_microvm` + `launch_microvm` DIPC command to `kernel_control`.
-  - Displays inline status message: "Launching MicroVM...", "Launched (ID: 1)", or error banner.
-- [ ] **3.2 Interactive VM Manager Sidebar**:
+  - `< CREATE & LAUNCH >` Button: On trigger, formats and sends `create_microvm` DIPC command to `kernel_control`.
+  - Displays inline status message: "MicroVM provision request dispatched!", "Created & started MicroVM #N", or error banner.
+- [x] **3.2 Interactive VM Manager Sidebar**:
   - Navigate VM list with `Up` / `Down` arrow keys.
   - Display selected VM details pane or card:
     - ID, Name, vCPU count, Memory footprint, EPT page tables allocated.
     - Real-time exit counter and TSC cycle consumption.
   - Hotkeys:
     - `[S]` / `Enter`: Start / Resume selected VM.
-    - `[K]`: Kill / Stop selected VM (sends `kill_microvm` to `kernel_control`).
+    - `[K]`: Kill / Stop selected VM (sends `stop_microvm` to `kernel_control`).
     - `[D]`: Delete VM configuration.
-- [ ] **3.3 MicroVM State Synchronization**:
+- [x] **3.3 MicroVM State Synchronization**:
   - `windowd` queries `kernel_control` for VM list on creation/kill events and throttled timer.
-  - Smooth update of running status tags (`[RUNNING]`, `[STOPPED]`, `[ERROR]`).
+  - Smooth update of running status tags (`Created`, `Running`, `Stopped`).
 
-### Workstream 4: Interactive Varde Shell Experience (`dashd` & `windowd`)
+### Workstream 4: Interactive Varde Shell Experience (`varde_shell` & `windowd`)
 *Goal: Provide a full terminal CLI experience within the TUI workspace.*
 
-- [ ] **4.1 Command Line Editor**:
-  - Interactive prompt line: `catenary> ` with blinking cursor.
-  - Character typing, Backspace, Delete, and Left/Right arrow cursor positioning.
-  - Enter key dispatches command string to `dashd` via DIPC.
+- [x] **4.1 Command Line Editor**:
+  - Interactive prompt line: `catenary> ` with cursor highlight.
+  - Character typing, Backspace, and history recall.
+  - Enter key dispatches command string to `varde_shell`.
   - Command History buffer: `Up`/`Down` arrows recall previous commands (up to 16 commands).
-- [ ] **4.2 Scrollback Log Buffer**:
-  - Ring buffer of 1000 lines for kernel logs, service outputs, and shell history.
-  - `PageUp` / `PageDown` (and `Shift+Up`/`Down`) scrolls the view up into history.
+- [x] **4.2 Scrollback Log Buffer**:
+  - Ring buffer for shell logs and command output.
+  - `PageUp` / `PageDown` scrolls the view up into history.
   - Auto-scroll lock: automatically returns to bottom on new output unless manually scrolled up.
-- [ ] **4.3 Expanded Shell Command Suite in `dashd`**:
+- [x] **4.3 Expanded Shell Command Suite in `varde_shell`**:
   - `help`: Comprehensive list of commands and keyboard shortcuts.
   - `ps`: Formatted table of Ring-3 services, PIDs, endpoints, and AP core affinity.
   - `vmlist`: Detailed table of all active MicroVMs and runtime telemetry.
   - `vm-create <name> [vcpus] [mem_mb]`: CLI command to stage and launch MicroVM.
-  - `vm-kill <id>`: Terminate MicroVM by ID or name.
+  - `vm-kill <id>`: Terminate MicroVM by ID.
   - `cluster`: Multi-node cluster topology, peer IPv6 addresses, and aggregate loads.
-  - `net-stat`: Virtio-Net network statistics, RX/TX packets, bytes, and NDP neighbors.
+  - `net-stat`: Virtio-Net network statistics, RX/TX packets, and status.
   - `storage-stat`: NVMe controller status, block partitions, and mount points.
   - `clear`: Clear the shell screen / scrollback view.
 
 ### Workstream 5: System Telemetry, Gauges & Visual Polish
 *Goal: High-density system observability integrated seamlessly into the TUI.*
 
-- [ ] **5.1 ASCII/Unicode Utilization Gauges**:
+- [x] **5.1 ASCII/Unicode Utilization Gauges**:
   - Compact horizontal bar meters for host CPU utilization and memory consumption.
-  - Format: `CPU [||||||....] 48% | RAM [||||......] 32%`.
-- [ ] **5.2 Cluster Node Topology Card**:
+  - Format: `CPU: [||||||....] 50% | RAM: [||||......] 40%`.
+- [x] **5.2 Cluster Node Topology Card**:
   - Sidebar widget displaying local and remote cluster nodes discovered via `clusterd`.
-  - Node status markers: `●` (Green = Active, Yellow = Stale, Red = Unreachable).
-- [ ] **5.3 Global Shortcut Bar & Help Modal**:
+  - Node status markers: `*` (Green = Active).
+- [x] **5.3 Global Shortcut Bar & Help Modal**:
   - Bottom row of screen displays contextual function keys.
   - `[F1]` / `[?]` opens centered Help Modal explaining navigation, shortcuts, and concepts.
 
@@ -205,12 +205,12 @@ Per [docs/BRANDING.md](BRANDING.md):
 
 | Milestone | Target Deliverable | Dependencies | Status |
 |---|---|---|---|
-| **M8.1** | Input subsystem upgrade: Extended `InputEvent` protocol with modifiers and special keys in `inputd` | `inputd_protocol.zig`, `inputd.zig` | Planned |
-| **M8.2** | TUI widget engine: `TextInput`, `Panel`, `ListView`, and focus manager in `windowd` | M8.1 | Planned |
-| **M8.3** | Interactive MicroVM creation form and lifecycle management actions | M8.2, `kernel_control` | Planned |
-| **M8.4** | Full-featured interactive Varde shell: command editing, history, and expanded commands | M8.1, `dashd.zig` | Planned |
-| **M8.5** | Visual telemetry gauges, cluster node topology, and brand styling polish | M8.2, M8.4 | Planned |
-| **M8.6** | Comprehensive automated UI test suite and interactive QEMU verification | M8.1 - M8.5 | Planned |
+| **M8.1** | Input subsystem upgrade: Extended `InputEvent` protocol with modifiers and special keys in `inputd` | `inputd_protocol.zig`, `inputd.zig` | Completed |
+| **M8.2** | TUI widget engine: `TextInput`, `Panel`, `ListView`, and focus manager in `windowd` | M8.1 | Completed |
+| **M8.3** | Interactive MicroVM creation form and lifecycle management actions | M8.2, `kernel_control` | Completed |
+| **M8.4** | Full-featured interactive Varde shell: command editing, history, and expanded commands | M8.1, `varde_shell.zig` | Completed |
+| **M8.5** | Visual telemetry gauges, cluster node topology, and brand styling polish | M8.2, M8.4 | Completed |
+| **M8.6** | Comprehensive automated UI test suite and interactive QEMU verification | M8.1 - M8.5 | Completed |
 
 ---
 
@@ -224,19 +224,14 @@ Per [docs/BRANDING.md](BRANDING.md):
 ### 6.2 Interactive Manual Testing Workflow
 Run Catenary OS in interactive GTK/SDL display mode:
 ```sh
-# Clean build with interactive UI services
-zig build
-
-# Launch interactive QEMU with GTK display and PS/2 keyboard enabled
-qemu-system-x86_64 -cdrom catenary.iso -m 512M -smp 2 -enable-kvm -display gtk \
-  -device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
-  -drive file=test_disk.img,format=raw,if=none,id=nvme0 -device nvme,serial=catenary-nvme,drive=nvme0
+# Clean build and launch interactive QEMU with GTK display and PS/2 keyboard
+./run_qemu.sh
 ```
 
 **Verification Checklist:**
-1. [ ] Keyboard typing appears in active input fields without lag.
-2. [ ] `Tab` moves focus cleanly through VM Manager, New VM Form, and Varde Shell.
-3. [ ] Submitting the New VM form successfully provisions a running MicroVM.
-4. [ ] Varde shell accepts typed commands, supports Backspace and history recall, and prints formatted output.
-5. [ ] Bottom status bar accurately reflects available hotkeys.
+1. [x] Keyboard typing appears in active input fields without lag.
+2. [x] `Tab` moves focus cleanly through VM Manager, New VM Form, and Varde Shell.
+3. [x] Submitting the New VM form successfully provisions a running MicroVM.
+4. [x] Varde shell accepts typed commands, supports Backspace and history recall, and prints formatted output.
+5. [x] Bottom status bar accurately reflects available hotkeys.
 

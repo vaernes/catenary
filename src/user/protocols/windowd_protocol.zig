@@ -29,7 +29,7 @@ pub const InputEvent = extern struct {
     ascii: u8,
     /// Raw PS/2 set-1 make scancode.
     scancode: u8,
-    _reserved: [5]u8 = [_]u8{0} ** 5,
+    _reserved: [5]u8 = @splat(0),
 };
 
 comptime {

@@ -13,7 +13,7 @@ pub const Ipv6Addr = extern struct {
     }
 
     pub fn loopback() Ipv6Addr {
-        var out: Ipv6Addr = .{ .bytes = [_]u8{0} ** 16 };
+        var out: Ipv6Addr = .{ .bytes = @splat(0) };
         out.bytes[15] = 1;
         return out;
     }
@@ -75,7 +75,7 @@ pub fn setAuthKey(seed: u64) void {
 /// Cluster-wide key shared by all nodes; authenticates DIPC traffic that
 /// crosses the wire. Unlike `auth_key` (per-boot random, node-local) it is the
 /// same on every node of a cluster.
-var cluster_key: [32]u8 = [_]u8{0} ** 32;
+var cluster_key: [32]u8 = @splat(0);
 var cluster_key_set: bool = false;
 
 pub fn setClusterSecret(secret: []const u8) void {

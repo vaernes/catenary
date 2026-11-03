@@ -14,7 +14,7 @@ pub const ElfError = error{
 };
 
 pub const Elf64_Ehdr = std.elf.Elf64_Ehdr;
-pub const Elf64_Phdr = std.elf.Elf64_Phdr;
+pub const Elf64_Phdr = std.elf.Elf64.Phdr;
 
 pub const LoadedElf = struct {
     entry: u64,
@@ -31,8 +31,8 @@ pub fn parseInMem(elf_bytes: []const u8) ElfError!LoadedElf {
     if (!std.mem.eql(u8, hdr.e_ident[0..4], std.elf.MAGIC)) return error.BadMagic;
     if (hdr.e_ident[std.elf.EI_CLASS] != std.elf.ELFCLASS64) return error.Not64Bit;
     if (hdr.e_ident[std.elf.EI_DATA] != std.elf.ELFDATA2LSB) return error.NotLittleEndian;
-    if (@intFromEnum(hdr.e_type) != @intFromEnum(std.elf.ET.EXEC)) return error.NotExecutable;
-    if (@intFromEnum(hdr.e_machine) != @intFromEnum(std.elf.EM.X86_64)) return error.BadArchitecture;
+    if (@backingInt(hdr.e_type) != @backingInt(std.elf.ET.EXEC)) return error.NotExecutable;
+    if (@backingInt(hdr.e_machine) != @backingInt(std.elf.EM.X86_64)) return error.BadArchitecture;
 
     if (hdr.e_phentsize < @sizeOf(Elf64_Phdr)) return error.BadProgramHeaderSize;
 
@@ -55,12 +55,12 @@ pub fn parseInMem(elf_bytes: []const u8) ElfError!LoadedElf {
         if (ph_struct_end > ph_end or ph_struct_end > elf_bytes.len) return error.ProgramHeaderOutOfBounds;
 
         const ph: *const Elf64_Phdr = @ptrCast(@alignCast(&elf_bytes[ph_offset]));
-        if (ph.p_type == std.elf.PT_LOAD) {
-            const vaddr_start = ph.p_vaddr;
-            const vaddr_end = std.math.add(u64, ph.p_vaddr, ph.p_memsz) catch return error.SegmentRangeOverflow;
-            if (ph.p_filesz > ph.p_memsz) return error.SegmentFileLargerThanMemory;
+        if (ph.type == .LOAD) {
+            const vaddr_start = ph.vaddr;
+            const vaddr_end = std.math.add(u64, ph.vaddr, ph.memsz) catch return error.SegmentRangeOverflow;
+            if (ph.filesz > ph.memsz) return error.SegmentFileLargerThanMemory;
 
-            const segment_file_end = std.math.add(u64, ph.p_offset, ph.p_filesz) catch return error.SegmentOutOfBounds;
+            const segment_file_end = std.math.add(u64, ph.offset, ph.filesz) catch return error.SegmentOutOfBounds;
             if (segment_file_end > elf_bytes.len) return error.SegmentOutOfBounds;
 
             if (vaddr_start < res.load_min) res.load_min = vaddr_start;

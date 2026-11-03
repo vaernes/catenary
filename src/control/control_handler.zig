@@ -61,6 +61,7 @@ fn sendControlReply(
     );
 
     const msg_page = try dipc.allocPageMessage(hhdm_offset, request_hdr.dst, request_hdr.src, payload[0..]);
+    errdefer dipc.freePageMessage(msg_page);
     _ = try router.routePageWithLocalNode(hhdm_offset, table, msg_page);
 }
 
@@ -90,29 +91,29 @@ fn computeNodeIdentityTrustTag(manifest: *const trust.KernelManifest, addr: dipc
 fn serviceMaskFor(table: *const endpoint_table.EndpointTable) u32 {
     var mask: u32 = 0;
 
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.netd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.netd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.netd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.netd)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.storaged)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.storaged)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.storaged)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.storaged)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.dashd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.dashd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.dashd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.dashd)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.containerd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.containerd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.containerd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.containerd)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.clusterd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.clusterd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.clusterd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.clusterd)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.inputd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.inputd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.inputd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.inputd)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.windowd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.windowd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.windowd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.windowd)));
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.configd)) != null) {
-        mask |= @as(u32, 1) << @as(u5, @intCast(@intFromEnum(service_bootstrap.ServiceKind.configd)));
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.configd)) != null) {
+        mask |= @as(u32, 1) << @as(u5, @intCast(@backingInt(service_bootstrap.ServiceKind.configd)));
     }
 
     return mask;
@@ -127,20 +128,20 @@ fn nodeFlagsFor(table: *const endpoint_table.EndpointTable) u32 {
     flags |= control_protocol.NODE_FLAG_CLUSTER_CAPABLE;
     if (build_options.vmm_active) flags |= control_protocol.NODE_FLAG_VMM_ACTIVE;
 
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.netd)) != null) {
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.netd)) != null) {
         flags |= control_protocol.NODE_FLAG_NETD_REGISTERED;
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.storaged)) != null) {
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.storaged)) != null) {
         flags |= control_protocol.NODE_FLAG_STORAGE_REGISTERED;
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.dashd)) != null) {
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.dashd)) != null) {
         flags |= control_protocol.NODE_FLAG_DASHD_REGISTERED;
         flags |= control_protocol.NODE_FLAG_TELEMETRY_AVAILABLE;
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.clusterd)) != null) {
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.clusterd)) != null) {
         flags |= control_protocol.NODE_FLAG_CLUSTERD_REGISTERED;
     }
-    if (table.lookup(@intFromEnum(identity.ReservedEndpoint.configd)) != null) {
+    if (table.lookup(@backingInt(identity.ReservedEndpoint.configd)) != null) {
         flags |= control_protocol.NODE_FLAG_CONFIGD_REGISTERED;
     }
 
@@ -153,7 +154,7 @@ fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.C
         serialWrite("Control: reject: src_node mismatch\n");
         return false;
     }
-    if (hdr.src.endpoint != @intFromEnum(identity.ReservedEndpoint.netd)) {
+    if (hdr.src.endpoint != @backingInt(identity.ReservedEndpoint.netd)) {
         serialWrite("Control: reject: src_endpoint mismatch\n");
         return false;
     }
@@ -162,9 +163,9 @@ fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.C
 
 fn isAuthorizedMicrovmSource(hdr: *const dipc.PageHeader) bool {
     const ep = hdr.src.endpoint;
-    return ep == @intFromEnum(identity.ReservedEndpoint.clusterd) or
-        ep == @intFromEnum(identity.ReservedEndpoint.windowd) or
-        ep == @intFromEnum(identity.ReservedEndpoint.configd);
+    return ep == @backingInt(identity.ReservedEndpoint.clusterd) or
+        ep == @backingInt(identity.ReservedEndpoint.windowd) or
+        ep == @backingInt(identity.ReservedEndpoint.configd);
 }
 
 pub fn handleKernelControlPage(
@@ -175,7 +176,7 @@ pub fn handleKernelControlPage(
     const hdr = dipc.headerFromPage(hhdm_offset, page_phys);
     if (hdr.magic != dipc.WireMagic or hdr.version != dipc.WireVersion) return error.BadHeader;
     if (!dipc.verifyPageAuth(hhdm_offset, page_phys)) return error.BadHeader;
-    if (hdr.dst.endpoint != @intFromEnum(identity.ReservedEndpoint.kernel_control)) return error.NotForKernel;
+    if (hdr.dst.endpoint != @backingInt(identity.ReservedEndpoint.kernel_control)) return error.NotForKernel;
 
     const payload_len = @as(usize, hdr.payload_len);
     if (payload_len < @sizeOf(control_protocol.ControlHeader)) return error.BadPayload;
@@ -344,17 +345,21 @@ pub fn handleKernelControlPage(
             const table_const: *const endpoint_table.EndpointTable = table;
             const clusterd_dst = dipc.Address{
                 .node = node_config.getLocalNode(),
-                .endpoint = @intFromEnum(identity.ReservedEndpoint.clusterd),
+                .endpoint = @backingInt(identity.ReservedEndpoint.clusterd),
             };
             const configd_dst = dipc.Address{
                 .node = node_config.getLocalNode(),
-                .endpoint = @intFromEnum(identity.ReservedEndpoint.configd),
+                .endpoint = @backingInt(identity.ReservedEndpoint.configd),
             };
             if (dipc.allocPageMessage(hhdm_offset, hdr.src, clusterd_dst, fwd_payload)) |fwd_page| {
-                _ = router.routePageWithLocalNode(hhdm_offset, table_const, fwd_page) catch {};
+                _ = router.routePageWithLocalNode(hhdm_offset, table_const, fwd_page) catch {
+                    dipc.freePageMessage(fwd_page);
+                };
             } else |_| {}
             if (dipc.allocPageMessage(hhdm_offset, hdr.src, configd_dst, fwd_payload)) |fwd_page| {
-                _ = router.routePageWithLocalNode(hhdm_offset, table_const, fwd_page) catch {};
+                _ = router.routePageWithLocalNode(hhdm_offset, table_const, fwd_page) catch {
+                    dipc.freePageMessage(fwd_page);
+                };
             } else |_| {}
         },
         // poll_netd_inbox and assign_node_addr are handled directly in the trap bridge
@@ -366,6 +371,7 @@ pub fn handleKernelControlPage(
                 .addr = node_config.getLocalNode(),
             };
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            errdefer dipc.freePageMessage(msg_page);
             const table_const: *const endpoint_table.EndpointTable = table;
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
@@ -379,11 +385,12 @@ pub fn handleKernelControlPage(
                 .manifest_version = if (manifest_valid) manifest.version else 0,
                 .service_hash_count = if (manifest_valid) countManifestServiceHashes(manifest) else 0,
                 .flags = nodeFlagsFor(table),
-                .kernel_hash = if (manifest_valid) manifest.kernel_hash else [_]u8{0} ** 32,
+                .kernel_hash = if (manifest_valid) manifest.kernel_hash else @splat(0),
                 .trust_tag = if (manifest_valid) computeNodeIdentityTrustTag(manifest, addr) else 0,
             };
 
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            errdefer dipc.freePageMessage(msg_page);
             const table_const: *const endpoint_table.EndpointTable = table;
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
@@ -396,10 +403,15 @@ pub fn handleKernelControlPage(
                 .instance_id = 0,
             };
             const table_const: *const endpoint_table.EndpointTable = table;
+            const microvm_registry = @import("../vmm/microvm_registry.zig");
 
             if (build_options.vmm_active and build_options.services_active) {
                 const vmx = @import("../arch/x86_64/vmx.zig");
                 if (vmx.launchStagedInstance()) |id| {
+                    if (microvm_registry.findMutable(id)) |inst| {
+                        if (p.name[0] != 0) inst.name = p.name;
+                        if (p.container[0] != 0) inst.container = p.container;
+                    }
                     serialWrite("kernel_control: staged MicroVM launched via DIPC\n");
                     reply.status = .ok;
                     reply.instance_id = id;
@@ -408,8 +420,10 @@ pub fn handleKernelControlPage(
                 } else |_| {}
             }
 
-            const microvm_registry = @import("../vmm/microvm_registry.zig");
             if (microvm_registry.create(p.name, p.container, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
+                if (hdr.src.endpoint == @backingInt(identity.ReservedEndpoint.windowd)) {
+                    _ = microvm_registry.start(id);
+                }
                 serialWrite("configd: MicroVM created via DIPC\n");
                 reply.status = .ok;
                 reply.instance_id = id;
@@ -452,7 +466,7 @@ pub fn handleKernelControlPage(
                     if (res.count < control_protocol.MAX_VM_SNAPSHOT_ENTRIES) {
                         res.entries[res.count] = .{
                             .instance_id = inst.instance_id,
-                            .state = @intFromEnum(inst.state),
+                            .state = @backingInt(inst.state),
                             .mem_pages = inst.mem_pages,
                             .vcpus = inst.vcpus,
                             .cpu_cycles = inst.cpu_cycles,
@@ -466,6 +480,7 @@ pub fn handleKernelControlPage(
             }
 
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            errdefer dipc.freePageMessage(msg_page);
             const table_const: *const endpoint_table.EndpointTable = table;
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },
@@ -493,6 +508,7 @@ pub fn handleKernelControlPage(
             }
 
             const msg_page = try dipc.allocPageMessage(hhdm_offset, hdr.dst, hdr.src, std.mem.asBytes(&res));
+            errdefer dipc.freePageMessage(msg_page);
             const table_const: *const endpoint_table.EndpointTable = table;
             _ = try router.routePageWithLocalNode(hhdm_offset, table_const, msg_page);
         },

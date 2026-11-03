@@ -178,7 +178,7 @@ fn writeE820Entry(page: []u8, index: usize, addr: u64, size: u64, entry_type: u3
 
 pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, cmdline: []const u8, guest_ram_bytes: u64, initrd_gpa: u64, initrd_size: u64) [zero_page_size]u8 {
     _ = cmdline;
-    var page: [zero_page_size]u8 = [_]u8{0} ** zero_page_size;
+    var page: [zero_page_size]u8 = @splat(0);
     const template = bootParamsTemplate(parsed);
     std.mem.copyForwards(u8, page[setup_header_offset .. setup_header_offset + template.len], template);
 

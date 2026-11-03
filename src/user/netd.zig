@@ -105,11 +105,11 @@ const DIPC_RECV_VA: u64 = lib.DIPC_RECV_VA;
 const DMA_BASE_VA: u64 = lib.DMA_BASE_VA;
 const PAGE_SIZE: u64 = lib.PAGE_SIZE;
 const DEFAULT_LINK_MTU: u16 = 1500;
-const NETD_ENDPOINT: u64 = @intFromEnum(lib.ReservedEndpoint.netd);
-const NETD_SERVICE_MASK: u32 = @as(u32, 1) << @as(u5, @intCast(@intFromEnum(lib.ServiceKind.netd)));
+const NETD_ENDPOINT: u64 = @backingInt(lib.ReservedEndpoint.netd);
+const NETD_SERVICE_MASK: u32 = @as(u32, 1) << @as(u5, @intCast(@backingInt(lib.ServiceKind.netd)));
 
-var g_wire_frame_buf: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
-var g_icmp_frame_buf: [PAGE_SIZE]u8 = [_]u8{0} ** PAGE_SIZE;
+var g_wire_frame_buf: [PAGE_SIZE]u8 = @splat(0);
+var g_icmp_frame_buf: [PAGE_SIZE]u8 = @splat(0);
 
 // PCI config read via kernel syscall
 fn pciRead(bus: u8, dev: u8, func: u8, off: u8, size: u8, token: u64) u64 {
@@ -220,8 +220,8 @@ const IPV6_ALL_NODES_MULTICAST: [16]u8 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 
 
 // State globals
 var g_io_base: u16 = 0;
-var g_our_mac: [6]u8 = [_]u8{0} ** 6;
-var g_our_ipv6: [16]u8 = [_]u8{0} ** 16;
+var g_our_mac: [6]u8 = @splat(0);
+var g_our_ipv6: [16]u8 = @splat(0);
 var g_rx_last_used: u16 = 0;
 var g_tx_last_used: u16 = 0;
 var g_tx_avail_idx: u16 = 0;
@@ -262,24 +262,24 @@ fn releaseTcpLock() void {
 const NEIGHBOR_CACHE_SIZE: usize = 32;
 const NeighborEntry = struct {
     valid: bool = false,
-    ipv6: [16]u8 = [_]u8{0} ** 16,
-    mac: [6]u8 = [_]u8{0} ** 6,
+    ipv6: [16]u8 = @splat(0),
+    mac: [6]u8 = @splat(0),
 };
-var g_neighbor_cache: [NEIGHBOR_CACHE_SIZE]NeighborEntry = [_]NeighborEntry{.{}} ** NEIGHBOR_CACHE_SIZE;
+var g_neighbor_cache: [NEIGHBOR_CACHE_SIZE]NeighborEntry = @splat(.{});
 var g_neighbor_evict: usize = 0; // round-robin eviction index
 
 const PEER_TABLE_SIZE: usize = netd_proto.MAX_PEER_SNAPSHOT_ENTRIES;
 const PeerEntry = struct {
     valid: bool = false,
-    node_addr: [16]u8 = [_]u8{0} ** 16,
+    node_addr: [16]u8 = @splat(0),
     service_mask: u32 = 0,
     mtu: u16 = 0,
     flags: u16 = 0,
-    mac: [6]u8 = [_]u8{0} ** 6,
-    next_hop: [16]u8 = [_]u8{0} ** 16,
+    mac: [6]u8 = @splat(0),
+    next_hop: [16]u8 = @splat(0),
 };
 
-var g_peer_table: [PEER_TABLE_SIZE]PeerEntry = [_]PeerEntry{.{}} ** PEER_TABLE_SIZE;
+var g_peer_table: [PEER_TABLE_SIZE]PeerEntry = @splat(.{});
 var g_peer_evict: usize = 0;
 
 fn ipv6Eq(a: *const [16]u8, b: *const [16]u8) bool {
@@ -834,7 +834,7 @@ fn sendNeighborAdvertisement(
     target_ip: *const [16]u8,
 ) void {
     // Ethernet (14) + IPv6 (40) + ICMPv6 NA (24) + option TLL (8) = 86 bytes.
-    var frame: [86]u8 = [_]u8{0} ** 86;
+    var frame: [86]u8 = @splat(0);
     // Ethernet header
     @memcpy(frame[0..6], dst_mac);
     @memcpy(frame[6..12], &g_our_mac);
@@ -873,7 +873,7 @@ fn sendNeighborAdvertisement(
 // Send an ICMPv6 Neighbor Solicitation for target_ipv6 so we can learn its MAC.
 fn sendNeighborSolicitation(target_ipv6: *const [16]u8) void {
     // Solicited-node multicast: ff02::1:ffXX:XXXX (last 3 bytes of target)
-    var sol_mcast: [16]u8 = [_]u8{0} ** 16;
+    var sol_mcast: [16]u8 = @splat(0);
     sol_mcast[0] = 0xff;
     sol_mcast[1] = 0x02;
     sol_mcast[11] = 0x01;
@@ -885,7 +885,7 @@ fn sendNeighborSolicitation(target_ipv6: *const [16]u8) void {
     const dst_mac = [6]u8{ 0x33, 0x33, 0xff, target_ipv6[13], target_ipv6[14], target_ipv6[15] };
 
     // ICMPv6 NS: type(1)+code(1)+cksum(2)+reserved(4)+target(16)+SLLAO(8) = 32 bytes
-    var icmp: [32]u8 = [_]u8{0} ** 32;
+    var icmp: [32]u8 = @splat(0);
     icmp[0] = 135; // NS
     @memcpy(icmp[8..24], target_ipv6);
     icmp[24] = 1;
@@ -895,7 +895,7 @@ fn sendNeighborSolicitation(target_ipv6: *const [16]u8) void {
     icmp[2] = @truncate(ck >> 8);
     icmp[3] = @truncate(ck);
 
-    var frame: [86]u8 = [_]u8{0} ** 86;
+    var frame: [86]u8 = @splat(0);
     @memcpy(frame[0..6], &dst_mac);
     @memcpy(frame[6..12], &g_our_mac);
     frame[12] = 0x86;
@@ -1009,7 +1009,7 @@ fn publishKernelNodeAddress(bs: *const BootstrapDescriptor, token: u64) bool {
 
     const ok = lib.syscall(SYS_SEND_PAGE, g_tx_dipc_scratch_phys, 0, token) == 0;
     if (ok) {
-        sendNodeAddrReply(&g_our_ipv6, @intFromEnum(lib.ReservedEndpoint.clusterd));
+        sendNodeAddrReply(&g_our_ipv6, @backingInt(lib.ReservedEndpoint.clusterd));
     }
     return ok;
 }
@@ -1026,8 +1026,8 @@ pub const Socket = struct {
     state: tcp.State = .closed,
     local_port: u16 = 0,
     remote_port: u16 = 0,
-    remote_ip: [16]u8 = [_]u8{0} ** 16,
-    remote_mac: [6]u8 = [_]u8{0} ** 6,
+    remote_ip: [16]u8 = @splat(0),
+    remote_mac: [6]u8 = @splat(0),
     iss: u32 = 0,
     snd_una: u32 = 0,
     snd_nxt: u32 = 0,
@@ -1036,12 +1036,12 @@ pub const Socket = struct {
     rcv_nxt: u32 = 0,
     rcv_wnd: u16 = tcp.DEFAULT_WINDOW_SIZE,
     owner_endpoint: u64 = 0,
-    owner_node: [16]u8 = [_]u8{0} ** 16,
-    rx_buf: [2048]u8 = [_]u8{0} ** 2048,
+    owner_node: [16]u8 = @splat(0),
+    rx_buf: [2048]u8 = @splat(0),
     rx_len: usize = 0,
 };
 
-var g_tcp_sockets: [TCP_MAX_SOCKETS]Socket = [_]Socket{.{}} ** TCP_MAX_SOCKETS;
+var g_tcp_sockets: [TCP_MAX_SOCKETS]Socket = @splat(.{});
 var g_tcp_next_id: u32 = 1;
 var g_tcp_ephemeral_port: u16 = 49152;
 var g_isn_seed: u32 = 0x51A7_8C3D;
@@ -1206,7 +1206,7 @@ fn sendTcpRecvToOwner(sock: *Socket, data: []const u8) void {
         .data_len = @as(u16, @intCast(data.len)),
         ._pad = 0,
     };
-    @memcpy(buf[@sizeOf(netd_proto.TcpRecvPayload) .. total_len], data);
+    @memcpy(buf[@sizeOf(netd_proto.TcpRecvPayload)..total_len], data);
     _ = sendNetdMessageRx(&sock.owner_node, sock.owner_endpoint, .tcp_recv, buf[0..total_len]);
 }
 
@@ -1392,12 +1392,12 @@ fn handleTcpStatus(page_hdr: *align(1) const lib.PageHeader, payload_va: u64, pa
         .state = 0,
         .local_port = 0,
         .remote_port = 0,
-        .remote_ip = [_]u8{0} ** 16,
+        .remote_ip = @splat(0),
         .rx_buffered = 0,
     };
 
     if (findTcpSocketById(req.socket_id)) |sock| {
-        reply.state = @intFromEnum(sock.state);
+        reply.state = @backingInt(sock.state);
         reply.local_port = sock.local_port;
         reply.remote_port = sock.remote_port;
         @memcpy(&reply.remote_ip, &sock.remote_ip);
@@ -1866,7 +1866,7 @@ pub export fn umain() noreturn {
         }
         seedSyntheticMac(token, &g_our_mac);
         deriveLinkLocal(&g_our_mac, &g_our_ipv6);
-        _ = lib.syscall(SYS_REGISTER, 0, @intFromEnum(lib.ReservedEndpoint.netd), token);
+        _ = lib.syscall(SYS_REGISTER, 0, @backingInt(lib.ReservedEndpoint.netd), token);
         lib.serialWrite("netd: registered\n");
         while (true) {
             if (!pollDipc(token)) {
@@ -1969,7 +1969,7 @@ pub export fn umain() noreturn {
     lib.serialWrite("netd: stage driver_ok\n");
     fillRxQueue();
 
-    _ = lib.syscall(SYS_REGISTER, 0, @intFromEnum(lib.ReservedEndpoint.netd), token);
+    _ = lib.syscall(SYS_REGISTER, 0, @backingInt(lib.ReservedEndpoint.netd), token);
     lib.serialWrite("netd: registered\n");
 
     lib.serialWrite("netd: publishing kernel node address...\n");

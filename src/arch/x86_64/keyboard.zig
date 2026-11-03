@@ -7,21 +7,67 @@ const KBD_STATUS_PORT: u16 = 0x64;
 var kbd_ring_buf: [256]u8 = undefined;
 var kbd_ring_head: u8 = 0;
 var kbd_ring_tail: u8 = 0;
+var kbd_lock: bool = false;
+
+fn acquireKbdLock() u64 {
+    var flags: u64 = 0;
+    asm volatile (
+        \\pushfq
+        \\popq %[flags]
+        \\cli
+        : [flags] "=r" (flags),
+    );
+    while (@atomicRmw(bool, &kbd_lock, .Xchg, true, .seq_cst)) {
+        asm volatile ("pause");
+    }
+    return flags;
+}
+
+fn releaseKbdLock(flags: u64) void {
+    @atomicStore(bool, &kbd_lock, false, .seq_cst);
+    asm volatile (
+        \\pushq %[flags]
+        \\popfq
+        :
+        : [flags] "r" (flags),
+    );
+}
+
+fn drainControllerLocked() void {
+    while ((cpu.inb(KBD_STATUS_PORT) & 0x01) != 0) {
+        const scancode = cpu.inb(KBD_DATA_PORT);
+        const next = kbd_ring_head +% 1;
+        if (next != kbd_ring_tail) {
+            kbd_ring_buf[kbd_ring_head] = scancode;
+            kbd_ring_head = next;
+        }
+    }
+}
 
 pub fn init() void {
-    // Basic PS/2 keyboard initialization if needed.
-    // Most BIOS/UEFI leave it in a usable state.
+    // Basic PS/2 keyboard initialization.
     idt.setGate(0x21, keyboardInterrupt, 0x8E);
+
+    // Drain any leftover data in controller buffer
+    while ((cpu.inb(KBD_STATUS_PORT) & 0x01) != 0) {
+        _ = cpu.inb(KBD_DATA_PORT);
+    }
+
+    // Enable first PS/2 port
+    cpu.outb(KBD_STATUS_PORT, 0xAE);
 }
 
 pub fn getChar() ?u8 {
-    if (kbd_ring_head == kbd_ring_tail) return null;
-    const scancode = kbd_ring_buf[kbd_ring_tail];
-    kbd_ring_tail +%= 1;
+    const scancode = getRawScancode() orelse return null;
     return scancodeToAscii(scancode);
 }
 
 pub fn getRawScancode() ?u8 {
+    const flags = acquireKbdLock();
+    defer releaseKbdLock(flags);
+    if (kbd_ring_head == kbd_ring_tail) {
+        drainControllerLocked();
+    }
     if (kbd_ring_head == kbd_ring_tail) return null;
     const scancode = kbd_ring_buf[kbd_ring_tail];
     kbd_ring_tail +%= 1;
@@ -75,17 +121,10 @@ fn scancodeToAscii(scancode: u8) ?u8 {
 }
 
 pub export fn catenary_keyboardInterruptBridge() callconv(.c) void {
-    const status = cpu.inb(KBD_STATUS_PORT);
-    if ((status & 0x01) != 0) {
-        const scancode = cpu.inb(KBD_DATA_PORT);
-        // Forward every byte (make, break, and 0xE0 extended prefixes) so the
-        // Ring-3 input daemon can track modifier state and extended keys.
-        // Drop on overflow rather than overwriting unread scancodes.
-        const next = kbd_ring_head +% 1;
-        if (next != kbd_ring_tail) {
-            kbd_ring_buf[kbd_ring_head] = scancode;
-            kbd_ring_head = next;
-        }
+    {
+        const flags = acquireKbdLock();
+        defer releaseKbdLock(flags);
+        drainControllerLocked();
     }
     cpu.outb(0x20, 0x20); // Send EOI to master PIC
 }

@@ -137,8 +137,8 @@ pub const MAX_RESOURCE_SNAPSHOT_ENTRIES: usize = 16;
 pub const ResourceSnapshotReply = extern struct {
     count: u32,
     _pad: u32 = 0,
-    entries: [MAX_RESOURCE_SNAPSHOT_ENTRIES]ResourceSnapshotEntry = [_]ResourceSnapshotEntry{.{
-        .node_addr = [_]u8{0} ** 16,
+    entries: [MAX_RESOURCE_SNAPSHOT_ENTRIES]ResourceSnapshotEntry = @splat(.{
+        .node_addr = @splat(0),
         .resources = .{
             .generation = 0,
             .total_mem_pages = 0,
@@ -149,14 +149,14 @@ pub const ResourceSnapshotReply = extern struct {
             .service_mask = 0,
             .flags = 0,
         },
-    }} ** MAX_RESOURCE_SNAPSHOT_ENTRIES,
+    }),
 };
 
 /// Op.vm_list_reply — compact VM snapshot list for dashboard queries.
 pub const VmEntry = extern struct {
     instance_id: u32,
     state: u8,
-    _pad: [3]u8 = [_]u8{0} ** 3,
+    _pad: [3]u8 = @splat(0),
     mem_pages: u32,
     vcpus: u32,
     name: [32]u8,

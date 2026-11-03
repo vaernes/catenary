@@ -26,8 +26,8 @@ pub const Instance = struct {
     in_use: bool = false,
     instance_id: u32 = 0,
     state: MicrovmState = .empty,
-    name: [32]u8 = [_]u8{0} ** 32,
-    container: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @splat(0),
+    container: [32]u8 = @splat(0),
     /// Guest RAM size in 4 KiB pages (e.g. 16384 = 64 MiB).
     mem_pages: u32 = 0,
     vcpus: u32 = 1,
@@ -123,12 +123,12 @@ pub fn create(name: [32]u8, container: [32]u8, mem_pages: u32, vcpus: u32, kerne
     return null;
 }
 
-/// Transition a created instance to running.  Returns false if the instance
-/// does not exist or is not in the `created` state.
+/// Transition a created or stopped instance to running.  Returns false if the
+/// instance does not exist or is not in the `created` or `stopped` state.
 pub fn start(instance_id: u32) bool {
     ensureInit();
     const slot = findMutable(instance_id) orelse return false;
-    if (slot.state != .created) return false;
+    if (slot.state != .created and slot.state != .stopped) return false;
     slot.state = .running;
     return true;
 }

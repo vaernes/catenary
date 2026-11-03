@@ -120,6 +120,7 @@ pub fn build(b: *std.Build) void {
         kernel_tests.use_llvm = true;
         kernel_tests.use_lld = true;
         kernel_tests.root_module.addAssemblyFile(b.path("src/arch/x86_64/switch_context.S"));
+        kernel_tests.root_module.addAssemblyFile(b.path("src/arch/x86_64/tables.S"));
     }
 
     const run_kernel_tests = b.addRunArtifact(kernel_tests);

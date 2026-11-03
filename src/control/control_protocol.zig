@@ -191,7 +191,7 @@ pub const ListVmsRequest = extern struct {
 pub const VmSnapshotEntry = extern struct {
     instance_id: u32,
     state: u8,
-    _pad: [3]u8 = [_]u8{0} ** 3,
+    _pad: [3]u8 = @splat(0),
     mem_pages: u32,
     vcpus: u32,
     cpu_cycles: u64,
@@ -206,16 +206,16 @@ pub const VmSnapshotListPayload = extern struct {
     count: u32,
     _pad: u32 = 0,
     entries: [MAX_VM_SNAPSHOT_ENTRIES]VmSnapshotEntry =
-        [_]VmSnapshotEntry{.{
+        @splat(.{
             .instance_id = 0,
             .state = 0,
             .mem_pages = 0,
             .vcpus = 0,
             .cpu_cycles = 0,
             .exit_count = 0,
-            .name = [_]u8{0} ** 32,
-            .container = [_]u8{0} ** 32,
-        }} ** MAX_VM_SNAPSHOT_ENTRIES,
+            .name = @splat(0),
+            .container = @splat(0),
+        }),
 };
 
 pub const NodeAddrResult = extern struct {

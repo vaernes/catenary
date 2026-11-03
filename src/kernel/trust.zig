@@ -5,7 +5,7 @@ pub const MAX_SERVICE_HASHES: usize = 16;
 
 pub const ServiceHash = struct {
     kind: service_bootstrap.ServiceKind = .netd,
-    hash: [32]u8 = [_]u8{0} ** 32,
+    hash: [32]u8 = @splat(0),
     is_valid: bool = false,
 };
 
@@ -20,8 +20,8 @@ pub const KernelManifest = struct {
     // Future placeholders for measured boot
     load_address_virtual: u64,
     entry_point_virtual: u64,
-    kernel_hash: [32]u8 = [_]u8{0} ** 32,
-    service_hashes: [MAX_SERVICE_HASHES]ServiceHash = [_]ServiceHash{.{}} ** MAX_SERVICE_HASHES,
+    kernel_hash: [32]u8 = @splat(0),
+    service_hashes: [MAX_SERVICE_HASHES]ServiceHash = @splat(.{}),
 
     pub fn report(self: KernelManifest, serialWrite: *const fn ([]const u8) void, printHex: *const fn (u64) void) void {
         serialWrite("--- KERNEL TRUST MANIFEST ---\n");

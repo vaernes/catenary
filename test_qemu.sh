@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+if [ -d "/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_64-linux-0.17.0" ]; then
+    export PATH="/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_64-linux-0.17.0:$PATH"
+fi
+
 # Catenary OS smoke test:
 # - boots Catenary OS under QEMU
 # - launches the nested-VMX path
@@ -33,9 +37,13 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
         DEFAULT_VMX_LINUX_PATTERNS="kernel_control: staged MicroVM launched via DIPC;VMX: entering guest via vmlaunch;Linux version;Catenary OS Guest Init: SUCCESS;guest_rootfs: init started"
         ;;
+    ui-phase8)
+        DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false"
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;windowd: input event received;[UI] MicroVM provisioned: alpine-node-01;varde_shell: executed 'ps';varde_shell: executed 'vmlist';varde_shell: executed 'cluster';varde_shell: executed 'net-stat';varde_shell: executed 'storage-stat'"
+        ;;
     *)
         echo "[!] Unknown SMOKE_PROFILE: ${SMOKE_PROFILE}" >&2
-        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services" >&2
+        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8" >&2
         exit 2
         ;;
 esac
@@ -84,7 +92,7 @@ xorriso -as mkisofs -b limine-bios-cd.bin \
 
 ./limine/limine bios-install catenary.iso
 
-rm -f qemu_serial.log qemu.pid
+rm -f qemu_serial.log qemu.pid /tmp/catenary_qemu_mon.sock
 
 ACCEL="tcg"
 CPU="max,vmx=on"
@@ -110,6 +118,7 @@ GTK_PATH= qemu-system-x86_64 \
     -cdrom catenary.iso -boot d \
     -chardev file,id=s0,path=qemu_serial.log \
     -serial chardev:s0 \
+    -monitor unix:/tmp/catenary_qemu_mon.sock,server,nowait \
     -display none \
     -pidfile qemu.pid \
     -no-reboot \
@@ -121,8 +130,36 @@ cleanup() {
     if [ -f qemu.pid ]; then
         kill "$(cat qemu.pid)" >/dev/null 2>&1 || true
     fi
+    rm -f /tmp/catenary_qemu_mon.sock
 }
 trap cleanup EXIT
+
+ui_keys_injected=0
+inject_ui_phase8_keys() {
+    python3 -c '
+import socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect("/tmp/catenary_qemu_mon.sock")
+time.sleep(0.2)
+def send_keys(keys, delay=0.12):
+    for k in keys:
+        s.sendall(f"sendkey {k}\n".encode())
+        time.sleep(delay)
+
+# 1. Step through MicroVM Provisioning Form fields (name -> vcpus -> memory -> kernel -> rootfs -> create_btn) and trigger CREATE & LAUNCH
+send_keys(["ret", "ret", "ret", "ret", "ret", "ret"], 0.15)
+time.sleep(0.3)
+
+# 2. Switch to Varde Shell pane (F4) and execute Phase 8 shell commands
+send_keys(["f4"], 0.2)
+for cmd in ["ps", "vmlist", "cluster", "net-stat", "storage-stat"]:
+    keys = ["minus" if ch == "-" else ch for ch in cmd] + ["ret"]
+    send_keys(keys, 0.08)
+    time.sleep(0.2)
+s.close()
+'
+}
 
 echo "[+] Waiting for all milestones (timeout ${TIMEOUT_SECS}s)..."
 ok=0
@@ -151,6 +188,13 @@ fi
 
 for ((i=0; i<${TIMEOUT_SECS}; i++)); do
     if [ -f qemu_serial.log ]; then
+        if [ "${SMOKE_PROFILE}" = "ui-phase8" ] && [ "${ui_keys_injected}" -eq 0 ]; then
+            if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "configd: MicroVM created via DIPC"; then
+                echo "[+] Injecting Phase 8 UI & Varde Shell keystrokes via QEMU monitor..."
+                inject_ui_phase8_keys
+                ui_keys_injected=1
+            fi
+        fi
         all_found=1
         for p in "${required_patterns[@]}"; do
             if [ -z "${p}" ]; then

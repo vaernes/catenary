@@ -102,7 +102,7 @@ pub const NetdHeader = extern struct {
 pub const TransmitPayload = extern struct {
     /// Length of the raw frame (bytes), excluding this header.
     frame_len: u16,
-    _pad: [6]u8 = [_]u8{0} ** 6,
+    _pad: [6]u8 = @splat(0),
 };
 
 /// Op.node_addr_reply — netd's response to a get_node_addr query.
@@ -115,7 +115,7 @@ pub const RouteUpdatePayload = extern struct {
     prefix: [16]u8, // IPv6 network prefix
     prefix_len: u8, // CIDR prefix length (0–128)
     action: u8, // 0 = remove, 1 = add
-    _pad: [6]u8 = [_]u8{0} ** 6,
+    _pad: [6]u8 = @splat(0),
     next_hop: [16]u8, // IPv6 next-hop (or :: for on-link)
 };
 
@@ -139,7 +139,7 @@ pub const PeerAnnouncementPayload = extern struct {
     mtu: u16,
     flags: u16,
     mac: [6]u8,
-    _pad: [2]u8 = [_]u8{0} ** 2,
+    _pad: [2]u8 = @splat(0),
 };
 
 pub const PeerSnapshotRequest = extern struct {
@@ -153,7 +153,7 @@ pub const PeerSnapshotEntry = extern struct {
     mtu: u16,
     flags: u16,
     mac: [6]u8,
-    _pad: [2]u8 = [_]u8{0} ** 2,
+    _pad: [2]u8 = @splat(0),
 };
 
 pub const MAX_PEER_SNAPSHOT_ENTRIES: usize = 16;
@@ -161,13 +161,13 @@ pub const MAX_PEER_SNAPSHOT_ENTRIES: usize = 16;
 pub const PeerSnapshotReply = extern struct {
     count: u32,
     _pad: u32 = 0,
-    entries: [MAX_PEER_SNAPSHOT_ENTRIES]PeerSnapshotEntry = [_]PeerSnapshotEntry{.{
-        .node_addr = [_]u8{0} ** 16,
+    entries: [MAX_PEER_SNAPSHOT_ENTRIES]PeerSnapshotEntry = @splat(.{
+        .node_addr = @splat(0),
         .service_mask = 0,
         .mtu = 0,
         .flags = 0,
-        .mac = [_]u8{0} ** 6,
-    }} ** MAX_PEER_SNAPSHOT_ENTRIES,
+        .mac = @splat(0),
+    }),
 };
 
 // ---------------------------------------------------------------------------
@@ -253,10 +253,9 @@ pub const TcpStatusPayload = extern struct {
 pub const TcpStatusReplyPayload = extern struct {
     socket_id: u32,
     state: u8,
-    _pad: [3]u8 = [_]u8{0} ** 3,
+    _pad: [3]u8 = @splat(0),
     local_port: u16,
     remote_port: u16,
-    remote_ip: [16]u8 = [_]u8{0} ** 16,
+    remote_ip: [16]u8 = @splat(0),
     rx_buffered: u32 = 0,
 };
-

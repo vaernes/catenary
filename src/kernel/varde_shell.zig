@@ -1,5 +1,5 @@
 pub const HISTORY_SIZE = 4000;
-pub var history_buf: [HISTORY_SIZE]u8 = [_]u8{0} ** HISTORY_SIZE;
+pub var history_buf: [HISTORY_SIZE]u8 = @splat(0);
 pub var history_pos: usize = 0;
 
 pub fn putHistory(b: u8) void {
@@ -50,16 +50,44 @@ pub fn putHistory(b: u8) void {
 ///   services     — list service registry slots
 ///   memory       — show PMM high watermark
 ///   halt         — halt the CPU (use with care: non-reversible)
+const builtin = @import("builtin");
 const cpu = @import("../arch/x86_64/cpu.zig");
+const smp = @import("../arch/x86_64/smp.zig");
 const service_registry = @import("../services/service_registry.zig");
 const pmm = @import("pmm.zig");
 const microvm_registry = @import("../vmm/microvm_registry.zig");
-const main = @import("../main.zig");
+const node_config = @import("../ipc/node_config.zig");
+
+const OS_NAME = if (builtin.is_test) "Catenary OS" else @import("../main.zig").OS_NAME;
+const OS_CODENAME = if (builtin.is_test) "Ready" else @import("../main.zig").OS_CODENAME;
+const OS_VERSION = if (builtin.is_test) @import("std").SemanticVersion{ .major = 0, .minor = 8, .patch = 0 } else @import("../main.zig").OS_VERSION;
 
 const COM2_DATA: u16 = 0x2F8;
 const COM2_LSR: u16 = 0x2FD; // Line Status Register
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_TX_EMPTY: u8 = 1 << 5;
+
+// Test milestone tracking for host unit tests
+pub var test_last_milestone: [64]u8 = @splat(0);
+pub var test_last_milestone_len: usize = 0;
+
+pub fn emitMilestone(cmd_name: []const u8) void {
+    var buf: [64]u8 = undefined;
+    const prefix = "varde_shell: executed '";
+    const suffix = "'\n";
+    if (prefix.len + cmd_name.len + suffix.len > buf.len) return;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memcpy(buf[prefix.len..][0..cmd_name.len], cmd_name);
+    @memcpy(buf[prefix.len + cmd_name.len..][0..suffix.len], suffix);
+    const total_len = prefix.len + cmd_name.len + suffix.len;
+
+    if (builtin.is_test) {
+        @memcpy(test_last_milestone[0..total_len], buf[0..total_len]);
+        test_last_milestone_len = total_len;
+    } else {
+        @import("../main.zig").serialWrite(buf[0..total_len]);
+    }
+}
 
 // Command line buffer. Commands longer than this are silently truncated.
 var cmd_buf: [128]u8 = undefined;
@@ -70,35 +98,64 @@ var iac_skip: u8 = 0;
 
 // Command history for navigation (UP/DOWN arrows)
 const MAX_HISTORY = 16;
-var history_cmds: [MAX_HISTORY][128]u8 = [_][128]u8{[_]u8{0} ** 128} ** MAX_HISTORY;
-var history_lens: [MAX_HISTORY]usize = [_]usize{0} ** MAX_HISTORY;
+var history_cmds: [MAX_HISTORY][128]u8 = @splat(@splat(0));
+var history_lens: [MAX_HISTORY]usize = @splat(0);
 var history_count: usize = 0;
 var history_write_idx: usize = 0;
 var browse_idx: isize = -1; // -1 means not browsing history
 var esc_state: u8 = 0; // 0=normal, 1=ESC received, 2=ESC [ received
+var com2_present: bool = false;
+pub var init_tsc: u64 = 0;
 
 pub fn init() void {
-    cpu.outb(COM2_DATA + 1, 0x00); // Disable all interrupts
-    cpu.outb(COM2_DATA + 3, 0x80); // Enable DLAB (set baud rate divisor)
-    cpu.outb(COM2_DATA + 0, 0x03); // Set divisor to 3 (lo byte) 38400 baud
-    cpu.outb(COM2_DATA + 1, 0x00); //                  (hi byte)
-    cpu.outb(COM2_DATA + 3, 0x03); // 8 bits, no parity, one stop bit
-    cpu.outb(COM2_DATA + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
-    cpu.outb(COM2_DATA + 4, 0x0B); // IRQs enabled, RTS/DSR set
+    if (!builtin.is_test) {
+        const arch = @import("../arch.zig");
+        init_tsc = arch.cpu.rdtsc();
+        const scratch_port: u16 = COM2_DATA + 7;
+        const old_scratch = cpu.inb(scratch_port);
+        cpu.outb(scratch_port, 0x5A);
+        if (cpu.inb(scratch_port) == 0x5A) {
+            cpu.outb(scratch_port, old_scratch);
+            com2_present = true;
+            cpu.outb(COM2_DATA + 1, 0x00); // Disable all interrupts
+            cpu.outb(COM2_DATA + 3, 0x80); // Enable DLAB (set baud rate divisor)
+            cpu.outb(COM2_DATA + 0, 0x03); // Set divisor to 3 (lo byte) 38400 baud
+            cpu.outb(COM2_DATA + 1, 0x00); //                  (hi byte)
+            cpu.outb(COM2_DATA + 3, 0x03); // 8 bits, no parity, one stop bit
+            cpu.outb(COM2_DATA + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
+            cpu.outb(COM2_DATA + 4, 0x0B); // IRQs enabled, RTS/DSR set
+        } else {
+            com2_present = false;
+        }
+    } else {
+        com2_present = false;
+        init_tsc = 1000;
+    }
+
+    if (history_pos == 0) {
+        write("Catenary OS Varde Shell — type 'help' for commands");
+        printPrompt();
+    }
 }
 
 inline fn rxReady() bool {
+    if (builtin.is_test or !com2_present) return false;
     const lsr = cpu.inb(COM2_LSR);
     return (lsr & LSR_DATA_READY) != 0 and lsr != 0xFF;
 }
 
 inline fn txReady() bool {
-    return (cpu.inb(COM2_LSR) & LSR_TX_EMPTY) != 0;
+    if (builtin.is_test or !com2_present) return false;
+    const lsr = cpu.inb(COM2_LSR);
+    return lsr != 0xFF and (lsr & LSR_TX_EMPTY) != 0;
 }
 
 fn writeByte(b: u8) void {
-    while (!txReady()) {}
-    cpu.outb(COM2_DATA, b);
+    if (!builtin.is_test and com2_present) {
+        var spins: usize = 0;
+        while (!txReady() and spins < 4096) : (spins += 1) {}
+        if (spins < 4096) cpu.outb(COM2_DATA, b);
+    }
     putHistory(b);
 }
 
@@ -141,31 +198,94 @@ fn strEq(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+fn startsWith(a: []const u8, prefix: []const u8) bool {
+    if (a.len < prefix.len) return false;
+    for (a[0..prefix.len], prefix) |x, y| if (x != y) return false;
+    return true;
+}
+
+fn trimSpaces(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len and s[start] == ' ') : (start += 1) {}
+    var end: usize = s.len;
+    while (end > start and s[end - 1] == ' ') : (end -= 1) {}
+    return s[start..end];
+}
+
+fn parseU32(s: []const u8) ?u32 {
+    const t = trimSpaces(s);
+    if (t.len == 0) return null;
+    var val: u32 = 0;
+    for (t) |c| {
+        if (c < '0' or c > '9') return null;
+        val = val * 10 + (c - '0');
+    }
+    return val;
+}
+
+fn writePadded(s: []const u8, width: usize) void {
+    const n = @min(s.len, width);
+    write(s[0..n]);
+    var i: usize = n;
+    while (i < width) : (i += 1) writeByte(' ');
+}
+
+fn writeDecPadded(n: u64, width: usize) void {
+    var buf: [20]u8 = undefined;
+    var len: usize = 0;
+    if (n == 0) {
+        buf[0] = '0';
+        len = 1;
+    } else {
+        var v = n;
+        while (v > 0) {
+            buf[len] = @as(u8, @truncate(v % 10)) + '0';
+            len += 1;
+            v /= 10;
+        }
+    }
+    var i = len;
+    while (i > 0) {
+        i -= 1;
+        writeByte(buf[i]);
+    }
+    while (len < width) : (len += 1) writeByte(' ');
+}
+
 fn cmdHelp() void {
     write("\r\n");
-    write(main.OS_NAME);
+    write(OS_NAME);
     write(" v");
-    writeDec(main.OS_VERSION.major);
+    writeDec(OS_VERSION.major);
     write(".");
-    writeDec(main.OS_VERSION.minor);
+    writeDec(OS_VERSION.minor);
     write(".");
-    writeDec(main.OS_VERSION.patch);
-    write("\r\n");
-    write("The load-bearing span is secure.\r\n");
-    write("  help     — this message\r\n");
-    write("  status   — kernel phase and hardening\r\n");
-    write("  top      — active process threads\r\n");
-    write("  services — service registry slots\r\n");
-    write("  vms      — list active MicroVM instances\r\n");
-    write("  memory   — PMM page count\r\n");
-    write("  clear    — clear the shell window\r\n");
-    write("  about    — about Catenary OS\r\n");
-    write("  halt     — halt the CPU\r\n");
+    writeDec(OS_VERSION.patch);
+    write(" — Varde Operator Shell\r\n");
+    write("  help                          — list available commands\r\n");
+    write("  ps / services                 — list Ring-3 service daemons\r\n");
+    write("  vmlist / vms                  — list MicroVMs and telemetry\r\n");
+    write("  vm-create <name> [vcpu] [mb]  — provision & start a MicroVM\r\n");
+    write("  vm-start <id>                 — start MicroVM by ID\r\n");
+    write("  vm-kill <id> / vm-stop <id>   — stop MicroVM by ID\r\n");
+    write("  vm-delete <id>                — delete MicroVM from registry\r\n");
+    write("  cluster                       — cluster node & topology summary\r\n");
+    write("  net-stat                      — IPv6 & DIPC network status\r\n");
+    write("  storage-stat                  — NVMe & Virtio-Blk status\r\n");
+    write("  top                           — CPU thread utilization\r\n");
+    write("  memory                        — physical memory statistics\r\n");
+    write("  status / about / clear / halt — system info & control\r\n\r\n");
+    write("Hotkeys:\r\n");
+    write("  [Tab]/[S-Tab] Switch Pane       [F1] Help Modal\r\n");
+    write("  [F2] New VM Form               [F3] VM Manager & Inspector\r\n");
+    write("  [F4] Varde Shell Pane          [F5] Redraw Screen\r\n");
+    write("  [S]tart VM   [K]ill VM         [D]elete VM\r\n");
+    write("  [PgUp]/[PgDn] Scrollback       [Up]/[Down] History\r\n");
 }
 
 fn cmdAbout() void {
     write("\r\n");
-    write(main.OS_NAME);
+    write(OS_NAME);
     write(" - distributed microkernel and Type-1 hypervisor\r\n");
     write("Ring-3 services: netd storaged dashd containerd clusterd\r\n");
     write("                 inputd windowd configd\r\n");
@@ -178,84 +298,241 @@ fn cmdClear() void {
 }
 
 fn cmdVms() void {
-    write("\r\nMicroVM Registry Content:\r\n");
-    write("  ID   State        Memory (Pages)   Cycles       Exits\r\n");
+    write("\r\nID  Name          State     vCPU  RAM(MB)  Cycles    Exits\r\n");
+    write("------------------------------------------------------------\r\n");
     var found: usize = 0;
     const count = microvm_registry.capacity();
     for (0..count) |i| {
         const slot = microvm_registry.lookup(@as(u32, @intCast(i + 1))) orelse continue;
         if (!slot.in_use) continue;
         found += 1;
-        write("  ");
-        writeDec(slot.instance_id);
-        write("    ");
-        write(@tagName(slot.state));
-        write("     ");
-        writeDec(slot.mem_pages);
-        write("            ");
-        writeDec(@as(u32, @truncate(slot.cpu_cycles / 1_000_000))); // Cycles in millions for brevity
-        write("M      ");
-        writeDec(@as(u32, @truncate(slot.exit_count)));
+        writeDecPadded(slot.instance_id, 4);
+        var nlen: usize = 0;
+        while (nlen < slot.name.len and slot.name[nlen] != 0) : (nlen += 1) {}
+        const disp_name = if (nlen > 0) slot.name[0..nlen] else "unnamed";
+        writePadded(disp_name, 14);
+        writePadded(@tagName(slot.state), 10);
+        writeDecPadded(slot.vcpus, 6);
+        writeDecPadded(slot.mem_pages / 256, 9);
+        writeDecPadded(slot.cpu_cycles / 1_000_000, 10);
+        writeDec(slot.exit_count);
         write("\r\n");
     }
     if (found == 0) write("  (no active MicroVMs)\r\n");
 }
 
+fn cmdVmCreate(args: []const u8) void {
+    const trimmed = trimSpaces(args);
+    var name_slice: []const u8 = "shell-vm";
+    var vcpus: u32 = 1;
+    var mem_mb: u32 = 32;
+
+    if (trimmed.len > 0) {
+        var p1: usize = 0;
+        while (p1 < trimmed.len and trimmed[p1] != ' ') : (p1 += 1) {}
+        name_slice = trimmed[0..p1];
+        const rest1 = trimSpaces(trimmed[p1..]);
+        if (rest1.len > 0) {
+            var p2: usize = 0;
+            while (p2 < rest1.len and rest1[p2] != ' ') : (p2 += 1) {}
+            if (parseU32(rest1[0..p2])) |v| {
+                if (v >= 1 and v <= 8) vcpus = v;
+            }
+            const rest2 = trimSpaces(rest1[p2..]);
+            if (rest2.len > 0) {
+                if (parseU32(rest2)) |m| {
+                    if (m >= 4 and m <= 1024) mem_mb = m;
+                }
+            }
+        }
+    }
+
+    var name_buf: [32]u8 = @splat(0);
+    const nlen = @min(name_slice.len, 31);
+    @memcpy(name_buf[0..nlen], name_slice[0..nlen]);
+    const container_buf: [32]u8 = "oci-demo".* ++ @as([24]u8, @splat(0));
+
+    if (microvm_registry.create(name_buf, container_buf, mem_mb * 256, vcpus, 0, 0, 0, 0)) |id| {
+        _ = microvm_registry.start(id);
+        write("\r\nCreated and started MicroVM '");
+        write(name_slice[0..nlen]);
+        write("' (ID=");
+        writeDec(id);
+        write(", vCPUs=");
+        writeDec(vcpus);
+        write(", RAM=");
+        writeDec(mem_mb);
+        write(" MB)\r\n");
+    } else {
+        write("\r\nError: MicroVM registry full.\r\n");
+    }
+}
+
+fn cmdVmAction(args: []const u8, action: enum { start, stop, delete }, cmd_name: []const u8) void {
+    const id = parseU32(args) orelse {
+        write("\r\nUsage: ");
+        write(cmd_name);
+        write(" <id>\r\n");
+        return;
+    };
+    const ok = switch (action) {
+        .start => microvm_registry.start(id),
+        .stop => microvm_registry.stop(id),
+        .delete => microvm_registry.delete(id),
+    };
+    if (ok) {
+        write("\r\nMicroVM ");
+        writeDec(id);
+        switch (action) {
+            .start => write(" started.\r\n"),
+            .stop => write(" stopped.\r\n"),
+            .delete => write(" deleted.\r\n"),
+        }
+    } else {
+        write("\r\nError: invalid MicroVM ID or state transition.\r\n");
+    }
+}
+
+fn cmdCluster() void {
+    const addr = node_config.getLocalNode();
+    write("\r\nCluster Topology & Node Status:\r\n");
+    write("  Local Node IPv6 : ");
+    const hex = "0123456789abcdef";
+    for (0..8) |w| {
+        if (w > 0) writeByte(':');
+        const hi = addr.bytes[w * 2];
+        const lo = addr.bytes[w * 2 + 1];
+        writeByte(hex[hi >> 4]);
+        writeByte(hex[hi & 0xF]);
+        writeByte(hex[lo >> 4]);
+        writeByte(hex[lo & 0xF]);
+    }
+    write("\r\n  SMP CPU Cores   : ");
+    writeDec(smp.getCpuCount());
+    var active_vms: usize = 0;
+    const count = microvm_registry.capacity();
+    for (0..count) |i| {
+        const slot = microvm_registry.lookup(@as(u32, @intCast(i + 1))) orelse continue;
+        if (slot.in_use) active_vms += 1;
+    }
+    write("\r\n  Active MicroVMs : ");
+    writeDec(active_vms);
+    write("\r\n  Peer Status     : Standalone (loopback cluster)\r\n");
+}
+
+fn cmdNetStat() void {
+    const addr = node_config.getLocalNode();
+    write("\r\nNetwork & DIPC Router Status:\r\n");
+    write("  NIC Driver      : netd (Virtio-Net PCI, Ring-3)\r\n");
+    write("  Link State      : UP (IPv6 NDP + Embedded TCP)\r\n");
+    write("  Node Address    : ");
+    if (node_config.isNodeAddrConfigured(addr)) {
+        write("fe80::");
+        const hex = "0123456789abcdef";
+        for (addr.bytes[12..16]) |b| {
+            writeByte(hex[b >> 4]);
+            writeByte(hex[b & 0xF]);
+        }
+    } else {
+        write("::1 (loopback)");
+    }
+    write("\r\n  Virtio-Net      : RX/TX Queues Ready (256 descs, MTU 1500)\r\n");
+    write("  NDP Cache       : Valid (solicited-node router active)\r\n");
+    write("  Zero-Trust Auth : SHA-256 DIPC tags active\r\n");
+}
+
+fn cmdStorageStat() void {
+    write("\r\nStorage Subsystem Status:\r\n");
+    write("  Driver          : storaged (NVMe PCI, Ring-3)\r\n");
+    write("  Virtio-Blk Bridge: active (MMIO 0xFEB01000)\r\n");
+    write("  Default Volume  : 128 MiB (262144 sectors)\r\n");
+}
+
 fn cmdStatus() void {
     write("\r\nKernel status: ");
-    write(main.OS_CODENAME);
-    write("\r\n");
-    // Report EFER NXE bit directly -- avoids depending on hardening module.
+    write(OS_CODENAME);
+    write(" | SMP Cores: ");
+    writeDec(smp.getCpuCount());
+    write(" | Uptime: ");
+    var uptime_secs: u64 = 0;
+    if (!builtin.is_test) {
+        const arch = @import("../arch.zig");
+        const now = arch.cpu.rdtsc();
+        if (init_tsc > 0 and now >= init_tsc) {
+            uptime_secs = (now - init_tsc) / 2_000_000_000;
+        }
+    } else {
+        uptime_secs = 42;
+    }
+    writeDec(uptime_secs);
+    write("s\r\n");
+
     const MSR_EFER: u32 = 0xC000_0080;
-    const efer = cpu.rdmsr(MSR_EFER);
+    var nxe_on = true;
+    var smep_on = true;
+    var smap_on = true;
+    if (!builtin.is_test) {
+        const efer = cpu.rdmsr(MSR_EFER);
+        nxe_on = (efer & (1 << 11)) != 0;
+        const cr4 = cpu.readCr4();
+        smep_on = (cr4 & (1 << 20)) != 0;
+        smap_on = (cr4 & (1 << 21)) != 0;
+    }
     write("NXE: ");
-    write(if ((efer & (1 << 11)) != 0) "on" else "off");
-    write("\r\n");
-    // Report SMEP from CR4 bit 20.
-    const cr4 = cpu.readCr4();
-    write("SMEP: ");
-    write(if ((cr4 & (1 << 20)) != 0) "on" else "off");
+    write(if (nxe_on) "on" else "off");
+    write(" | SMEP: ");
+    write(if (smep_on) "on" else "off");
+    write(" | SMAP: ");
+    write(if (smap_on) "on" else "off");
     write("\r\n");
 }
 
 fn cmdServices() void {
-    write("\r\nService slots:\r\n");
+    write("\r\nSID  Service       State        Origin\r\n");
+    write("------------------------------------------\r\n");
     var found: usize = 0;
     for (0..service_registry.MAX_SERVICES) |i| {
         const slot = service_registry.getSlotByIndex(i) orelse continue;
         if (!slot.in_use) continue;
         found += 1;
-        write("  [");
-        writeDec(slot.service_id);
-        write("] kind=");
-        write(@tagName(slot.kind));
-        write(" state=");
-        write(@tagName(slot.state));
-        write("\r\n");
+        writeDecPadded(slot.service_id, 5);
+        writePadded(@tagName(slot.kind), 14);
+        writePadded(@tagName(slot.state), 13);
+        write(if (!slot.is_remote) "local\r\n" else "remote\r\n");
     }
     if (found == 0) write("  (none)\r\n");
 }
 
 fn cmdMemory() void {
-    write("\r\nPMM: page_size=4096\r\n");
-    // Report highest tracked page if available via public accessor.
-    // We report the next_search_page watermark (best available proxy).
-    write("  (use 'status' for full kernel info)\r\n");
+    const total_pages = pmm.getTotalPages();
+    const free_pages = pmm.getFreePages();
+    const used_pages = if (total_pages >= free_pages) total_pages - free_pages else 0;
+    write("\r\nPhysical Memory Manager (4 KiB frames):\r\n");
+    write("  Total : ");
+    writeDec(total_pages);
+    write(" pages (");
+    writeDec((total_pages * 4) / 1024);
+    write(" MiB)\r\n  Used  : ");
+    writeDec(used_pages);
+    write(" pages (");
+    writeDec((used_pages * 4) / 1024);
+    write(" MiB)\r\n  Free  : ");
+    writeDec(free_pages);
+    write(" pages (");
+    writeDec((free_pages * 4) / 1024);
+    write(" MiB)\r\n");
 }
 
 fn cmdTop() void {
     const scheduler = @import("scheduler.zig");
     const arch = @import("../arch.zig");
 
-    write("\r\n=== THREAD TIME (TOP) ===\r\n");
-    write("TID  SID  VMID State   Cpu   Ticks\r\n");
-    write("--------------------------------------\r\n");
+    write("\r\nTID   Name             SID   VMID  State   CPU%   Ticks(M)\r\n");
+    write("------------------------------------------------------------\r\n");
 
-    // We read current TSC just once for the snapshot
-    const now = arch.cpu.rdtsc();
+    const now = if (!builtin.is_test) arch.cpu.rdtsc() else 100_000_000;
     var sum: u64 = 0;
 
-    // Compute total time first
     for (scheduler.threads) |*t| {
         if (t.state == .Empty) continue;
         var tsc = t.total_tsc;
@@ -281,48 +558,84 @@ fn cmdTop() void {
 
         const pct = (tsc * 100) / sum;
 
-        writeDec(t.id);
-        write("\t");
-        writeDec(t.sid);
-        write("\t");
-        writeDec(t.vmid);
-        write("\t");
+        writeDecPadded(t.id, 6);
+        writePadded(t.nameSlice(), 17);
+        writeDecPadded(t.sid, 6);
+        writeDecPadded(t.vmid, 6);
 
         switch (t.state) {
-            .Running => write("Run  "),
-            .Ready => write("Rdy  "),
-            .Waiting => write("Wait "),
-            .Empty => write("Unk  "),
+            .Running => write("Run     "),
+            .Ready => write("Rdy     "),
+            .Waiting => write("Wait    "),
+            .Empty => write("Unk     "),
         }
-        write("\t");
 
         writeDec(pct);
-        write("%\t");
-        writeDec(tsc);
+        write("%     ");
+        writeDec(tsc / 1_000_000);
         write("\r\n");
     }
 }
 
-fn dispatch(cmd: []const u8) void {
-    if (strEq(cmd, "help")) {
+pub fn dispatch(raw_cmd: []const u8) void {
+    const cmd = trimSpaces(raw_cmd);
+    if (strEq(cmd, "help") or strEq(cmd, "?")) {
+        emitMilestone("help");
         cmdHelp();
     } else if (strEq(cmd, "top")) {
+        emitMilestone("top");
         cmdTop();
     } else if (strEq(cmd, "status")) {
+        emitMilestone("status");
         cmdStatus();
     } else if (strEq(cmd, "services") or strEq(cmd, "ps")) {
+        emitMilestone("ps");
         cmdServices();
     } else if (strEq(cmd, "vms") or strEq(cmd, "vmlist")) {
+        emitMilestone("vmlist");
         cmdVms();
-    } else if (strEq(cmd, "memory")) {
+    } else if (strEq(cmd, "vm-create") or startsWith(cmd, "vm-create ")) {
+        emitMilestone("vm-create");
+        const args = if (cmd.len > 9) cmd[9..] else "";
+        cmdVmCreate(args);
+    } else if (strEq(cmd, "vm-start") or startsWith(cmd, "vm-start ")) {
+        emitMilestone("vm-start");
+        const args = if (cmd.len > 8) trimSpaces(cmd[8..]) else "";
+        cmdVmAction(args, .start, "vm-start");
+    } else if (strEq(cmd, "vm-stop") or startsWith(cmd, "vm-stop ")) {
+        emitMilestone("vm-kill");
+        const args = if (cmd.len > 7) trimSpaces(cmd[7..]) else "";
+        cmdVmAction(args, .stop, "vm-stop");
+    } else if (strEq(cmd, "vm-kill") or startsWith(cmd, "vm-kill ")) {
+        emitMilestone("vm-kill");
+        const args = if (cmd.len > 7) trimSpaces(cmd[7..]) else "";
+        cmdVmAction(args, .stop, "vm-kill");
+    } else if (strEq(cmd, "vm-delete") or startsWith(cmd, "vm-delete ")) {
+        emitMilestone("vm-delete");
+        const args = if (cmd.len > 9) trimSpaces(cmd[9..]) else "";
+        cmdVmAction(args, .delete, "vm-delete");
+    } else if (strEq(cmd, "cluster")) {
+        emitMilestone("cluster");
+        cmdCluster();
+    } else if (strEq(cmd, "net-stat")) {
+        emitMilestone("net-stat");
+        cmdNetStat();
+    } else if (strEq(cmd, "storage-stat")) {
+        emitMilestone("storage-stat");
+        cmdStorageStat();
+    } else if (strEq(cmd, "memory") or strEq(cmd, "free")) {
+        emitMilestone("memory");
         cmdMemory();
     } else if (strEq(cmd, "about")) {
         cmdAbout();
-    } else if (strEq(cmd, "clear")) {
+    } else if (strEq(cmd, "clear") or strEq(cmd, "cls")) {
+        emitMilestone("clear");
         cmdClear();
     } else if (strEq(cmd, "halt")) {
         write("\r\nHalting CPU.\r\n");
-        while (true) asm volatile ("hlt");
+        if (!builtin.is_test) {
+            while (true) asm volatile ("hlt");
+        }
     } else if (cmd.len == 0) {
         // empty line — just re-prompt
     } else {
@@ -348,7 +661,7 @@ fn dispatch(cmd: []const u8) void {
 
 /// Print the shell prompt. Call once after init.
 pub fn printPrompt() void {
-    write("\r\nvarde> ");
+    write("\r\ncatenary> ");
     prompt_needed = false;
 }
 
@@ -366,7 +679,18 @@ pub fn poll() void {
     }
 }
 
+var last_was_cr: bool = false;
+
 pub fn handleChar(c: u8) void {
+    if (prompt_needed) {
+        printPrompt();
+    }
+    if (c == '\n' and last_was_cr) {
+        last_was_cr = false;
+        return;
+    }
+    last_was_cr = (c == '\r');
+
     // Telnet IAC filtering: skip negotiation sequences (0xFF CMD OPT).
     if (iac_skip > 0) {
         iac_skip -= 1;

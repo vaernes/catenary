@@ -155,7 +155,7 @@ pub export fn umain() noreturn {
     const token = bs.capability_token;
 
     lib.serialWrite("inputd: starting\n");
-    _ = lib.syscall(SYS_REGISTER, 0, 8, token); // Register at endpoint 8 for inputd
+    _ = lib.syscall(SYS_REGISTER, 0, @intFromEnum(lib.ReservedEndpoint.inputd), token);
     lib.serialWrite("inputd: registered at endpoint 8\n");
 
     const dipc_phys = lib.syscall(SYS_ALLOC_DMA, 1, 0, token);
@@ -164,7 +164,7 @@ pub export fn umain() noreturn {
         while (true) asm volatile ("pause");
     }
 
-    var local_node: ?lib.Ipv6Addr = null;
+    const node = lib.Ipv6Addr{ .bytes = bs.local_node };
 
     // Input loop: poll the kernel scancode ring via SYS_GET_KEY (which yields
     // when empty) and forward decoded events over DIPC. inputd must never park
@@ -179,11 +179,7 @@ pub export fn umain() noreturn {
         }
 
         const evt = decode(@truncate(scancode_val)) orelse continue;
-
-        if (local_node == null) {
-            local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA, 8) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
-        }
-        const node = local_node.?;
+        lib.serialWrite("inputd: key press decoded\n");
 
         const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA);
         const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
@@ -193,8 +189,8 @@ pub export fn umain() noreturn {
             .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
             .payload_len = @as(u32, @intCast(@sizeOf(InputEventPayload))),
             .auth_tag = 0,
-            .src = .{ .node = node, .endpoint = 8 }, // inputd
-            .dst = .{ .node = node, .endpoint = 9 }, // windowd
+            .src = .{ .node = node, .endpoint = @intFromEnum(lib.ReservedEndpoint.inputd) },
+            .dst = .{ .node = node, .endpoint = @intFromEnum(lib.ReservedEndpoint.windowd) },
         };
         const payload: *align(1) InputEventPayload = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
         payload.* = evt;

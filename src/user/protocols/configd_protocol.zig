@@ -96,7 +96,7 @@ pub const NodeLeavePayload = extern struct {
     node_addr: [16]u8,
     generation: u64,
     reason: u8, // 0 = timeout, 1 = graceful shutdown
-    _pad: [7]u8 = [_]u8{0} ** 7,
+    _pad: [7]u8 = @splat(0),
 };
 
 /// Op.config_update — a key/value pair update to be propagated cluster-wide.
@@ -135,10 +135,10 @@ pub const MAX_NODE_RECORDS: usize = 16;
 pub const RegistrySnapshotReply = extern struct {
     count: u32,
     _pad: u32 = 0,
-    nodes: [MAX_NODE_RECORDS]NodeRecord = [_]NodeRecord{.{
-        .node_addr = [_]u8{0} ** 16,
+    nodes: [MAX_NODE_RECORDS]NodeRecord = @splat(.{
+        .node_addr = @splat(0),
         .generation = 0,
         .service_mask = 0,
         .flags = 0,
-    }} ** MAX_NODE_RECORDS,
+    }),
 };

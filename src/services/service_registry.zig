@@ -22,7 +22,7 @@ pub const Slot = struct {
     kind: service_bootstrap.ServiceKind = .netd,
     user_id: service_bootstrap.UserId = .core,
     is_remote: bool = false,
-    remote_node: dipc.Ipv6Addr = dipc.Ipv6Addr{ .bytes = [_]u8{0} ** 16 },
+    remote_node: dipc.Ipv6Addr = dipc.Ipv6Addr{ .bytes = @splat(0) },
     runtime_mode: service_bootstrap.RuntimeMode = .oneshot,
     state: ServiceState = .empty,
     entry_rip: u64 = 0,
@@ -118,7 +118,7 @@ pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8, remote_n
     // Try to find if we already track this remote service
     for (0..MAX_SERVICES) |i| {
         if (slots[i].in_use and slots[i].service_id == service_id and slots[i].is_remote) {
-            slots[i].state = @enumFromInt(state);
+            slots[i].state = @fromBackingInt(@intCast(state));
             slots[i].remote_node = remote_node;
             return true;
         }
@@ -130,9 +130,9 @@ pub fn registerRemoteService(service_id: u32, kind_val: u16, state: u8, remote_n
                 .in_use = true,
                 .is_remote = true,
                 .service_id = service_id,
-                .kind = @enumFromInt(kind_val),
+                .kind = @fromBackingInt(@intCast(kind_val)),
                 .remote_node = remote_node,
-                .state = @enumFromInt(state),
+                .state = @fromBackingInt(@intCast(state)),
             };
             return true;
         }
@@ -384,12 +384,12 @@ pub fn releaseDipcSlot(service_id: u32) void {
 test "registerRemoteService stores remote node address" {
     init();
 
-    var remote_node = dipc.Ipv6Addr{ .bytes = [_]u8{0} ** 16 };
+    var remote_node = dipc.Ipv6Addr{ .bytes = @splat(0) };
     remote_node.bytes[0] = 0x20;
     remote_node.bytes[1] = 0x01;
     remote_node.bytes[15] = 0x55;
 
-    try std.testing.expect(registerRemoteService(77, @intFromEnum(service_bootstrap.ServiceKind.netd), @intFromEnum(ServiceState.active), remote_node));
+    try std.testing.expect(registerRemoteService(77, @backingInt(service_bootstrap.ServiceKind.netd), @backingInt(ServiceState.active), remote_node));
 
     const slot = lookup(77) orelse return error.TestUnexpectedResult;
     try std.testing.expect(slot.is_remote);

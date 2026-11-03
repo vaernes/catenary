@@ -192,31 +192,40 @@ test "TCP Flags and State enum" {
     try std.testing.expectEqual(@as(u8, 0x10), Flags.ACK);
     try std.testing.expectEqual(@as(u8, 0x20), Flags.URG);
 
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(State.closed));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(State.listen));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(State.syn_sent));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(State.syn_received));
-    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(State.established));
-    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(State.fin_wait_1));
-    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(State.fin_wait_2));
-    try std.testing.expectEqual(@as(u8, 7), @intFromEnum(State.close_wait));
-    try std.testing.expectEqual(@as(u8, 8), @intFromEnum(State.last_ack));
-    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(State.time_wait));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(State.closed));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(State.listen));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(State.syn_sent));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(State.syn_received));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(State.established));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(State.fin_wait_1));
+    try std.testing.expectEqual(@as(u8, 6), @backingInt(State.fin_wait_2));
+    try std.testing.expectEqual(@as(u8, 7), @backingInt(State.close_wait));
+    try std.testing.expectEqual(@as(u8, 8), @backingInt(State.last_ack));
+    try std.testing.expectEqual(@as(u8, 9), @backingInt(State.time_wait));
 }
 
 test "computeChecksum IPv6 verification and roundtrip" {
     const src_ip = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x54, 0x00, 0xff, 0xfe, 0x12, 0x34, 0x56 };
     const dst_ip = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x54, 0x00, 0xff, 0xfe, 0x78, 0x9a, 0xbc };
 
-    var segment: [24]u8 = [_]u8{0} ** 24;
+    var segment: [24]u8 = @splat(0);
     // Dummy TCP header (20 bytes) + 4 bytes payload
-    segment[0] = 0x1F; segment[1] = 0x90; // port 8080
-    segment[2] = 0x00; segment[3] = 0x50; // port 80
-    segment[4] = 0x00; segment[5] = 0x00; segment[6] = 0x00; segment[7] = 0x01; // seq = 1
+    segment[0] = 0x1F;
+    segment[1] = 0x90; // port 8080
+    segment[2] = 0x00;
+    segment[3] = 0x50; // port 80
+    segment[4] = 0x00;
+    segment[5] = 0x00;
+    segment[6] = 0x00;
+    segment[7] = 0x01; // seq = 1
     segment[12] = 0x50; // data offset 5 words
     segment[13] = Flags.SYN;
-    segment[14] = 0x10; segment[15] = 0x00; // window 4096
-    segment[20] = 'p'; segment[21] = 'i'; segment[22] = 'n'; segment[23] = 'g';
+    segment[14] = 0x10;
+    segment[15] = 0x00; // window 4096
+    segment[20] = 'p';
+    segment[21] = 'i';
+    segment[22] = 'n';
+    segment[23] = 'g';
 
     const cksum = computeChecksum(&src_ip, &dst_ip, &segment);
     try std.testing.expect(cksum != 0);
@@ -229,4 +238,3 @@ test "computeChecksum IPv6 verification and roundtrip" {
     const verify = computeChecksum(&src_ip, &dst_ip, &segment);
     try std.testing.expectEqual(@as(u16, 0), verify);
 }
-

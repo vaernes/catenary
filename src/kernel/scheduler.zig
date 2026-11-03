@@ -25,7 +25,7 @@ pub const Thread = struct {
     user_pml4: u64 = 0,
     total_tsc: u64 = 0,
     /// Null-terminated ASCII name for debug output (max 15 chars + NUL).
-    name: [16]u8 = [_]u8{0} ** 16,
+    name: [16]u8 = @splat(0),
     /// User-space entry RIP for threads spawned via SYS_SPAWN_THREAD.
     /// Read by service_extra_thread_trampoline; 0 for primary service threads.
     user_entry: u64 = 0,
@@ -61,7 +61,7 @@ pub const Thread = struct {
 pub const MAILBOX_CAPACITY: usize = 16;
 
 pub const Mailbox = struct {
-    slots: [MAILBOX_CAPACITY]u64 = [_]u64{0} ** MAILBOX_CAPACITY,
+    slots: [MAILBOX_CAPACITY]u64 = @splat(0),
     head: usize = 0,
     tail: usize = 0,
     count: usize = 0,
@@ -89,7 +89,7 @@ pub const Mailbox = struct {
 
 var threads_pool: [THREAD_TARGET_COUNT]Thread align(16) linksection(".data") = undefined;
 pub var threads: []Thread = threads_pool[0..THREAD_TARGET_COUNT];
-pub var current_thread_per_cpu: [smp.MAX_CPUS]usize = [_]usize{0} ** smp.MAX_CPUS;
+pub var current_thread_per_cpu: [smp.MAX_CPUS]usize = @splat(0);
 pub var current_thread_idx: usize = 0;
 var next_thread_id: u32 = 1;
 var hhdm_offset: u64 = 0;
@@ -97,11 +97,11 @@ pub var last_tsc_stamp: u64 = 0;
 pub var scheduler_active: bool = false;
 
 var schedule_spinlock: bool = false;
-var lock_depth: [smp.MAX_CPUS]u32 = [_]u32{0} ** smp.MAX_CPUS;
-var saved_flags: [smp.MAX_CPUS]u64 = [_]u64{0} ** smp.MAX_CPUS;
-var thread_active: [THREAD_TARGET_COUNT]bool = [_]bool{false} ** THREAD_TARGET_COUNT;
-var prev_switched_thread: [smp.MAX_CPUS]?usize = [_]?usize{null} ** smp.MAX_CPUS;
-var ap_task_logged: [smp.MAX_CPUS][THREAD_TARGET_COUNT]bool = [_][THREAD_TARGET_COUNT]bool{[_]bool{false} ** THREAD_TARGET_COUNT} ** smp.MAX_CPUS;
+var lock_depth: [smp.MAX_CPUS]u32 = @splat(0);
+var saved_flags: [smp.MAX_CPUS]u64 = @splat(0);
+var thread_active: [THREAD_TARGET_COUNT]bool = @splat(false);
+var prev_switched_thread: [smp.MAX_CPUS]?usize = @splat(null);
+var ap_task_logged: [smp.MAX_CPUS][THREAD_TARGET_COUNT]bool = @splat(@splat(false));
 
 fn acquireScheduleLock() void {
     var flags: u64 = 0;
@@ -206,7 +206,7 @@ fn serviceKindName(kind: @import("../services/service_bootstrap.zig").ServiceKin
 }
 
 fn fmtVmxName(vmid: u32) [16]u8 {
-    var buf: [16]u8 = [_]u8{0} ** 16;
+    var buf: [16]u8 = @splat(0);
     buf[0] = 'v';
     buf[1] = 'm';
     buf[2] = 'x';
@@ -448,7 +448,7 @@ pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
                     sibling_count += 1;
                 }
             }
-            var name_buf: [16]u8 = [_]u8{0} ** 16;
+            var name_buf: [16]u8 = @splat(0);
             if (service_registry.getServiceKind(sid)) |kind| {
                 const base = serviceKindName(kind);
                 const blen = @min(base.len, 13);
@@ -602,7 +602,7 @@ pub fn schedule() void {
     while (i < max_runnable) : (i += 1) {
         const candidate = (old_idx + 1 + i) % max_runnable;
         if (candidate == 0) continue; // Skip thread 0 (BSP boot/idle thread)
-        if (cpu_id != 0 and threads[candidate].sid == 0 and !threads[candidate].is_vmx) continue;
+        if (cpu_id != 0 and (threads[candidate].sid == 0 or threads[candidate].is_vmx)) continue;
         if (threads[candidate].state == .Ready and !thread_active[candidate]) {
             next_idx = candidate;
             break;

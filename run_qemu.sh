@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+if [ -d "/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_64-linux-0.17.0" ]; then
+    export PATH="/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_64-linux-0.17.0:$PATH"
+fi
+
 echo "[+] Building Catenary OS..."
 zig build ${ZIG_BUILD_ARGS:-} -p /tmp/zig-out --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache
 
@@ -16,6 +20,12 @@ cp /tmp/zig-out/bin/clusterd iso_root/modules/clusterd.elf
 cp /tmp/zig-out/bin/inputd iso_root/modules/inputd.elf
 cp /tmp/zig-out/bin/windowd iso_root/modules/windowd.elf
 cp /tmp/zig-out/bin/configd iso_root/modules/configd.elf
+if [ -f "guest/bzImage" ]; then
+    cp guest/bzImage iso_root/boot/bzImage
+fi
+if [ -f "guest/initramfs.cpio.gz" ]; then
+    cp guest/initramfs.cpio.gz iso_root/boot/initramfs.cpio.gz
+fi
 cp limine.conf iso_root/
 
 if [ ! -d "limine" ]; then
@@ -40,7 +50,7 @@ echo "[+] Installing Limine to ISO..."
 
 echo "[+] Running QEMU..."
 # Serial for main kernel log + Serial for guest/varde bridge
-GTK_PATH= qemu-system-x86_64 -enable-kvm -M q35 -m 256M -cpu host,vmx=on -cdrom catenary.iso -boot d -serial stdio -serial telnet:127.0.0.1:4445,server,nowait \
+GTK_PATH= qemu-system-x86_64 -enable-kvm -M q35 -smp 2 -m 512M -cpu host,vmx=on -cdrom catenary.iso -boot d -serial stdio -serial telnet:127.0.0.1:4445,server,nowait \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0,romfile= \
     -drive file=/dev/null,format=raw,if=none,id=nvm \
     -device nvme,serial=deadbeef,drive=nvm

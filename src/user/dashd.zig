@@ -30,13 +30,13 @@ const MAX_VMS: u32 = 16;
 const VmStats = struct {
     used: bool = false,
     /// Owning node address; all-zero means this (local) node.
-    node: [16]u8 = [_]u8{0} ** 16,
+    node: [16]u8 = @splat(0),
     id: u32 = 0,
     cpu_cycles: u64 = 0,
     exit_count: u64 = 0,
 };
 
-var vm_table: [MAX_VMS]VmStats = [_]VmStats{.{}} ** MAX_VMS;
+var vm_table: [MAX_VMS]VmStats = @splat(.{});
 
 /// Find or allocate the stats slot for (node, id). Slots are keyed by node so
 /// identical instance ids on different cluster nodes do not collide.
@@ -67,7 +67,7 @@ var remote_telemetry_logged: bool = false;
 fn forwardToClusterd(scratch_phys: u64, token: u64, instance_id: u32, cpu_cycles: u64, exit_count: u64) void {
     const sample = dashd_proto.ClusterTelemetryUpdate{
         .sample_tsc = 0,
-        .node_addr = [_]u8{0} ** 16,
+        .node_addr = @splat(0),
         .instance_id = instance_id,
         .cpu_cycles = cpu_cycles,
         .exit_count = exit_count,
@@ -81,8 +81,8 @@ fn forwardToClusterd(scratch_phys: u64, token: u64, instance_id: u32, cpu_cycles
         .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
         .payload_len = @as(u32, @intCast(cl_len)),
         .auth_tag = 0,
-        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.dashd) },
-        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.clusterd) },
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.dashd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.clusterd) },
     };
     const ch: *align(1) clusterd_proto.ClusterdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
     ch.* = .{
@@ -97,7 +97,7 @@ fn forwardToClusterd(scratch_phys: u64, token: u64, instance_id: u32, cpu_cycles
     _ = lib.syscall(lib.SYS_SEND_PAGE, scratch_phys, 0, token);
 }
 
-const LOCAL_NODE: [16]u8 = [_]u8{0} ** 16;
+const LOCAL_NODE: [16]u8 = @splat(0);
 
 fn isLocalNode(n: *const [16]u8) bool {
     return std.mem.eql(u8, n, &LOCAL_NODE);
@@ -186,7 +186,7 @@ fn sendSummaryReply(scratch_phys: u64, token: u64, dst: lib.Address) void {
         .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
         .payload_len = @as(u32, @intCast(body_len)),
         .auth_tag = 0,
-        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.dashd) },
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.dashd) },
         .dst = dst,
     };
     const dh: *align(1) dashd_proto.DashdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
@@ -204,7 +204,10 @@ fn cmdCluster() void {
         // Summarise each distinct node once, at its first slot.
         var seen = false;
         for (vm_table[0..i]) |*p| {
-            if (p.used and std.mem.eql(u8, &p.node, &s.node)) { seen = true; break; }
+            if (p.used and std.mem.eql(u8, &p.node, &s.node)) {
+                seen = true;
+                break;
+            }
         }
         if (seen) continue;
         var vms: u32 = 0;
@@ -291,32 +294,32 @@ pub export fn umain() noreturn {
 
         const dash_hdr: *align(1) const dashd_proto.DashdHeader = @ptrCast(payload_ptr);
         if (payload_len >= @sizeOf(dashd_proto.DashdHeader) and dash_hdr.magic == dashd_proto.MAGIC) {
-                switch (dash_hdr.op) {
-                    .shell_command => {
-                        if (payload_len >= @sizeOf(dashd_proto.DashdHeader) + @sizeOf(dashd_proto.ShellCommandRequest)) {
-                            const req: *align(1) const dashd_proto.ShellCommandRequest = @ptrCast(payload_ptr + @sizeOf(dashd_proto.DashdHeader));
-                            // Find null terminator to get command length.
-                            var cmd_len: usize = 0;
-                            while (cmd_len < dashd_proto.MAX_CMD_LEN and req.cmd[cmd_len] != 0) : (cmd_len += 1) {}
-                            dispatchShellCommand(req.cmd[0..cmd_len]);
+            switch (dash_hdr.op) {
+                .shell_command => {
+                    if (payload_len >= @sizeOf(dashd_proto.DashdHeader) + @sizeOf(dashd_proto.ShellCommandRequest)) {
+                        const req: *align(1) const dashd_proto.ShellCommandRequest = @ptrCast(payload_ptr + @sizeOf(dashd_proto.DashdHeader));
+                        // Find null terminator to get command length.
+                        var cmd_len: usize = 0;
+                        while (cmd_len < dashd_proto.MAX_CMD_LEN and req.cmd[cmd_len] != 0) : (cmd_len += 1) {}
+                        dispatchShellCommand(req.cmd[0..cmd_len]);
+                    }
+                },
+                .cluster_telemetry_update => {
+                    if (payload_len >= @sizeOf(dashd_proto.DashdHeader) + @sizeOf(dashd_proto.ClusterTelemetryUpdate)) {
+                        const sample: *align(1) const dashd_proto.ClusterTelemetryUpdate = @ptrCast(payload_ptr + @sizeOf(dashd_proto.DashdHeader));
+                        if (!remote_telemetry_logged) {
+                            remote_telemetry_logged = true;
+                            lib.serialWrite("dashd: cluster telemetry received from remote node\n");
                         }
-                    },
-                    .cluster_telemetry_update => {
-                        if (payload_len >= @sizeOf(dashd_proto.DashdHeader) + @sizeOf(dashd_proto.ClusterTelemetryUpdate)) {
-                            const sample: *align(1) const dashd_proto.ClusterTelemetryUpdate = @ptrCast(payload_ptr + @sizeOf(dashd_proto.DashdHeader));
-                            if (!remote_telemetry_logged) {
-                                remote_telemetry_logged = true;
-                                lib.serialWrite("dashd: cluster telemetry received from remote node\n");
-                            }
-                            if (upsertVm(&sample.node_addr, sample.instance_id)) |s| {
-                                s.cpu_cycles = sample.cpu_cycles;
-                                s.exit_count = sample.exit_count;
-                            }
+                        if (upsertVm(&sample.node_addr, sample.instance_id)) |s| {
+                            s.cpu_cycles = sample.cpu_cycles;
+                            s.exit_count = sample.exit_count;
                         }
-                    },
-                    .telemetry_summary_request => sendSummaryReply(text_phys, token, hdr.src),
-                    else => {},
-                }
+                    }
+                },
+                .telemetry_summary_request => sendSummaryReply(text_phys, token, hdr.src),
+                else => {},
+            }
         } else if (payload_len >= @sizeOf(TelemetryPayload)) {
             // Raw telemetry from local microvm_bridge
             const telem: *align(1) const TelemetryPayload = @ptrCast(payload_ptr);

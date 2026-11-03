@@ -215,9 +215,9 @@ pub fn init() void {
     outb(0xA1, 0x02);
     outb(0x21, 0x01);
     outb(0xA1, 0x01);
-    // Unmask IRQ0 (PIT timer only). Mask IRQ1-7 on master PIC and all IRQ8-15 on slave PIC
+    // Unmask IRQ0 (PIT timer) and IRQ1 (PS/2 keyboard). Mask IRQ2-7 on master PIC and all IRQ8-15 on slave PIC
     // to prevent un-acknowledged Virtio PCI IRQ 11 loops from starving user space scheduling.
-    outb(0x21, 0xFE);
+    outb(0x21, 0xFC);
     outb(0xA1, 0xFF);
 }
 

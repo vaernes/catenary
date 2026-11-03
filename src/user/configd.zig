@@ -67,7 +67,7 @@ const MAX_VMS = 8;
 
 const NodeEntry = struct {
     used: bool = false,
-    addr: [16]u8 = [_]u8{0} ** 16,
+    addr: [16]u8 = @splat(0),
     services: u16 = 0,
 };
 
@@ -77,8 +77,8 @@ const VmEntry = struct {
     mem_pages: u32 = 0,
 };
 
-var cluster_nodes: [MAX_CLUSTER_NODES]NodeEntry = [_]NodeEntry{.{}} ** MAX_CLUSTER_NODES;
-var vms: [MAX_VMS]VmEntry = [_]VmEntry{.{}} ** MAX_VMS;
+var cluster_nodes: [MAX_CLUSTER_NODES]NodeEntry = @splat(.{});
+var vms: [MAX_VMS]VmEntry = @splat(.{});
 var next_vmid: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -294,8 +294,8 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
         .kernel_size = bs.linux_bzimage_size,
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
-        .name = [_]u8{0} ** 32,
-        .container = [_]u8{0} ** 32,
+        .name = @splat(0),
+        .container = @splat(0),
     };
 
     // The kernel's SYS_SEND_PAGE copies from the DMA phys page, re-signs, and routes.
@@ -408,8 +408,8 @@ fn handleListMicrovms(bs: *const BootstrapDescriptor, token: u64, text_phys: u64
             .vcpus = 1,
             .cpu_cycles = 0,
             .exit_count = 0,
-            .name = [_]u8{0} ** 32,
-            .container = [_]u8{0} ** 32,
+            .name = @splat(0),
+            .container = @splat(0),
         };
         // Copy first 3 chars of index as a default name placeholder
         _ = i;

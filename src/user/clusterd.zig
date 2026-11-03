@@ -19,7 +19,7 @@ const BootstrapDescriptor = lib.BootstrapDescriptor;
 
 const USER_BOOTSTRAP_VADDR: usize = 0x0000_7FFF_FFFB_0000;
 
-const EP_CLUSTERD: u64 = @intFromEnum(lib.ReservedEndpoint.clusterd);
+const EP_CLUSTERD: u64 = @backingInt(lib.ReservedEndpoint.clusterd);
 const MAX_PEERS: usize = clusterd_proto.MAX_RESOURCE_SNAPSHOT_ENTRIES;
 const DEFAULT_VM_MEM_PAGES: u32 = 16384;
 const DEFAULT_VM_VCPUS: u32 = 1;
@@ -27,7 +27,7 @@ const IPV6_ALL_NODES_MULTICAST = lib.Ipv6Addr{ .bytes = .{ 0xff, 0x02, 0, 0, 0, 
 
 const PeerState = struct {
     used: bool = false,
-    node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = [_]u8{0} ** 16 },
+    node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = @splat(0) },
     has_resources: bool = false,
     resources: clusterd_proto.ResourceAdvertisement = zeroResources(),
     announced: bool = false,
@@ -38,17 +38,17 @@ const PeerState = struct {
 const PendingInboundLaunch = struct {
     active: bool = false,
     request_id: u64 = 0,
-    requester_node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = [_]u8{0} ** 16 },
+    requester_node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = @splat(0) },
     mem_pages: u32 = 0,
     vcpus: u32 = 0,
 };
 
-var g_local_node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = [_]u8{0} ** 16 };
+var g_local_node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = @splat(0) };
 var g_local_resources: clusterd_proto.ResourceAdvertisement = zeroResources();
-var g_peers: [MAX_PEERS]PeerState = [_]PeerState{.{}} ** MAX_PEERS;
+var g_peers: [MAX_PEERS]PeerState = @splat(.{});
 var g_next_request_id: u64 = 1;
 var g_pending_launch_request_id: u64 = 0;
-var g_pending_launch_node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = [_]u8{0} ** 16 };
+var g_pending_launch_node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = @splat(0) };
 var g_remote_launch_complete: bool = false;
 var g_pending_inbound_launch: PendingInboundLaunch = .{};
 var g_local_netd_ready: bool = false;
@@ -77,8 +77,8 @@ fn seedLocalResources() void {
         .logical_cpu_total = 1,
         .logical_cpu_available = 1,
         .active_vms = 0,
-        .service_mask = (@as(u32, 1) << @as(u5, @intCast(@intFromEnum(lib.ServiceKind.clusterd)))) |
-            (@as(u32, 1) << @as(u5, @intCast(@intFromEnum(lib.ServiceKind.netd)))),
+        .service_mask = (@as(u32, 1) << @as(u5, @intCast(@backingInt(lib.ServiceKind.clusterd)))) |
+            (@as(u32, 1) << @as(u5, @intCast(@backingInt(lib.ServiceKind.netd)))),
         .flags = lib.NODE_FLAG_CLUSTER_CAPABLE,
     };
 }
@@ -91,7 +91,7 @@ fn ipv6Eq(a: lib.Ipv6Addr, b: lib.Ipv6Addr) bool {
 }
 
 fn isLoopback(addr: lib.Ipv6Addr) bool {
-    const all_zero = [_]u8{0} ** 16;
+    const all_zero: [16]u8 = @splat(0);
     if (std.mem.eql(u8, &addr.bytes, &all_zero)) return true;
     const loopback = lib.Ipv6Addr.loopback().bytes;
     return std.mem.eql(u8, &addr.bytes, &loopback);
@@ -209,7 +209,7 @@ fn sendNetdMessage(
         .payload_len = @as(u32, @intCast(total_payload_len)),
         .auth_tag = 0,
         .src = .{ .node = g_local_node, .endpoint = EP_CLUSTERD },
-        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.netd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.netd) },
     };
 
     const msg_hdr: *align(1) netd_proto.NetdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
@@ -243,7 +243,7 @@ fn sendDashdClusterTelemetry(
         .payload_len = @as(u32, @intCast(body_len)),
         .auth_tag = 0,
         .src = .{ .node = g_local_node, .endpoint = EP_CLUSTERD },
-        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @intFromEnum(lib.ReservedEndpoint.dashd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.dashd) },
     };
     const dh: *align(1) dashd_proto.DashdHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
     dh.* = .{ .op = .cluster_telemetry_update, .payload_len = @sizeOf(dashd_proto.ClusterTelemetryUpdate) };
@@ -416,8 +416,8 @@ fn maybeRequestLocalLaunch(
         .kernel_size = bs.linux_bzimage_size,
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
-        .name = [_]u8{0} ** 32,
-        .container = [_]u8{0} ** 32,
+        .name = @splat(0),
+        .container = @splat(0),
     };
     @memcpy(create.name[0..7], "default");
     _ = sendControlRequest(bs, scratch_phys, scratch_va, token, .create_microvm, std.mem.asBytes(&create));
@@ -460,8 +460,8 @@ fn maybeRequestRemoteLaunch(
         .kernel_size = bs.linux_bzimage_size,
         .initramfs_phys = bs.initramfs_phys,
         .initramfs_size = bs.initramfs_size,
-        .name = [_]u8{0} ** 32,
-        .container = [_]u8{0} ** 32,
+        .name = @splat(0),
+        .container = @splat(0),
     };
     @memcpy(req.name[0..13], "remote-micron");
 
@@ -485,7 +485,7 @@ fn handleRegistrySync(
     const remote_node = hdr.src.node;
 
     if (!isRemoteNode(remote_node)) {
-        if (payload.service_kind == @intFromEnum(lib.ServiceKind.netd)) {
+        if (payload.service_kind == @backingInt(lib.ServiceKind.netd)) {
             g_local_netd_ready = true;
             if (!g_netd_node_query_sent) {
                 _ = sendNetdMessage(scratch_phys, scratch_va, token, .get_node_addr, &[_]u8{});
@@ -669,7 +669,7 @@ fn handleClusterdProtocol(
             maybeRequestRemoteLaunch(bs, scratch_phys, scratch_va, token);
         },
         .telemetry_report => {
-                        if (msg_payload_len != @sizeOf(dashd_proto.ClusterTelemetryUpdate)) return;
+            if (msg_payload_len != @sizeOf(dashd_proto.ClusterTelemetryUpdate)) return;
             var sample = @as(*align(1) const dashd_proto.ClusterTelemetryUpdate, @ptrFromInt(msg_payload_va)).*;
             if (isLoopback(src_node) or ipv6Eq(src_node, g_local_node)) {
                 // Local dashd sample: stamp our identity and share with peers.
@@ -727,8 +727,8 @@ fn dispatchDipcMessage(
         payload_len >= lib.CONTROL_HEADER_SIZE)
     {
         handleKernelControlReply(dipc_phys, DMA_BASE_VA, token, recv_va);
-    } else if (in_header.src.endpoint == @intFromEnum(lib.ReservedEndpoint.netd) or
-               (payload_len >= 4 and std.mem.readInt(u32, payload_ptr[0..4], .little) == netd_proto.MAGIC))
+    } else if (in_header.src.endpoint == @backingInt(lib.ReservedEndpoint.netd) or
+        (payload_len >= 4 and std.mem.readInt(u32, payload_ptr[0..4], .little) == netd_proto.MAGIC))
     {
         handleNetdProtocol(bs, dipc_phys, DMA_BASE_VA, token, recv_va);
     } else if (payload_len >= 4 and std.mem.readInt(u32, payload_ptr[0..4], .little) == clusterd_proto.MAGIC) {

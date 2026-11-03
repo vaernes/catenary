@@ -381,7 +381,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
 
             if (build_options.expected_kernel_hash) |expected_hex| {
                 bootLog("SECURE BOOT: Verifying kernel integrity...\n");
-                var expected_bytes: [32]u8 = [_]u8{0} ** 32;
+                var expected_bytes: [32]u8 = @splat(0);
                 var ok = true;
                 if (expected_hex.len == 64) {
                     for (0..32) |idx| {
@@ -431,6 +431,7 @@ pub export fn _kernel_main() callconv(.c) noreturn {
                 };
             }
             manager.init(hhdm.offset);
+            varde_shell.init();
             if (build_options.services_active) {
                 service_manager.bootAll(hhdm.offset, node_config.getLocalNode()) catch |err| {
                     bootLog("Service Manager bootAll failed: ");

@@ -643,9 +643,10 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const vsh = @import("../../kernel/varde_shell.zig");
             const page = arg0;
             if (page == 0) return 0;
-            const len = @min(vsh.history_pos, 4096);
+            const len = @min(vsh.history_pos, 4095);
             const dest: [*]u8 = @ptrFromInt(page + hhdm_offset);
             @memcpy(dest[0..len], vsh.history_buf[0..len]);
+            dest[len] = 0;
             return len;
         },
         abi.SYS_FB_DRAW => {

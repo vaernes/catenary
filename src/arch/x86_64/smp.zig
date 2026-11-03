@@ -19,12 +19,12 @@ pub const CpuCore = struct {
     is_bsp: bool,
 };
 
-var cpus: [MAX_CPUS]CpuCore = [_]CpuCore{.{
+var cpus: [MAX_CPUS]CpuCore = @splat(.{
     .id = 0,
     .lapic_id = 0,
     .online = true,
     .is_bsp = true,
-}} ** MAX_CPUS;
+});
 
 var cpu_count: usize = 1;
 
@@ -34,8 +34,8 @@ var cpu_count: usize = 1;
 
 var ap_online_flag: bool = false;
 var serial_lock: bool = false;
-var serial_lock_depth: [MAX_CPUS]u32 = [_]u32{0} ** MAX_CPUS;
-var serial_saved_flags: [MAX_CPUS]u64 = [_]u64{0} ** MAX_CPUS;
+var serial_lock_depth: [MAX_CPUS]u32 = @splat(0);
+var serial_saved_flags: [MAX_CPUS]u64 = @splat(0);
 
 pub fn serialAcquire() void {
     var flags: u64 = 0;
@@ -164,7 +164,7 @@ fn lapicWaitIdle() void {
 // Per-AP Stacks
 // ---------------------------------------------------------------------------
 
-var ap_stacks: [7][4096]u8 align(16) = [_][4096]u8{[_]u8{0} ** 4096} ** 7;
+var ap_stacks: [7][4096]u8 align(16) = @splat(@splat(0));
 
 // ---------------------------------------------------------------------------
 // AP Entry Point (called from 64-bit trampoline stub)
@@ -203,7 +203,7 @@ export fn apEntry(ap_idx: u64) callconv(.c) noreturn {
     // 5. Enable SSE / FPU on AP
     var cr0 = cpu.readCr0();
     cr0 &= ~@as(u64, 1 << 2); // clear EM
-    cr0 |= (1 << 1);          // set MP
+    cr0 |= (1 << 1); // set MP
     cpu.writeCr0(cr0);
 
     var cr4 = cpu.readCr4();
@@ -257,16 +257,16 @@ fn writeTrampoline(hhdm: u64, bsp_cr3: u64) void {
 
     // 16-bit real-mode stub at 0x00
     const s16 = [_]u8{
-        0xFA,                          // cli
-        0xFC,                          // cld
-        0x31, 0xC0,                    // xor ax, ax
-        0x8E, 0xD8,                    // mov ds, ax
-        0x8E, 0xC0,                    // mov es, ax
-        0x8E, 0xD0,                    // mov ss, ax
+        0xFA, // cli
+        0xFC, // cld
+        0x31, 0xC0, // xor ax, ax
+        0x8E, 0xD8, // mov ds, ax
+        0x8E, 0xC0, // mov es, ax
+        0x8E, 0xD0, // mov ss, ax
         0x0F, 0x01, 0x16, 0x80, 0x80, // lgdt [0x8080]
-        0x0F, 0x20, 0xC0,              // mov eax, cr0
-        0x0C, 0x01,                    // or al, 1
-        0x0F, 0x22, 0xC0,              // mov cr0, eax
+        0x0F, 0x20, 0xC0, // mov eax, cr0
+        0x0C, 0x01, // or al, 1
+        0x0F, 0x22, 0xC0, // mov cr0, eax
         0x66, 0xEA, 0x30, 0x80, 0x00, 0x00, 0x08, 0x00, // jmpf 0x08:0x8030
     };
     for (s16, 0..) |b, i| t[i] = b;
@@ -274,22 +274,22 @@ fn writeTrampoline(hhdm: u64, bsp_cr3: u64) void {
     // 32-bit protected-mode stub at 0x30
     // Order per Intel SDM 9.8.5: PAE -> EFER.LME|NXE -> CR3 -> CR0.PG -> Long Mode Jump
     const s32 = [_]u8{
-        0x66, 0xB8, 0x10, 0x00,        // mov ax, 0x10
-        0x8E, 0xD8,                    // mov ds, ax
-        0x8E, 0xC0,                    // mov es, ax
-        0x8E, 0xD0,                    // mov ss, ax
-        0x0F, 0x20, 0xE0,              // mov eax, cr4
-        0x83, 0xC8, 0x20,              // or eax, 0x20 (enable CR4.PAE)
-        0x0F, 0x22, 0xE0,              // mov cr4, eax
+        0x66, 0xB8, 0x10, 0x00, // mov ax, 0x10
+        0x8E, 0xD8, // mov ds, ax
+        0x8E, 0xC0, // mov es, ax
+        0x8E, 0xD0, // mov ss, ax
+        0x0F, 0x20, 0xE0, // mov eax, cr4
+        0x83, 0xC8, 0x20, // or eax, 0x20 (enable CR4.PAE)
+        0x0F, 0x22, 0xE0, // mov cr4, eax
         0xB9, 0x80, 0x00, 0x00, 0xC0, // mov ecx, 0xC0000080 (IA32_EFER MSR)
-        0x0F, 0x32,                    // rdmsr
+        0x0F, 0x32, // rdmsr
         0x0D, 0x00, 0x09, 0x00, 0x00, // or eax, 0x900 (enable EFER.LME | EFER.NXE)
-        0x0F, 0x30,                    // wrmsr
+        0x0F, 0x30, // wrmsr
         0xA1, 0xB0, 0x80, 0x00, 0x00, // mov eax, [0x80B0] (load CR3 physical address)
-        0x0F, 0x22, 0xD8,              // mov cr3, eax
-        0x0F, 0x20, 0xC0,              // mov eax, cr0
+        0x0F, 0x22, 0xD8, // mov cr3, eax
+        0x0F, 0x20, 0xC0, // mov eax, cr0
         0x0D, 0x01, 0x00, 0x00, 0x80, // or eax, 0x80000001 (enable CR0.PG and CR0.PE)
-        0x0F, 0x22, 0xC0,              // mov cr0, eax
+        0x0F, 0x22, 0xC0, // mov cr0, eax
         0xEA, 0x00, 0x81, 0x00, 0x00, 0x18, 0x00, // jmpf 0x18:0x8100
     };
     for (s32, 0..) |b, i| t[0x30 + i] = b;
@@ -297,14 +297,14 @@ fn writeTrampoline(hhdm: u64, bsp_cr3: u64) void {
     // 64-bit long-mode stub at 0x100
     const s64 = [_]u8{
         0x48, 0xB8, 0xC0, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x80C0
-        0x48, 0x8B, 0x20,                                           // mov rsp, [rax]
-        0x48, 0x83, 0xEC, 0x08,                                     // sub rsp, 8 (align for SysV ABI)
+        0x48, 0x8B, 0x20, // mov rsp, [rax]
+        0x48, 0x83, 0xEC, 0x08, // sub rsp, 8 (align for SysV ABI)
         0x48, 0xB8, 0xC8, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x80C8
-        0x48, 0x8B, 0x38,                                           // mov rdi, [rax]
+        0x48, 0x8B, 0x38, // mov rdi, [rax]
         0x48, 0xB8, 0xB8, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x80B8
-        0x48, 0x8B, 0x00,                                           // mov rax, [rax]
-        0xFF, 0xE0,                                                 // jmp rax
-        0xF4, 0xEB, 0xFD,                                           // hlt; jmp -3
+        0x48, 0x8B, 0x00, // mov rax, [rax]
+        0xFF, 0xE0, // jmp rax
+        0xF4, 0xEB, 0xFD, // hlt; jmp -3
     };
     for (s64, 0..) |b, i| t[0x100 + i] = b;
 }
@@ -322,7 +322,7 @@ fn setApParams(hhdm: u64, stack_top: u64, ap_idx: u64) void {
 pub fn init(hhdm_offset: u64) void {
     const c1 = cpu.cpuid(1, 0);
     const bsp_apic_id: u8 = @truncate(c1.ebx >> 24);
-    const max_ids: u8     = @truncate((c1.ebx >> 16) & 0xFF);
+    const max_ids: u8 = @truncate((c1.ebx >> 16) & 0xFF);
     cpus[0].lapic_id = bsp_apic_id;
 
     serialAcquire();
