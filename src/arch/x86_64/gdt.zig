@@ -32,7 +32,8 @@ var per_cpu_tss: [MAX_CPUS]Tss align(16) = @splat(.{
 });
 
 pub fn tssSelectorForCpu(cpu_id: usize) u16 {
-    return @as(u16, @intCast(0x28 + cpu_id * 16));
+    const id = if (cpu_id < MAX_CPUS) cpu_id else 0;
+    return @as(u16, @intCast(0x28 + id * 16));
 }
 
 pub fn initTssForCpu(cpu_id: usize) void {
@@ -125,6 +126,14 @@ fn printHex(n: u64) void {
     for (buf) |c| cpu.outb(0x3F8, c);
 }
 
+/// Returns the 64-bit linear base address of the Task State Segment (TSS)
+/// for the specified CPU core. Clamps out-of-range IDs to core 0.
+pub fn tssBaseForCpu(cpu_id: usize) u64 {
+    const id = if (cpu_id < MAX_CPUS) cpu_id else 0;
+    return @intFromPtr(&per_cpu_tss[id]);
+}
+
+/// Backwards-compatible alias returning Core 0's TSS base.
 pub fn tssBase() u64 {
-    return @intFromPtr(&per_cpu_tss[0]);
+    return tssBaseForCpu(0);
 }

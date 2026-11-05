@@ -176,9 +176,9 @@ fn writeE820Entry(page: []u8, index: usize, addr: u64, size: u64, entry_type: u3
     writeLe32(page, base + 16, entry_type);
 }
 
-pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, cmdline: []const u8, guest_ram_bytes: u64, initrd_gpa: u64, initrd_size: u64) [zero_page_size]u8 {
+pub fn buildBootParamsPageInto(page: *[zero_page_size]u8, parsed: *const ParsedBzImage, layout: LaunchLayout, cmdline: []const u8, guest_ram_bytes: u64, initrd_gpa: u64, initrd_size: u64) void {
     _ = cmdline;
-    var page: [zero_page_size]u8 = @splat(0);
+    @memset(page, 0);
     const template = bootParamsTemplate(parsed);
     std.mem.copyForwards(u8, page[setup_header_offset .. setup_header_offset + template.len], template);
 
@@ -205,7 +205,11 @@ pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, c
         writeLe32(page[0..], ramdisk_image_offset, @as(u32, @truncate(initrd_gpa)));
         writeLe32(page[0..], ramdisk_size_offset, @as(u32, @truncate(initrd_size)));
     }
+}
 
+pub fn buildBootParamsPage(parsed: *const ParsedBzImage, layout: LaunchLayout, cmdline: []const u8, guest_ram_bytes: u64, initrd_gpa: u64, initrd_size: u64) [zero_page_size]u8 {
+    var page: [zero_page_size]u8 = @splat(0);
+    buildBootParamsPageInto(&page, parsed, layout, cmdline, guest_ram_bytes, initrd_gpa, initrd_size);
     return page;
 }
 

@@ -148,7 +148,9 @@ fn allowedSyscallMask(kind: ServiceKind) u32 {
             bit(abi.SYS_TRY_RECV) |
             bit(abi.SYS_GET_VARDE_LOG) |
             bit(abi.SYS_VARDE_INJECT) |
-            bit(abi.SYS_FB_GET_INFO),
+            bit(abi.SYS_FB_GET_INFO) |
+            bit(abi.SYS_GET_VM_CONSOLE_LOG) |
+            bit(abi.SYS_VM_CONSOLE_INJECT),
         .containerd => base_mask |
             bit(abi.SYS_TRY_RECV),
         else => base_mask,

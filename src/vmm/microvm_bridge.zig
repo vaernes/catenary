@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const identity = @import("../ipc/identity.zig");
 const microvm_transport = @import("microvm_transport.zig");
 const virtio_blk = @import("virtio_blk.zig");
@@ -23,12 +24,47 @@ var buf: [MAX_PENDING]Entry = undefined;
 var head: u8 = 0;
 var tail: u8 = 0;
 var count: u8 = 0;
+var bridge_lock: bool = false;
+
+fn acquireLock() u64 {
+    var flags: u64 = 0;
+    if (!builtin.is_test and comptime builtin.cpu.arch == .x86_64) {
+        asm volatile (
+            \\pushfq
+            \\popq %[flags]
+            \\cli
+            : [flags] "=r" (flags),
+        );
+    }
+    while (@atomicRmw(bool, &bridge_lock, .Xchg, true, .seq_cst)) {
+        if (!builtin.is_test and comptime builtin.cpu.arch == .x86_64) {
+            asm volatile ("pause");
+        } else {
+            std.atomic.spinLoopHint();
+        }
+    }
+    return flags;
+}
+
+fn releaseLock(flags: u64) void {
+    @atomicStore(bool, &bridge_lock, false, .seq_cst);
+    if (!builtin.is_test and comptime builtin.cpu.arch == .x86_64) {
+        asm volatile (
+            \\pushq %[flags]
+            \\popfq
+            :
+            : [flags] "r" (flags),
+        );
+    }
+}
 
 fn capU8() u8 {
     return @as(u8, @intCast(MAX_PENDING));
 }
 
 pub fn init() void {
+    const flags = acquireLock();
+    defer releaseLock(flags);
     head = 0;
     tail = 0;
     count = 0;
@@ -37,6 +73,8 @@ pub fn init() void {
 // Bring-up boundary for future MicroVM-local ingress.
 // Ring 0 records the target MicroVM handle and the DIPC page ownership moves to this queue.
 pub fn enqueue(microvm_id: identity.MicrovmId, page_phys: u64) QueueError!void {
+    const flags = acquireLock();
+    defer releaseLock(flags);
     if (count >= capU8()) return error.Busy;
     buf[@as(usize, tail)] = .{ .microvm_id = microvm_id, .page_phys = page_phys };
     tail +%= 1;
@@ -45,6 +83,8 @@ pub fn enqueue(microvm_id: identity.MicrovmId, page_phys: u64) QueueError!void {
 }
 
 pub fn dequeue() ?Entry {
+    const flags = acquireLock();
+    defer releaseLock(flags);
     if (count == 0) return null;
     const entry = buf[@as(usize, head)];
     head +%= 1;
@@ -79,9 +119,12 @@ fn translateGuestPageHpa(vmid: u32, page_gpa: u64) ?u64 {
         const raw = translate(vmid, aligned) orelse return null;
         return raw & ~@as(u64, 0xFFF);
     }
-    if (!@import("builtin").is_test) {
+    if (!builtin.is_test) {
+        const microvm_reg = @import("microvm_registry.zig");
+        const inst = microvm_reg.findMutable(vmid) orelse return null;
+        const root = inst.ept_pml4_phys orelse return null;
         const vmx = @import("../arch/x86_64/vmx.zig");
-        return vmx.findGuestPageHpaPublic(aligned);
+        return vmx.translateEptGpaToHpa(root, aligned);
     }
     return null;
 }
@@ -599,4 +642,77 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     try std.testing.expectEqual(@as(u16, 2), readGuestInt(u16, hhdm, vmid, q.device_addr + 2).?);
     try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 4 + 8 + 4).?);
     try std.testing.expectEqual(@as(usize, 1), test_irq_count);
+}
+
+test "m1: microvm_registry affinity, device state, and uart circular buffer" {
+    const reg = @import("microvm_registry.zig");
+    reg.init();
+
+    const name: [32]u8 = "test-vm-1".* ++ @as([23]u8, @splat(0));
+    const container: [32]u8 = "container-1".* ++ @as([21]u8, @splat(0));
+
+    const id = reg.createWithAffinity(name, container, 1024, 1, 0, 0, 0, 0, 1).?;
+    try std.testing.expect(id >= 1);
+
+    const inst = reg.lookup(id).?;
+    try std.testing.expectEqual(@as(?u8, 1), inst.pinned_cpu);
+    try std.testing.expectEqual(true, inst.in_use);
+    try std.testing.expectEqual(reg.MicrovmState.created, inst.state);
+
+    // Verify setPinnedCpu
+    try std.testing.expect(reg.setPinnedCpu(id, 2));
+    const updated = reg.lookup(id).?;
+    try std.testing.expectEqual(@as(?u8, 2), updated.pinned_cpu);
+
+    // Verify VirtualDeviceState & UART circular buffer
+    var uart: reg.VmUartState = .{};
+    try std.testing.expect(uart.isRxEmpty());
+    try std.testing.expectEqual(@as(usize, 0), uart.tx_len);
+
+    // Test UART TX writing
+    uart.writeTxSlice("Hello, MicroVM!");
+    try std.testing.expectEqual(@as(usize, 15), uart.tx_len);
+    var log_buf: [32]u8 = undefined;
+    const n = uart.readTxLog(&log_buf);
+    try std.testing.expectEqual(@as(usize, 15), n);
+    try std.testing.expectEqualStrings("Hello, MicroVM!", log_buf[0..n]);
+
+    // Test UART RX injection and consumption
+    try std.testing.expect(uart.injectRxByte('X'));
+    try std.testing.expect(!uart.isRxEmpty());
+    try std.testing.expect(uart.irq4_pending);
+    try std.testing.expectEqual(@as(?u8, 'X'), uart.readRxByte());
+    try std.testing.expect(uart.isRxEmpty());
+    try std.testing.expect(!uart.irq4_pending);
+
+    // Test registry console log helper
+    var log_out: [64]u8 = undefined;
+    _ = reg.getConsoleLog(id, &log_out);
+    try std.testing.expect(reg.injectConsoleInput(id, 'Z'));
+}
+
+test "m1: microvm_bridge synchronized enqueue and dequeue" {
+    init();
+
+    const m_id: identity.MicrovmId = 42;
+    const page: u64 = 0x10000;
+
+    try enqueue(m_id, page);
+    const entry = dequeue().?;
+    try std.testing.expectEqual(@as(u32, 42), entry.microvm_id);
+    try std.testing.expectEqual(page, entry.page_phys);
+
+    // Queue should now be empty
+    try std.testing.expect(dequeue() == null);
+}
+
+test "m1: gdt per-core tssBaseForCpu" {
+    const gdt_mod = @import("../arch/x86_64/gdt.zig");
+    const tss0 = gdt_mod.tssBaseForCpu(0);
+    const tss1 = gdt_mod.tssBaseForCpu(1);
+
+    try std.testing.expect(tss0 != 0);
+    try std.testing.expect(tss1 != 0);
+    try std.testing.expect(tss0 != tss1);
+    try std.testing.expectEqual(tss0, gdt_mod.tssBase());
 }

@@ -17,6 +17,8 @@ pub const Thread = struct {
     is_vmx: bool = false,
     vmid: u32 = 0,
     vcpu_idx: u32 = 0,
+    /// Bound SMP core affinity (null = unpinned, 0 = BSP, 1 = AP 1, etc.)
+    pinned_cpu: ?u8 = null,
     /// Top of this thread's dedicated kernel interrupt stack (TSS.rsp0).
     /// 0 = kernel thread, no Ring-3 transitions.
     kernel_int_stack_top: u64 = 0,
@@ -464,7 +466,7 @@ pub fn spawnUserThread(sid: u32, entry_va: u64, stack_va: u64) !u32 {
     return error.NoEmptySlots;
 }
 
-pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx: u32) !u32 {
+pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx: u32, pinned_cpu: ?u8) !u32 {
     acquireScheduleLock();
     defer releaseScheduleLock();
     const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
@@ -513,6 +515,7 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
                 .is_vmx = is_vmx,
                 .vmid = vmid,
                 .vcpu_idx = vcpu_idx,
+                .pinned_cpu = pinned_cpu,
                 .entry_fn = entry,
             };
             if (is_vmx) {
@@ -524,6 +527,18 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
         }
     }
     return error.NoEmptySlots;
+}
+
+pub fn setThreadAffinity(tid: u32, cpu_id: ?u8) bool {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
+    for (0..THREAD_TARGET_COUNT) |i| {
+        if (threads[i].state != .Empty and threads[i].id == tid) {
+            threads[i].pinned_cpu = cpu_id;
+            return true;
+        }
+    }
+    return false;
 }
 
 fn vmx_thread_bridge() void {
@@ -602,7 +617,18 @@ pub fn schedule() void {
     while (i < max_runnable) : (i += 1) {
         const candidate = (old_idx + 1 + i) % max_runnable;
         if (candidate == 0) continue; // Skip thread 0 (BSP boot/idle thread)
-        if (cpu_id != 0 and (threads[candidate].sid == 0 or threads[candidate].is_vmx)) continue;
+
+        // Core affinity filtering:
+        // Pinned threads may ONLY execute on their assigned CPU core.
+        // Unpinned threads:
+        // - AP cores (cpu_id != 0) only run Ring-3 service tasks (sid != 0).
+        // - BSP (cpu_id == 0) runs unpinned Ring-3 services and kernel tasks.
+        if (threads[candidate].pinned_cpu) |pin| {
+            if (pin != @as(u8, @intCast(cpu_id))) continue;
+        } else {
+            if (cpu_id != 0 and threads[candidate].sid == 0) continue;
+        }
+
         if (threads[candidate].state == .Ready and !thread_active[candidate]) {
             next_idx = candidate;
             break;

@@ -34,6 +34,11 @@ fn serialWrite(s: []const u8) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-VM SMP Affinity State
+// ---------------------------------------------------------------------------
+var next_core_affinity: u8 = 0;
+
 fn payloadBase(hhdm_offset: u64, page_phys: u64) [*]const u8 {
     return @ptrFromInt(page_phys + hhdm_offset + dipc.HEADER_SIZE);
 }
@@ -404,14 +409,19 @@ pub fn handleKernelControlPage(
             };
             const table_const: *const endpoint_table.EndpointTable = table;
             const microvm_registry = @import("../vmm/microvm_registry.zig");
+            const smp = @import("../arch/x86_64/smp.zig");
+            const online_cpus = smp.getCpuCount();
 
+            // 1. If boot-staged instance 1 is ready, launch it on Core 0
             if (build_options.vmm_active and build_options.services_active) {
                 const vmx = @import("../arch/x86_64/vmx.zig");
                 if (vmx.launchStagedInstance()) |id| {
                     if (microvm_registry.findMutable(id)) |inst| {
                         if (p.name[0] != 0) inst.name = p.name;
                         if (p.container[0] != 0) inst.container = p.container;
+                        if (inst.pinned_cpu == null) inst.pinned_cpu = 0;
                     }
+                    next_core_affinity = if (online_cpus > 1) 1 else 0;
                     serialWrite("kernel_control: staged MicroVM launched via DIPC\n");
                     reply.status = .ok;
                     reply.instance_id = id;
@@ -420,9 +430,40 @@ pub fn handleKernelControlPage(
                 } else |_| {}
             }
 
-            if (microvm_registry.create(p.name, p.container, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size)) |id| {
-                if (hdr.src.endpoint == @backingInt(identity.ReservedEndpoint.windowd)) {
-                    _ = microvm_registry.start(id);
+            // 2. Assign round-robin core affinity across online SMP cores
+            const target_core: u8 = if (online_cpus > 1)
+                @intCast(next_core_affinity % online_cpus)
+            else
+                0;
+            next_core_affinity = if (online_cpus > 1)
+                @intCast((target_core + 1) % online_cpus)
+            else
+                0;
+
+            // 3. Allocate slot in microvm_registry with core affinity
+            if (microvm_registry.createWithAffinity(p.name, p.container, p.mem_pages, p.vcpus, p.kernel_phys, p.kernel_size, p.initramfs_phys, p.initramfs_size, target_core)) |id| {
+                if (microvm_registry.findMutable(id)) |inst| {
+                    if (build_options.vmm_active) {
+                        const vmx = @import("../arch/x86_64/vmx.zig");
+                        vmx.stageGuestForInstance(inst) catch {
+                            serialWrite("kernel_control: dynamic staging failed for VM\n");
+                            reply.status = .internal_error;
+                            try sendControlReply(control_protocol.CreateMicrovmResult, hhdm_offset, table_const, hdr, .create_microvm, reply);
+                            return;
+                        };
+
+                        // If created by windowd, start immediately and spawn pinned thread
+                        if (hdr.src.endpoint == @backingInt(identity.ReservedEndpoint.windowd)) {
+                            if (microvm_registry.start(id)) {
+                                const scheduler = @import("../kernel/scheduler.zig");
+                                _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch {};
+                            }
+                        }
+                    } else {
+                        if (hdr.src.endpoint == @backingInt(identity.ReservedEndpoint.windowd)) {
+                            _ = microvm_registry.start(id);
+                        }
+                    }
                 }
                 serialWrite("configd: MicroVM created via DIPC\n");
                 reply.status = .ok;
@@ -434,10 +475,37 @@ pub fn handleKernelControlPage(
             try sendControlReply(control_protocol.CreateMicrovmResult, hhdm_offset, table_const, hdr, .create_microvm, reply);
         },
         .start_microvm => {
+            if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
             if (remaining != @sizeOf(control_protocol.StartMicrovmPayload)) return error.BadPayload;
             const p: *const control_protocol.StartMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
             const microvm_registry = @import("../vmm/microvm_registry.zig");
+            const inst = microvm_registry.findMutable(p.instance_id) orelse return error.BadPayload;
+
+            // Idempotent: ignore if already running
+            if (inst.state == .running) return;
+
+            // Resolve target core affinity
+            const smp = @import("../arch/x86_64/smp.zig");
+            const online_cpus = smp.getCpuCount();
+            const target_core: u8 = if (inst.pinned_cpu) |pin|
+                pin
+            else blk: {
+                const core: u8 = if (online_cpus > 1) @intCast(next_core_affinity % online_cpus) else 0;
+                next_core_affinity = if (online_cpus > 1) @intCast((core + 1) % online_cpus) else 0;
+                inst.pinned_cpu = core;
+                break :blk core;
+            };
+
             if (!microvm_registry.start(p.instance_id)) return error.BadPayload;
+
+            if (build_options.vmm_active) {
+                const vmx = @import("../arch/x86_64/vmx.zig");
+                if (inst.ept_pml4_phys == null) {
+                    vmx.stageGuestForInstance(inst) catch return error.BadPayload;
+                }
+                const scheduler = @import("../kernel/scheduler.zig");
+                _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch return error.BadPayload;
+            }
         },
         .stop_microvm => {
             if (!isAuthorizedMicrovmSource(hdr)) return error.Unauthorized;
@@ -461,7 +529,7 @@ pub fn handleKernelControlPage(
                 .count = 0,
             };
 
-            for (instances) |inst| {
+            for (instances) |*inst| {
                 if (inst.in_use) {
                     if (res.count < control_protocol.MAX_VM_SNAPSHOT_ENTRIES) {
                         res.entries[res.count] = .{
@@ -498,7 +566,7 @@ pub fn handleKernelControlPage(
 
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             const instances = microvm_registry.getInstances();
-            for (instances) |inst| {
+            for (instances) |*inst| {
                 if (inst.in_use) res.active_vms += 1;
             }
             if (res.active_vms >= logical_cpu_total) {

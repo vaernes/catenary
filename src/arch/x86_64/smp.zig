@@ -5,6 +5,8 @@
 /// Trampoline transitions 16-bit real mode -> 32-bit protected mode -> 64-bit long mode.
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+const vmx = @import("vmx.zig");
 const cpu = @import("cpu.zig");
 const paging = @import("paging.zig");
 const idt = @import("idt.zig");
@@ -164,7 +166,8 @@ fn lapicWaitIdle() void {
 // Per-AP Stacks
 // ---------------------------------------------------------------------------
 
-var ap_stacks: [7][4096]u8 align(16) = @splat(@splat(0));
+const AP_STACK_SIZE: usize = 16384;
+var ap_stacks: [7][AP_STACK_SIZE]u8 align(16) = @splat(@splat(0));
 
 // ---------------------------------------------------------------------------
 // AP Entry Point (called from 64-bit trampoline stub)
@@ -217,7 +220,12 @@ export fn apEntry(ap_idx: u64) callconv(.c) noreturn {
     serialWrite(" online\n");
     serialRelease();
 
-    // 7. Handshake with BSP: mark online
+    // 7. Initialize per-core VMX root state on AP core before entering scheduler
+    if (build_options.vmm_active) {
+        vmx.initApCore(@as(usize, @intCast(ap_idx)));
+    }
+
+    // 8. Handshake with BSP: mark online
     @atomicStore(bool, &ap_online_flag, true, .seq_cst);
 
     // 8. AP Scheduler Loop
@@ -320,6 +328,10 @@ fn setApParams(hhdm: u64, stack_top: u64, ap_idx: u64) void {
 // ---------------------------------------------------------------------------
 
 pub fn init(hhdm_offset: u64) void {
+    if (build_options.vmm_active) {
+        vmx.setHhdmOffset(hhdm_offset);
+    }
+
     const c1 = cpu.cpuid(1, 0);
     const bsp_apic_id: u8 = @truncate(c1.ebx >> 24);
     const max_ids: u8 = @truncate((c1.ebx >> 16) & 0xFF);
@@ -366,6 +378,9 @@ pub fn init(hhdm_offset: u64) void {
     const bsp_cr3 = cpu.readCr3() & ~@as(u64, 0xFFF);
 
     // Prepare trampoline at physical 0x8000
+    if (build_options.vmm_active) {
+        vmx.setHhdmOffset(hhdm_offset);
+    }
     writeTrampoline(hhdm_offset, bsp_cr3);
 
     serialAcquire();
@@ -379,7 +394,7 @@ pub fn init(hhdm_offset: u64) void {
     while (i < ap_count) : (i += 1) {
         const ap_idx: u64 = i + 1;
         const target_apic_id: u32 = @as(u32, @intCast(i + 1));
-        const stack_top: u64 = @intFromPtr(&ap_stacks[i]) + 4096;
+        const stack_top: u64 = @intFromPtr(&ap_stacks[i]) + AP_STACK_SIZE;
 
         setApParams(hhdm_offset, stack_top, ap_idx);
         @atomicStore(bool, &ap_online_flag, false, .seq_cst);

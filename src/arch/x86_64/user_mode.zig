@@ -15,6 +15,7 @@ const endpoint_table = @import("../../ipc/endpoint_table.zig");
 const task_loader = @import("../../services/task_loader.zig");
 const dipc = @import("../../ipc/dipc.zig");
 const router = @import("../../ipc/router.zig");
+const microvm_registry = @import("../../vmm/microvm_registry.zig");
 
 pub extern fn enterUserMode(entry_rip: u64, stack_top: u64, entry_arg0: u64, code_selector: u64, data_selector: u64) void;
 
@@ -873,6 +874,43 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 return 0xFFFFFFFF;
             };
             return @as(u64, tid);
+        },
+        // op=28: SYS_GET_VM_CONSOLE_LOG — read circular console output log of a target MicroVM.
+        // arg0 = physical address of destination DMA page (clamped to 4095 bytes output).
+        // arg1 = target MicroVM instance_id (if 0, defaults to 1).
+        // Returns number of bytes copied (clamped to 4095).
+        // Restricted to windowd.
+        abi.SYS_GET_VM_CONSOLE_LOG => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0;
+            const kind = service_registry.getServiceKind(sid) orelse return 0;
+            if (kind != .windowd) return 0;
+            const page = arg0;
+            if (page == 0) return 0;
+            const raw_vmid = @as(u32, @truncate(arg1));
+            const vmid = if (raw_vmid == 0) 1 else raw_vmid;
+            if (vmid > microvm_registry.TARGET_INSTANCES) return 0;
+            const dest: [*]u8 = @ptrFromInt(page + hhdm_offset);
+            const copied = microvm_registry.getConsoleLog(vmid, dest[0..4095]);
+            dest[copied] = 0;
+            return @as(u64, copied);
+        },
+        // op=29: SYS_VM_CONSOLE_INJECT — inject an ASCII keystroke into the target MicroVM's RX FIFO.
+        // arg0 = target MicroVM instance_id (if 0, defaults to 1).
+        // arg1 = character (u8).
+        // Returns 0 on success, 0xFFFFFFFF on failure.
+        // Restricted to windowd.
+        abi.SYS_VM_CONSOLE_INJECT => {
+            const sid = service_registry.serviceIdForCapability(token) orelse return 0xFFFFFFFF;
+            const kind = service_registry.getServiceKind(sid) orelse return 0xFFFFFFFF;
+            if (kind != .windowd) return 0xFFFFFFFF;
+            const raw_vmid = @as(u32, @truncate(arg0));
+            const vmid = if (raw_vmid == 0) 1 else raw_vmid;
+            if (vmid > microvm_registry.TARGET_INSTANCES) return 0xFFFFFFFF;
+            const ch = @as(u8, @truncate(arg1));
+            if (!microvm_registry.injectConsoleInput(vmid, ch)) {
+                return 0xFFFFFFFF;
+            }
+            return 0;
         },
         else => {},
     }

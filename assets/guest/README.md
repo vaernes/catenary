@@ -40,6 +40,7 @@ Notes:
 - Rebuild that initramfs with `./dev/rebuild_guest_initramfs.sh` after changing [guest_init.c](../../guest_init.c) or [rootfs_init.c](rootfs_init.c).
 - That rebuild script expects a working `cc`, `fakeroot`, `cpio`, and `gzip` on the host.
 - The rebuilt initramfs includes a minimal embedded OCI-style rootfs at `/mnt/container` with `/sbin/init`, `/bin/sh`, and `/usr/bin/env` provided by [rootfs_init.c](rootfs_init.c).
+- The rootfs init process connects `/dev/ttyS0` to standard input and runs its built-in `help`, `env`, `os-release`, and `exit` shell, allowing the guest serial console input path to be tested end to end.
 - The embedded rootfs also ships a small `/etc/os-release` and standard top-level directories so guest handoff exercises a more realistic filesystem layout.
 - Catenary OS currently validates and stages the image, then boots Linux with the embedded guest init path and demo rootfs workload.
 - Validate the direct guest path with `SMOKE_PROFILE=vmx-linux ./test_qemu.sh`.

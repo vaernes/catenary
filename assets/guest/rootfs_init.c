@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 static const char *base_name(const char *path) {
     const char *slash = strrchr(path, '/');
@@ -60,15 +61,24 @@ static int run_shell(char **envp) {
     }
 }
 
-static int run_init(void) {
+static int run_init(char **envp) {
     printf("guest_rootfs: init started\n");
     printf("guest_rootfs: running from embedded OCI rootfs\n");
     print_os_release();
 
-    for (;;) {
-        sleep(30);
-        printf("guest_rootfs: heartbeat\n");
+    const int serial_fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
+    if (serial_fd < 0) {
+        printf("guest_rootfs: cannot open /dev/ttyS0\n");
+        for (;;) sleep(60);
     }
+    if (dup2(serial_fd, STDIN_FILENO) < 0) {
+        printf("guest_rootfs: cannot connect /dev/ttyS0 to stdin\n");
+        for (;;) sleep(60);
+    }
+    if (serial_fd > STDERR_FILENO) close(serial_fd);
+
+    (void)run_shell(envp);
+    for (;;) sleep(60);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -86,5 +96,5 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
 
-    return run_init();
+    return run_init(envp);
 }

@@ -4,6 +4,7 @@ zig-out/
 
 # Python / local tooling
 .venv/
+__pycache__/
 tmp/
 *.tmp
 

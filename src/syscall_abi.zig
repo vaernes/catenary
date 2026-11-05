@@ -163,3 +163,19 @@ pub const SYS_VARDE_INJECT: u64 = 25;
 /// arg1 = user-space stack top VA (exclusive; must be 16-byte aligned).
 /// Returns the kernel thread ID (u32, non-zero) on success, 0xFFFFFFFF on failure.
 pub const SYS_SPAWN_THREAD: u64 = 27;
+
+// ---------------------------------------------------------------------------
+// MicroVM Console (restricted to windowd)
+// ---------------------------------------------------------------------------
+
+/// Read the circular serial console output log of a target MicroVM into a DMA page.
+/// arg0 = physical address of destination DMA page (page-aligned).
+/// arg1 = target MicroVM instance_id (u32; if 0, defaults to 1).
+/// Returns number of bytes copied (clamped to 4095).
+pub const SYS_GET_VM_CONSOLE_LOG: u64 = 28;
+
+/// Inject an ASCII keystroke into the target MicroVM's virtual UART RX FIFO.
+/// arg0 = target MicroVM instance_id (u32; if 0, defaults to 1).
+/// arg1 = character (u8).
+/// Returns 0 on success, 0xFFFFFFFF on failure.
+pub const SYS_VM_CONSOLE_INJECT: u64 = 29;

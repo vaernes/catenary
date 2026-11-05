@@ -71,6 +71,8 @@ pub const SYS_FB_GET_INFO = abi.SYS_FB_GET_INFO;
 pub const SYS_PCI_READ_CONFIG = abi.SYS_PCI_READ_CONFIG;
 pub const SYS_PCI_WRITE_CONFIG = abi.SYS_PCI_WRITE_CONFIG;
 pub const SYS_SPAWN_THREAD = abi.SYS_SPAWN_THREAD;
+pub const SYS_GET_VM_CONSOLE_LOG = abi.SYS_GET_VM_CONSOLE_LOG;
+pub const SYS_VM_CONSOLE_INJECT = abi.SYS_VM_CONSOLE_INJECT;
 
 pub const DIPC_RECV_VA: u64 = 0x0000_7F00_0000_0000;
 pub const DMA_BASE_VA: u64 = 0x0000_7D00_0000_0000;
@@ -529,6 +531,25 @@ pub fn drawTextBg(dma_phys: u64, dma_va: u64, row: u32, col: u32, fg: u32, bg: u
     const arg0 = (dma_phys & 0xFF_FFFF_FFFF) | (@as(u64, bg & 0xFF_FFFF) << 40);
     const arg1 = (@as(u64, row) << 48) | (@as(u64, col) << 32) | (fg & 0xFF_FFFF);
     _ = syscall(SYS_FB_DRAW_COLORED, arg0, arg1, token);
+}
+
+// --- MicroVM Console Helpers ---
+
+pub fn getVmConsoleLog(arg0_val: anytype, arg1_val: anytype, token: u64) usize {
+    const T1 = @TypeOf(arg1_val);
+    if (T1 == []u8 or T1 == []const u8) {
+        const vmid = @as(u64, @intCast(arg0_val));
+        const buf_ptr = @intFromPtr(arg1_val.ptr);
+        return @as(usize, @intCast(syscall(SYS_GET_VM_CONSOLE_LOG, buf_ptr, vmid, token)));
+    } else {
+        const dma_phys = @as(u64, @intCast(arg0_val));
+        const instance_id = @as(u64, @intCast(arg1_val));
+        return @as(usize, @intCast(syscall(SYS_GET_VM_CONSOLE_LOG, dma_phys, instance_id, token)));
+    }
+}
+
+pub fn injectVmConsole(instance_id: u32, ch: u8, token: u64) bool {
+    return syscall(SYS_VM_CONSOLE_INJECT, @as(u64, instance_id), @as(u64, ch), token) == 0;
 }
 
 // --- DIPC Helpers ---

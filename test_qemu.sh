@@ -41,9 +41,18 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false"
         DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;windowd: input event received;[UI] MicroVM provisioned: alpine-node-01;varde_shell: executed 'ps';varde_shell: executed 'vmlist';varde_shell: executed 'cluster';varde_shell: executed 'net-stat';varde_shell: executed 'storage-stat'"
         ;;
+    phase9)
+        if [ "${SMP:-2}" -lt 2 ]; then
+            SMP=2
+        fi
+        DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=true"
+        DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;[UI] MicroVM provisioned: alpine-node-01;[UI] Switched console to MicroVM #2"
+        DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
+        DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1;[vm1] Catenary OS Guest Init: SUCCESS;[vm1] guest_rootfs: init started;[vm2] Catenary OS Guest Init: SUCCESS;[vm2] guest_rootfs: init started;[vm2] guest_rootfs: shell ready;[vm2] help env os-release exit"
+        ;;
     *)
         echo "[!] Unknown SMOKE_PROFILE: ${SMOKE_PROFILE}" >&2
-        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8" >&2
+        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8, phase9" >&2
         exit 2
         ;;
 esac
@@ -54,16 +63,7 @@ VMX_EPT_PATTERNS=${VMX_EPT_PATTERNS:-${DEFAULT_VMX_EPT_PATTERNS}}
 VMX_LINUX_PATTERNS=${VMX_LINUX_PATTERNS:-${DEFAULT_VMX_LINUX_PATTERNS}}
 
 pattern_seen() {
-    local pattern="$1"
-    perl -e '
-        my ($pattern, $file) = @ARGV;
-        open my $fh, q{<}, $file or exit 2;
-        local $/;
-        my $text = <$fh>;
-        my @chars = split //, $pattern;
-        my $regex = join(q{\.*}, map { quotemeta($_) } @chars);
-        exit($text =~ /$regex/s ? 0 : 1);
-    ' "$pattern" qemu_serial.log
+    grep -Fq -- "$1" qemu_serial.log
 }
 
 echo "[+] Building Catenary OS..."
@@ -161,6 +161,43 @@ s.close()
 '
 }
 
+inject_ui_phase9_keys() {
+    python3 -c '
+import socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect("/tmp/catenary_qemu_mon.sock")
+time.sleep(0.2)
+def send_keys(keys, delay=0.12):
+    for k in keys:
+        s.sendall(f"sendkey {k}\n".encode())
+        time.sleep(delay)
+
+# 1. Advance to memory, select 128 MB for the Linux guest, then create and launch MicroVM 2
+send_keys(["ret", "ret"], 0.15)
+send_keys(["right", "right"], 0.15)
+send_keys(["ret", "ret", "ret", "ret"], 0.15)
+time.sleep(0.4)
+
+# 2. Switch focus to Guest Serial Console pane (F6) and switch active console to MicroVM 2 (F8)
+send_keys(["f6"], 0.2)
+send_keys(["f8"], 0.2)
+
+deadline = time.monotonic() + 60
+while time.monotonic() < deadline:
+    with open("qemu_serial.log", "r", errors="replace") as log:
+        if "[vm2] guest_rootfs: shell ready" in log.read():
+            break
+    time.sleep(0.25)
+else:
+    raise SystemExit("MicroVM 2 guest shell did not become ready")
+
+# 3. Forward a command and require the guest shell response in the smoke profile
+send_keys(["h", "e", "l", "p", "ret"], 0.1)
+s.close()
+'
+}
+
 echo "[+] Waiting for all milestones (timeout ${TIMEOUT_SECS}s)..."
 ok=0
 required_patterns=()
@@ -192,6 +229,13 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
             if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "configd: MicroVM created via DIPC"; then
                 echo "[+] Injecting Phase 8 UI & Varde Shell keystrokes via QEMU monitor..."
                 inject_ui_phase8_keys
+                ui_keys_injected=1
+            fi
+        fi
+        if [ "${SMOKE_PROFILE}" = "phase9" ] && [ "${ui_keys_injected}" -eq 0 ]; then
+            if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "kernel_control: staged MicroVM launched via DIPC"; then
+                echo "[+] Injecting Phase 9 Multi-VM & Guest Console keystrokes via QEMU monitor..."
+                inject_ui_phase9_keys
                 ui_keys_injected=1
             fi
         fi
