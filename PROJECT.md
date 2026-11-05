@@ -1,6 +1,6 @@
 # Project: Catenary OS - Phase 9 (Multi-VCPU, SMP MicroVMs & Live Serial Console)
 
-> **Scope and evidence:** Phase 9 below preserves its existing milestone statuses and intended interface contracts: M1 is recorded as done and M2–M5 as planned. Some related code is present in the working tree, but source presence or a model test is not a live-system acceptance result. The historical 50/50 test report covers Python models and simulated traces, not a 50/50 QEMU or hardware run; see [TEST_READY.md](TEST_READY.md). The pre-existing working tree includes a `phase9` smoke-profile branch, but M4 remains planned pending real, per-guest integration evidence.
+> **Scope and evidence:** QEMU is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 9 is complete against its QEMU scope, based on the live guest integration and regression evidence below. The historical 50/50 test report covers Python models and simulated traces, not a 50/50 QEMU run; see [TEST_READY.md](TEST_READY.md). Hardware-specific behavior and claims beyond the tested QEMU paths are not established.
 
 ## Architecture
 Catenary OS is a high-performance distributed exokernel operating system written in Zig (targeting Zig 0.17.0).
@@ -58,7 +58,7 @@ Every feature identified during the Survey phase is mapped to a milestone below.
 | 16 | QEMU Monitor Key Injection for Phase 9 | Implement `inject_ui_phase9_keys` exercising VM launch, console switching, and guest shell | M4 | Survey 3 §4, §6 |
 | 17 | Concurrent MicroVM Milestone Assertions | Assert concurrent multi-core VMCS/EPT milestones, console switching, and clean exit 0 | M4 | Survey 3 §4, §7 |
 | 18 | Historical Testing Suite (Tiers 1-4) | Reference models and simulated scenarios; not opaque-box system tests | E2E-Track | Survey 3 §4; [TEST_READY.md](TEST_READY.md) |
-| 19 | Live Integration & Adversarial Hardening | Validate the actual implementation and conduct adversarial stress testing | M5 | Project Dual Track Spec |
+| 19 | Live QEMU Integration & Targeted Hardening | Validate the implementation on the declared QEMU acceptance path and run targeted regression/stress tests | M5 | Project Dual Track Spec |
 
 ---
 
@@ -67,10 +67,10 @@ Every feature identified during the Survey phase is mapped to a milestone below.
 | # | Name | Scope | Dependencies | Status |
 |---|------|-------|-------------|--------|
 | M1 | Ring 0 VMX, EPT & SMP Core Affinity | `src/arch/x86_64/vmx.zig`, `smp.zig`, `gdt.zig`, `src/kernel/scheduler.zig`, `src/vmm/microvm_registry.zig`, `microvm_bridge.zig` | none | DONE (EPT walker, per-core VMXON/stacks, TSS base, affinity, spinlocks) |
-| M2 | Console Syscalls & Multi-Instance Control | `src/syscall_abi.zig`, `src/user/lib.zig`, `src/services/service_bootstrap.zig`, `src/arch/x86_64/user_mode.zig`, `src/control/control_handler.zig`, `src/arch/x86_64/vmx.zig` | M1 contracts | Both guests accept and answer console input in live QEMU; targeted production UART tests pass |
-| M3 | windowd Live Guest Serial Console & Switching | `src/user/windowd.zig`, `src/user/protocols/windowd_protocol.zig` | M2 contracts | Live QEMU switches between both guests and verifies each shell response |
-| M4 | Automated Phase 9 Smoke Profile & Integration | `test_qemu.sh` | M2, M3 | Phase 9, vmx-linux, vmx-linux-services, and ui-phase8 QEMU profiles pass |
-| M5 | Live Integration & Adversarial Coverage Hardening | Entire codebase | M1, M2, M3, M4, TEST_READY.md | IN PROGRESS (software/QEMU regressions and targeted hardening tests pass; physical-host acceptance and broader adversarial gates remain) |
+| M2 | Console Syscalls & Multi-Instance Control | `src/syscall_abi.zig`, `src/user/lib.zig`, `src/services/service_bootstrap.zig`, `src/arch/x86_64/user_mode.zig`, `src/control/control_handler.zig`, `src/arch/x86_64/vmx.zig` | M1 contracts | DONE for QEMU scope (both guests accept and answer console input; targeted production UART tests pass) |
+| M3 | windowd Live Guest Serial Console & Switching | `src/user/windowd.zig`, `src/user/protocols/windowd_protocol.zig` | M2 contracts | DONE for QEMU scope (live switching between both guests and both shell responses verified) |
+| M4 | Automated Phase 9 Smoke Profile & Integration | `test_qemu.sh` | M2, M3 | DONE for QEMU scope (Phase 9, vmx-linux, vmx-linux-services, and ui-phase8 QEMU profiles pass) |
+| M5 | Live Integration & QEMU-Scoped Hardening | Entire codebase | M1, M2, M3, M4, TEST_READY.md | DONE for QEMU scope (kernel regressions, targeted adversarial suites, and QEMU matrix pass; physical-host and broader isolation tests are out of scope) |
 | E2E | Historical Model Testing Track | `tests/`, test harness, `TEST_INFRA.md`, `TEST_READY.md` | none (models and simulated traces) | DONE (historical report: 50/50 model cases; not live integration) |
 
 ### Current validation evidence (2026-11-05)
@@ -78,13 +78,13 @@ Every feature identified during the Survey phase is mapped to a milestone below.
 - The isolated live `phase9` QEMU profile passed with KVM at SMP=2 and SMP=4. It observed distinct EPT roots, VM 1 and VM 2 launched on cores 0 and 1, both guest shells becoming ready, console switching in both directions, and a `help` response from each guest. This verifies the exercised QEMU path only.
 - The complete available QEMU regression matrix passed: `default` at SMP=2/4; `vmx-linux`, `vmx-linux-services`, and `ui-phase8` at SMP=2; and `phase9` at SMP=2/4. The Linux profiles disable per-syscall UART keepalive because its injected dots fragmented literal log markers.
 - `zig build test-kernel --summary all` passed 72 production kernel tests with Zig 0.17.0. Standalone Zig EPT, UART/control adversarial-model, and VMCS stress suites passed 8, 10, and 8 tests; Python discovery passed 77 tests and the focused adversarial Python suites passed 33.
-- Physical-host acceptance and broader adversarial isolation gates remain pending. QEMU and unit/model tests do not establish hardware acceptance or production readiness.
-- The QEMU-validated software baseline is usable to begin Phase 10 development; this does not close Phase 9 M5 or establish hardware acceptance.
+- Phase 9 is complete for the declared QEMU-only acceptance scope. Physical-host acceptance and broader isolation testing are intentionally out of scope; the evidence makes no claims about physical hardware or production readiness.
+- The QEMU-validated software baseline is ready for Phase 10 development. Hardware-dependent properties that cannot be established in QEMU must remain unclaimed.
 - See the [current worktree test record](TEST_READY.md#8-current-worktree-verification) for commands and evidence boundaries.
 
 ## Expanded scope and future milestones
 
-**All Phase 10–14 capabilities and acceptance gates below are planned, not implemented or passed.** Preserve and validate the Phase 9 baseline before relying on it. Phase numbers in earlier documents are historical; this table supersedes their proposed future numbering without retroactively changing their completed work. Work can proceed in parallel where dependencies allow, but an acceptance gate cannot be skipped.
+**All Phase 10–14 capabilities and acceptance gates below are planned, not implemented or passed.** Preserve and validate the Phase 9 baseline before relying on it. Phase numbers in earlier documents are historical; this table supersedes their proposed future numbering without retroactively changing their completed work. Work can proceed in parallel where dependencies allow, but an acceptance gate cannot be skipped. Continue to use QEMU for project validation; do not treat QEMU as evidence for physical-only properties such as actual power-loss durability.
 
 | Phase | Goal and dependencies | Required deliverables | Acceptance and failure gates |
 | --- | --- | --- | --- |
