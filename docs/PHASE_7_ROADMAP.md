@@ -1,5 +1,8 @@
 # Phase 7: Network & Distributed Orchestration [COMPLETED]
 
+> [!IMPORTANT]
+> This is a historical record of the reported Phase 7 bring-up and smoke tests, not a current security, durability, or production-readiness certification. Current cluster authentication uses a shared key and has a replay gap; hardware-backed per-node identity, fencing, quorum, guest switching, and durable storage are not established. The IPv6 constraint below concerns the kernel and cluster control plane; planned guest segments support IPv4 and IPv6. See the current [project roadmap](../PROJECT.md), [cluster plan](CLUSTER_ORCHESTRATION.md), [virtual network plan](VIRTUAL_NETWORK_PLAN.md), and [storage plan](STORAGE_PLAN.md) for updated scope and future phase numbering.
+
 > [!NOTE]
 > **Status:** Completed & Verified (2026-10-11).
 > All core deliverables for Phase 7 (distributed orchestration, physical virtio-net, user-space TCP/IPv6, SMP scheduling, remote MicroVM launching, and cluster telemetry) are implemented and green in CI/tests.
@@ -78,7 +81,7 @@ Phase 7 core networking, cluster bootstrap, remote MicroVM launching, and Symmet
 
 ### 2.5 Storage Integration (`storaged` & `containerd`)
 - [x] **NVMe Driver & Synthetic Storage**: Controller initialization and block IO queues.
-- [x] **Container Image Mounting**: `containerd` allocates a 1 MiB NVMe partition per image (slot table at LBA 8192+), writes a header through `storaged` (real I/O under a dedicated requester id) and reads it back to verify. Full image unpack into the partition is still simulated.
+- [x] **Container Image Mounting**: `containerd` allocates a 1 MiB NVMe partition per image (slot table at LBA 8192+), writes a header through `storaged` (real I/O under a dedicated requester id) and reads it back. Full image unpack is simulated; the slot table is in memory and immediate readback does not establish durable persistence or power-loss safety.
 
 ---
 
@@ -86,7 +89,7 @@ Phase 7 core networking, cluster bootstrap, remote MicroVM launching, and Symmet
 
 - **Exokernel Philosophy**: All orchestration and networking logic remains strictly in Ring 3. The kernel only routes pages, provides scheduling, and exposes hardware virtualization primitives.
 - **Strict IPv6**: Zero legacy IPv4 support in kernel or cluster control plane.
-- **Zero-Trust**: Cross-node identity backed by hardware/boot measurements (`KernelManifest`).
+- **Trust target, not established**: The current shared-key cluster tag is not backed by a verified per-node boot measurement and lacks replay protection. Hardware-backed identity and attestation remain future work.
 
 ---
 

@@ -7,6 +7,9 @@ Thank you for your interest in contributing to Catenary OS. This is a passion pr
 Catenary OS is a freestanding x86_64 microkernel and Type-1 hypervisor. All contributions must respect the boundaries defined in [CONSTITUTION.md](CONSTITUTION.md):
 
 - **Ring 0** is limited to physical memory allocation, CPU scheduling, Intel VT-x management, and local IPC. Device drivers, network stacks, and POSIX abstractions belong in user space.
+- **Target scope**: Direct Linux MicroVMs and full Linux/Windows VMs, standalone and cross-node guest networks, a shared cluster UI, and virtual storage are described in [PROJECT.md](PROJECT.md). Follow the linked designs and distinguish them from implemented behavior.
+- **Independent platform code**: Independently author future Catenary components; do not copy, adapt, port, wrap, or substitute known platform implementations. Published specifications and established algorithms may be used. Existing tools, guest operating systems, explicitly approved licensed guest firmware/drivers, and optional guest Linux/KVM are exceptions; record their approval and provenance. Do not invent cryptographic primitives; other new third-party runtime code requires explicit approval.
+- **Failure safety**: Keep network and storage policy in Ring 3, fail closed on missing authority or stale policy, and preserve the planned metadata-quorum, two-durable-copy, fencing, and recovery contracts. IPv6-first host control does not preclude IPv4 guest traffic.
 - **AI-Assisted Development**: AI agents and human contributors are encouraged to rapidly prototype, implement features end-to-end, and refactor across kernel and user-space boundaries.
 - **Interface-First**: define or refine Zig types, constants, and memory layout invariants alongside implementation plumbing.
 - **Iterative Progress**: move in clear, verifiable steps, validating changes with build and smoke test scripts.
@@ -45,6 +48,7 @@ Open a GitHub issue and include:
 - Run `zig build` before submitting.
 - For boot-path or VMX changes, include serial output confirming the expected milestone is still reached.
 - For guest-handoff or service-owned MicroVM changes, prefer the matching `SMOKE_PROFILE` run and mention which profile you validated.
+- Label model results, live QEMU integration, and physical hardware/guest tests separately. Do not describe synthetic storage, a no-op flush, simulated traces, or unrun tests as evidence of durability or system acceptance. See [TEST_INFRA.md](TEST_INFRA.md).
 - Update the relevant markdown when build flags, smoke profiles, guest-rootfs workflow, or generated artifacts change.
 - Document any hardware behaviour, calling convention, or boot-time assumption that is not obvious from the code.
 - Do not add features, abstractions, or refactors beyond the stated scope of the change.

@@ -2,14 +2,14 @@
 
 ## 1. Brand Concept: The Micro-segmented Arch
 
-The visual identity of Catenary OS represents mathematical structural integrity combined with secure isolation. It visualizes our dual mission: distributing massive containerized workloads across a bare-metal cluster (the load-bearing Catenary arch) and enforcing absolute, zero-trust micro-segmentation between them (the mesh network).
+The visual identity of Catenary OS represents structural integrity and the goal of workload isolation. The arch and mesh symbolize MicroVMs and full VMs on a standalone node or cluster, with planned, default-deny microsegmentation. The visual metaphor is not a claim that the current experimental system provides absolute security.
 
 ## 2. The Emblem (The Icon)
 
 The primary icon is an inverted catenary arch—the mathematically perfect curve that supports massive weight by converting all tension into compression.
 
-* **The Structure (The Hypervisor):** The arch itself is not a solid form; it is entirely constructed from interconnected hexagonal cells or nodes. Each hexagon represents an isolated MicroVM or OCI container, securely managed by our bare-metal Type-1 hypervisor.
-* **The Mesh (The Network):** The hexagonal grid visually maps our IPv6 micro-segmentation, showing how isolated workloads interconnect to form a single, resilient fabric.
+* **The Structure (The Hypervisor):** The arch itself is not a solid form; it is entirely constructed from interconnected hexagonal cells or nodes. Each hexagon represents a MicroVM, full VM, or workload intended to be isolated by the bare-metal Type-1 hypervisor.
+* **The Mesh (The Network):** The hexagonal grid evokes the planned virtual network fabric: IPv6-first host control with microsegmented IPv4 and IPv6 guest traffic.
 * **The Core:** The central interlocking nodes subtly form a clean, stylized capital **'C'**, representing "Catenary."
 
 ## 3. Color Palette
@@ -34,4 +34,4 @@ The colors represent the structural components and the active energy within the 
 **The Metaphor:** In the Norwegian mountains, a *varde* is a carefully constructed stone cairn used to mark the safe, proven trail through vast and unforgiving terrain. 
 
 **The OS Connection:**
-If Catenary OS is the massive, complex landscape of distributed nodes and isolated MicroVMs, the `varde` shell is the engineer's guide through it. While the microkernel invisibly handles the heavy load-bearing and network routing, `varde` provides the visible, explicit markers. It is the steady, reliable command-line interface used to navigate the cluster, build isolated environments, and direct the flow of the system. You don't just run commands; you place a *varde* to mark the path for your workloads.
+If Catenary OS is the landscape of nodes and isolated workloads, the `varde` shell is the operator's guide through it. The microkernel supplies isolation and local IPC, while user-space services own network routing and orchestration. `varde` provides visible markers for navigating the system; its full cluster-management capabilities remain a goal.

@@ -1,5 +1,8 @@
 # Phase 8: User Interface, TUI System, and Interactive OS Workflows
 
+> [!IMPORTANT]
+> This is a historical Phase 8 plan and record. Its "production-ready" and "operator-grade" descriptions are goals, not a current production-readiness certification. The common authenticated cluster API and UI are future work; current phase numbering and acceptance gates are in [PROJECT.md](../PROJECT.md) and [cluster orchestration](CLUSTER_ORCHESTRATION.md).
+
 This document establishes the roadmap, architectural specification, and verification plan for **Phase 8** of Catenary OS. Phase 8 transitions Catenary OS from a cluster engine with a passive telemetry display into a fully interactive, operator-grade operating system with rich keyboard input, interactive forms, dynamic MicroVM lifecycle control, and an interactive Varde shell.
 
 ---

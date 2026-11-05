@@ -6,7 +6,9 @@ if [ -d "/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_6
 fi
 
 echo "[+] Building Catenary OS..."
-zig build ${ZIG_BUILD_ARGS:-} -p /tmp/zig-out --cache-dir /tmp/zig-local-cache --global-cache-dir /tmp/zig-global-cache
+ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-/tmp/zig-local-cache}" \
+ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/zig-global-cache}" \
+zig build ${ZIG_BUILD_ARGS:-} -p /tmp/zig-out
 
 echo "[+] Preparing ISO directory..."
 mkdir -p iso_root/boot

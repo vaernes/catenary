@@ -8,9 +8,18 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 
 ## Mission
 
-- Build Catenary OS as a distributed microkernel plus bare-metal hypervisor, not as a monolithic Unix-like kernel.
-- Preserve the exokernel boundary: Ring 0 is limited to physical memory allocation, CPU scheduling/context switching, Intel VT-x management, and local IPC.
-- Keep device drivers, network stacks, orchestration services, and compatibility layers in user space unless the user explicitly changes the architecture.
+- Build Catenary OS as a distributed microkernel and bare-metal Type-1 hypervisor, usable on one node or as a cluster, not as a monolithic Unix-like kernel.
+- The target includes Linux MicroVMs and directly hosted full Linux and Windows VMs; virtual switches and VM microsegmentation; cluster-wide management; and local and distributed virtual block storage. These are goals, not claims that all exist today.
+- Preserve the exokernel boundary: Ring 0 owns physical isolation and allocation, CPU scheduling/context switching, Intel VT-x/EPT, and local IPC, including the minimal hardware-adjacent mechanisms needed to enforce those boundaries.
+- Keep device drivers and complex backends, network stacks and policy, storage, orchestration, UI, and compatibility layers in isolated Ring-3 services. Existing in-kernel device handling is a bring-up baseline, not a license to move additional policy there.
+- Prefer direct virtualization for both VM profiles. An isolated support MicroVM and nested KVM are optional; boot, core services, storage recovery, quorum, and direct VMs must not depend on them.
+
+## Independent Platform Development
+
+- Independently author new Catenary hypervisor, VMM, device, network, storage, cluster, and UI implementations for the next phases. Do not copy, adapt, port, wrap, or substitute known platform implementations as Catenary components.
+- Public hardware and protocol specifications, academic papers, and established algorithms are legitimate references. Cite the relevant contracts and independently implement them; originality must never be used to justify unsafe or unreviewed consensus or cryptography.
+- Existing Catenary code, the Zig toolchain and standard library, Limine, and development/test tools remain part of the baseline. Approved guest operating systems, explicitly approved licensed guest firmware and drivers, and Linux/KVM in an optional support VM are exceptions. Record provenance, licensing, updates, and approval before adding such components. Any other new third-party runtime implementation needs explicit user approval.
+- Use established, reviewed cryptographic primitives from the existing Zig standard library where appropriate; do not invent cryptographic algorithms or assert that a composition is globally novel or patentable without independent review.
 
 ## Core Principles & AI Guidelines
 
@@ -18,14 +27,17 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 - Interface-First Development: Define or refine the Zig types, constants, memory layouts, and invariants alongside implementation plumbing for clear system contracts.
 - Evidence-Driven Debugging: Diagnose hardware failures using serial logs, QEMU output, register state, and architectural invariants.
 - Pragmatic & Iterative Changes: Move in clear, iterative steps when implementing kernel, hypervisor, or user-space features, testing changes against build and smoke outputs.
+- Respect the user's requested scope. A documentation-only request must not change source, tests, build configuration, guest assets, or runtime behavior.
 
 ## Architecture Constraints
 
 - Target is `x86_64-freestanding` Zig with no host OS assumptions, no libc dependency, and no hidden runtime requirements.
 - Respect the higher-half kernel layout, Limine boot flow, linker script, and early-boot CPU state assumptions already encoded in the repo.
 - Do not add POSIX-in-kernel abstractions, syscall-emulation layers, or Linux ABI compatibility inside Ring 0.
-- OCI compatibility is expected to come from Linux guests inside MicroVMs, not from reimplementing Linux semantics in the kernel.
-- IPv6-first distributed IPC remains the long-term direction. Avoid introducing IPv4-centric or socket-centric architecture into kernel code.
+- OCI workloads are intended to run in Linux MicroVMs, not through Linux syscall emulation in the kernel; do not claim full OCI compatibility without a tested scope.
+- Host and cluster control remain IPv6-first. Guest virtual segments must support both IPv4 and IPv6 through Ring-3 networking; do not impose an IPv4 or socket stack on Ring 0.
+- Treat guest-provided identities, descriptors, and addresses as untrusted. Enforce scoped capabilities, bounded ownership and DMA, host-assigned vNIC identities, default-deny ingress/egress policy, and authenticated cross-node transport. Do not confuse the existing DIPC bridge with a guest switch or the shared cluster key with per-node identity.
+- The initial distributed storage design uses three data nodes, a 2-of-3 metadata quorum, and two full copies on distinct nodes durably flushed before a write is acknowledged. Fencing, recovery, and backups are separate requirements; no-quorum or insufficient copies must fail closed.
 
 ## Zig And Low-Level Coding Expectations
 
@@ -44,11 +56,10 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 
 ## Current Project Context
 
-- The core exokernel is stable: PMM, scheduler, paging, GDT/IDT, Ring-3 service launch, and VMX baseline are all working.
-- The focus is now on getting the full OS operational: end-to-end Linux MicroVM boot, Ring-3 service integration (netd, storaged, dashd), DIPC routing, and virtio device emulation.
-- Full Linux handoff via VMX is the primary active goal. Completing EPT, virtio-net/blk, and the Linux boot protocol is appropriate scope.
-- Ring-3 service bring-up (DIPC messaging, service registry, control protocol) should be pursued in parallel with the VMX path.
-- KVM with nested VMX is the preferred validation path for VMX work.
+- Consult [PROJECT.md](../../PROJECT.md) for phase status and dependencies, [architecture](../../docs/architecture.md) for the current/target split, and the linked subsystem plans for future contracts.
+- The code contains experimental Linux direct-boot, VMX/EPT, virtio bridges, local NVMe, DIPC, and native UI paths. General UEFI-based Windows/Linux VM support, secure guest switching, quorum storage, and a common authenticated cluster UI are not established end to end.
+- The current synthetic storage path may acknowledge without persistence and the guest flush is a no-op. Never infer durability from its smoke markers or immediate readback.
+- QEMU with host KVM can test Catenary's existing VMX guest path; it does not demonstrate KVM inside a Catenary-hosted support VM. Nested VMX for that separate path is future work.
 
 ## Validation Workflow
 
@@ -56,6 +67,8 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 - For boot-path or hypervisor changes, prefer the repo smoke path and inspect serial output.
 - Use existing scripts and repo conventions before inventing new tooling.
 - If a failure occurs, capture the exact symptom, the last serial lines, and the stage of bring-up before proposing a fix.
+- Report model tests, live QEMU integration, and physical-host/guest testing separately. A model, expected marker, source symbol, or historical result is not proof of actual VM isolation, persistence, or a passing current run.
+- For storage, policy, identity, and cluster changes, validate crash/partition and failure behavior as well as successful paths; see [TEST_INFRA.md](../../TEST_INFRA.md) and the subsystem plans for proposed gates.
 
 ## Repository Layout
 
