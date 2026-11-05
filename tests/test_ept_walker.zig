@@ -10,7 +10,7 @@ const std = @import("std");
 
 /// Exact translation algorithm from src/arch/x86_64/vmx.zig:1128-1171
 fn translateEptGpaToHpa(root_phys: u64, gpa: u64, hhdm_offset: u64) ?u64 {
-    if (root_phys == 0 or hhdm_offset == 0) return null;
+    if (root_phys == 0 or hhdm_offset == 0 or gpa >= (1 << 48)) return null;
 
     // Level 4: PML4
     const pml4_phys = root_phys & 0x000F_FFFF_FFFF_F000;
@@ -309,7 +309,7 @@ test "EPT Isolation: Multi-Instance Separate Roots (No Memory Aliasing)" {
     try std.testing.expectEqual(hpa_inst2, trans2_after.?);
 }
 
-test "EPT Walker: Upper Bit Discarding (GPA >= 48 bits aliasing observation)" {
+test "EPT Walker: Rejects GPAs outside the four-level address range" {
     var mem: TestMemory = .{};
     const root = mem.getRootPhys();
 
@@ -322,11 +322,9 @@ test "EPT Walker: Upper Bit Discarding (GPA >= 48 bits aliasing observation)" {
     // Normal translation of GPA 0x0
     try std.testing.expectEqual(hpa_zero, translateEptGpaToHpa(root, 0x0, HHDM_MOCK));
 
-    // When bit 48 is set (GPA exceeds 48-bit address space, e.g. 0x0001_0000_0000_0000):
-    // In hardware EPT, this triggers an EPT violation.
-    // In current software walker, (gpa >> 39) & 0x1FF truncates bits >= 48, so it wraps to pml4[0].
+    // GPA bit 48 is outside the four-level EPT address range and must not alias
+    // the PML4[0] mapping.
     const gpa_bit48: u64 = 0x0001_0000_0000_0000;
     const res_bit48 = translateEptGpaToHpa(root, gpa_bit48, HHDM_MOCK);
-    // Documenting empirical observation: currently wraps around to pml4[0]
-    try std.testing.expectEqual(hpa_zero, res_bit48.?);
+    try std.testing.expect(res_bit48 == null);
 }

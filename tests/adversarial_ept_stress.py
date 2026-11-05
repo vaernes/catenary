@@ -114,7 +114,7 @@ class EmulatedEptRadixMemory:
         """
         Direct Python implementation of src/arch/x86_64/vmx.zig translateEptGpaToHpa.
         """
-        if root_phys == 0:
+        if root_phys == 0 or gpa >= (1 << 48):
             return None
 
         # Level 4: PML4
@@ -259,6 +259,15 @@ class AdversarialEptStressTests(unittest.TestCase):
         self.assertIsNone(self.mem.translate_ept(root2, 0x0020_0000))
         # High memory unmapped
         self.assertIsNone(self.mem.translate_ept(root2, 0x1000_0000_0000))
+
+    def test_adv_03b_reject_gpas_outside_four_level_address_range(self):
+        root = self.mem.alloc_table()
+        self.mem.map_4k(root, 0, 0x2000)
+
+        self.assertEqual(self.mem.translate_ept(root, 0), 0x2000)
+        for gpa in (1 << 48, (1 << 48) + 0x1000, (1 << 64) - 1):
+            with self.subTest(gpa=hex(gpa)):
+                self.assertIsNone(self.mem.translate_ept(root, gpa))
 
     def test_adv_04_multi_instance_isolation_8_vms(self):
         """

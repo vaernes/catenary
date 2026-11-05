@@ -56,15 +56,17 @@ class TestR4SmokeProfile(unittest.TestCase):
         mock_send_keys(["ret", "ret"])
         mock_send_keys(["right", "right"])
         mock_send_keys(["ret", "ret", "ret", "ret"])
-        # Step 2: Switch to console pane (f6)
+        # Step 2: Switch to console pane and select MicroVM 2 (f6, f8)
         mock_send_keys(["f6"])
-        # Step 3: Switch to MicroVM 2 console (f8)
         mock_send_keys(["f8"])
-        # Step 4: Send shell command 'help'
+        # Step 3: Send 'help' to MicroVM 2, switch back to MicroVM 1, and repeat
+        mock_send_keys(["h", "e", "l", "p", "ret"])
+        mock_send_keys(["f7"])
         mock_send_keys(["h", "e", "l", "p", "ret"])
 
         self.assertIn("sendkey f6\n", generated_monitor_commands)
         self.assertIn("sendkey f8\n", generated_monitor_commands)
+        self.assertIn("sendkey f7\n", generated_monitor_commands)
         self.assertIn("sendkey right\n", generated_monitor_commands)
         self.assertIn("sendkey ret\n", generated_monitor_commands)
 
@@ -84,9 +86,13 @@ class TestR4SmokeProfile(unittest.TestCase):
             "[UI] Switched console to MicroVM #2",
             "[vm1] Catenary OS Guest Init: SUCCESS",
             "[vm1] guest_rootfs: init started",
+            "[vm1] guest_rootfs: shell ready",
             "[vm2] Catenary OS Guest Init: SUCCESS",
             "[vm2] guest_rootfs: init started",
             "[vm2] guest_rootfs: shell ready",
+            "[UI] Switched console to MicroVM #1",
+            "[vm1] help env os-release exit",
+            "[UI] Switched console to MicroVM #2",
             "[vm2] help env os-release exit",
         ]
 
@@ -107,8 +113,13 @@ class TestR4SmokeProfile(unittest.TestCase):
         Linux version 6.1.102-catenary
         [vm1] Catenary OS Guest Init: SUCCESS
         [vm1] guest_rootfs: init started
+        [vm1] guest_rootfs: shell ready
         [vm2] Catenary OS Guest Init: SUCCESS
         [vm2] guest_rootfs: init started
+        [vm2] guest_rootfs: shell ready
+        [UI] Switched console to MicroVM #1
+        [vm1] help env os-release exit
+        [UI] Switched console to MicroVM #2
         [vm2] guest_rootfs: shell ready
         [vm2] help env os-release exit
         """

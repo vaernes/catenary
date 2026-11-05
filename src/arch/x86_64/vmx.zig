@@ -257,6 +257,7 @@ const GUEST_IDENTITY_PD_TABLES: usize = 8; // 8 * 1GiB mapped via 2MiB leaves
 const GUEST_IDENTITY_MAP_BYTES: u64 = @as(u64, GUEST_IDENTITY_PD_TABLES) * 1024 * 1024 * 1024;
 const EPT_PREFAULT_WINDOW_PAGES_DEMO: usize = 512; // 512 * 4KiB = 2MiB
 const EPT_PREFAULT_WINDOW_PAGES_LINUX: usize = 512; // map 2 MiB per Linux EPT violation to reduce boot-time VMEXIT churn
+const EPT_GPA_LIMIT: u64 = 1 << 48;
 const GUEST_POOL_PAGES: usize = 65536;
 const PREEMPTION_TIMER_INITIAL: u32 = 0x7FFFFFFF;
 const PREEMPTION_TIMER_RELOAD: u32 = 100000; // ~1ms at 100MHz preemption timer freq
@@ -1162,6 +1163,7 @@ fn eptEnsureTableForInstance(entry: *u64, inst: *microvm_registry.Instance) VmxE
 }
 
 fn eptMapPageForInstance(inst: *microvm_registry.Instance, gpa: u64, hpa: u64, flags: u64) VmxError!void {
+    if (!isSupportedEptGpa(gpa)) return error.GuestTooLarge;
     if (comptime !VMX_USE_EPT) return;
 
     if (inst.ept_pml4_phys == null) {
@@ -1200,7 +1202,7 @@ fn eptMapPage(gpa: u64, hpa: u64) VmxError!void {
 ///
 /// Returns the translated HPA preserving in-page offset, or null if unmapped.
 pub fn translateEptGpaToHpa(root_phys: u64, gpa: u64) ?u64 {
-    if (root_phys == 0 or vmx_hhdm_offset == 0) return null;
+    if (root_phys == 0 or vmx_hhdm_offset == 0 or !isSupportedEptGpa(gpa)) return null;
 
     // Level 4: PML4
     const pml4_phys = root_phys & 0x000F_FFFF_FFFF_F000;
@@ -1244,6 +1246,10 @@ pub fn translateEptGpaToHpa(root_phys: u64, gpa: u64) ?u64 {
     return (pte & 0x000F_FFFF_FFFF_F000) | (gpa & 0xFFF);
 }
 
+fn isSupportedEptGpa(gpa: u64) bool {
+    return gpa < EPT_GPA_LIMIT;
+}
+
 pub fn translateGpaToHpa(vmid: u32, gpa: u64) ?u64 {
     const inst = microvm_registry.lookup(vmid) orelse return null;
     const root = inst.ept_pml4_phys orelse return null;
@@ -1265,6 +1271,7 @@ pub fn findGuestPageHpaPublic(gpa: u64) ?u64 {
 }
 
 fn ensureGuestPageForInstance(inst: *microvm_registry.Instance, gpa: u64) VmxError!u64 {
+    if (!isSupportedEptGpa(gpa)) return error.GuestTooLarge;
     const aligned = gpa & 0x000F_FFFF_FFFF_F000;
     if (aligned >= guestRamBytes(inst) and !isGuestMmioWindow(aligned)) return error.GuestTooLarge;
     if (inst.ept_pml4_phys) |root| {
@@ -1278,11 +1285,18 @@ fn ensureGuestPageForInstance(inst: *microvm_registry.Instance, gpa: u64) VmxErr
     return hpa;
 }
 
+test "EPT rejects GPAs outside the four-level address range" {
+    try std.testing.expect(isSupportedEptGpa(0));
+    try std.testing.expect(isSupportedEptGpa(EPT_GPA_LIMIT - 1));
+    try std.testing.expect(!isSupportedEptGpa(EPT_GPA_LIMIT));
+    try std.testing.expect(!isSupportedEptGpa(0xFFFF_FFFF_FFFF_FFFF));
+}
+
 fn copyIntoGuestForInstance(inst: *microvm_registry.Instance, gpa_base: u64, data: []const u8) VmxError!void {
     var offset: usize = 0;
     while (offset < data.len) {
         const cur_gpa = gpa_base + @as(u64, @intCast(offset));
-        const page_gpa = cur_gpa & 0x000F_FFFF_FFFF_F000;
+        const page_gpa = cur_gpa & ~@as(u64, 0xFFF);
         const page_off = @as(usize, @intCast(cur_gpa & 0xFFF));
         const hpa = try ensureGuestPageForInstance(inst, page_gpa);
         const dst: [*]u8 = @ptrFromInt(hpa + vmx_hhdm_offset);
@@ -1937,12 +1951,10 @@ fn handleIoExit(regs: *GuestRegs) void {
                 const value: u8 = if (maybe_inst) |inst| inst.devices.uart.dll else serial_dll;
                 regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | value;
             } else {
-                const value: u8 = if (maybe_inst) |inst| blk: {
-                    const flags = microvm_registry.lock();
-                    const ch = inst.devices.uart.readRxByte() orelse 0;
-                    microvm_registry.unlock(flags);
-                    break :blk ch;
-                } else 0;
+                const value: u8 = if (active_vmid) |id|
+                    (microvm_registry.readConsoleInput(id) orelse 0)
+                else
+                    0;
                 regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | value;
             }
         } else {
@@ -1983,17 +1995,12 @@ fn handleIoExit(regs: *GuestRegs) void {
                     serial_dlm = value;
                 }
             } else {
-                const rx_non_empty = if (maybe_inst) |inst| !inst.devices.uart.isRxEmpty() else false;
+                const rx_non_empty = if (active_vmid) |id| microvm_registry.hasConsoleInput(id) else false;
                 const rda_active = (value & 0x01) != 0 and rx_non_empty;
                 const thre_active = (value & 0x02) != 0;
                 const pic_imr = if (maybe_inst) |inst| inst.devices.pic.master_imr else pic_master_imr;
                 if (maybe_inst) |inst| {
-                    inst.devices.uart.ier = value;
-                    if ((rda_active or thre_active) and (pic_imr & 0x10) == 0) {
-                        inst.devices.uart.irq4_pending = true;
-                    } else if (!rda_active and !thre_active) {
-                        inst.devices.uart.irq4_pending = false;
-                    }
+                    microvm_registry.configureConsoleUartInterrupt(inst.instance_id, value, (pic_imr & 0x10) == 0);
                 } else {
                     serial_ier = value;
                     if ((rda_active or thre_active) and (pic_imr & 0x10) == 0) {
@@ -2008,7 +2015,7 @@ fn handleIoExit(regs: *GuestRegs) void {
         if (is_in) {
             const ier = if (maybe_inst) |inst| inst.devices.uart.ier else serial_ier;
             const fcr = if (maybe_inst) |inst| inst.devices.uart.fcr else serial_fcr;
-            const rx_non_empty = if (maybe_inst) |inst| !inst.devices.uart.isRxEmpty() else false;
+            const rx_non_empty = if (active_vmid) |id| microvm_registry.hasConsoleInput(id) else false;
             var value: u8 = 0x01;
             if (rx_non_empty and (ier & 0x01) != 0) {
                 value = 0x04; // Received Data Available (RDA) pending
@@ -2053,10 +2060,8 @@ fn handleIoExit(regs: *GuestRegs) void {
         // COM1 LSR: bits 5 and 6 (THRE and TEMT) asserted (0x60).
         // Assert bit 0 (Data Ready) if !isRxEmpty().
         var lsr: u8 = 0x60;
-        if (maybe_inst) |inst| {
-            if (!inst.devices.uart.isRxEmpty()) {
-                lsr |= 0x01;
-            }
+        if (active_vmid) |id| {
+            if (microvm_registry.hasConsoleInput(id)) lsr |= 0x01;
         }
         regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | lsr;
     } else if (port == 0x3FE and is_in) {
@@ -2614,8 +2619,8 @@ fn tryInjectTimerIrq() void {
     const active_vmid = if (core_id < smp.MAX_CPUS) current_instance_per_cpu[core_id] else current_instance_id;
     const maybe_inst = if (active_vmid) |id| microvm_registry.findMutable(id) else null;
 
-    const irq4_pending: bool = if (maybe_inst) |inst|
-        (inst.devices.uart.irq4_pending or (!inst.devices.uart.isRxEmpty() and (inst.devices.uart.ier & 0x01) != 0))
+    const irq4_pending: bool = if (active_vmid) |id|
+        microvm_registry.consoleUartInterruptPending(id, guest_interruptible)
     else
         serial_irq4_pending;
 
@@ -2626,9 +2631,7 @@ fn tryInjectTimerIrq() void {
             const pic_base: u8 = if (maybe_inst) |inst| inst.devices.pic.master_vector_base else pic_master_vector_base;
             const vector: u64 = @as(u64, pic_base) + 4;
             _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, vector | (VM_ENTRY_INTR_TYPE_EXTERNAL << 8) | (1 << 31));
-            if (maybe_inst) |inst| {
-                inst.devices.uart.irq4_pending = false;
-            } else {
+            if (active_vmid == null) {
                 serial_irq4_pending = false;
             }
             return; // one interrupt per VMENTRY

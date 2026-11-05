@@ -67,49 +67,7 @@ pub fn isSyscallAllowed(kind: ServiceKind, op: u64) bool {
     return (mask & (@as(u32, 1) << @as(u5, @intCast(op)))) != 0;
 }
 
-// Current implementation in src/vmm/microvm_registry.zig:66-141
-pub const VmUartState_Current = struct {
-    dll: u8 = 0x01,
-    dlm: u8 = 0x00,
-    ier: u8 = 0,
-    fcr: u8 = 0,
-    lcr: u8 = 0x03,
-    mcr: u8 = 0,
-    scr: u8 = 0,
-    irq4_pending: bool = false,
-    rx_buf: [256]u8 = undefined,
-    rx_head: u8 = 0,
-    rx_tail: u8 = 0,
-    rx_count: u8 = 0, // <-- VULNERABILITY: u8 cannot hold 256!
-    tx_buf: [4096]u8 = undefined,
-    tx_len: usize = 0,
-
-    pub fn reset(self: *VmUartState_Current) void {
-        self.dll = 0x01;
-        self.dlm = 0x00;
-        self.ier = 0;
-        self.fcr = 0;
-        self.lcr = 0x03;
-        self.mcr = 0;
-        self.scr = 0;
-        self.irq4_pending = false;
-        self.rx_head = 0;
-        self.rx_tail = 0;
-        self.rx_count = 0;
-        self.tx_len = 0;
-    }
-
-    pub fn injectRxByte(self: *VmUartState_Current, ch: u8) bool {
-        if (self.rx_count >= 256) return false;
-        self.rx_buf[@as(usize, self.rx_tail)] = ch;
-        self.rx_tail +%= 1;
-        self.rx_count += 1;
-        self.irq4_pending = true;
-        return true;
-    }
-};
-
-// Fixed implementation where rx_count is u16 (or usize)
+// Standalone reference model for the corrected UART FIFO behavior.
 pub const VmUartState_Fixed = struct {
     dll: u8 = 0x01,
     dlm: u8 = 0x00,
@@ -325,33 +283,10 @@ test "5. DMA Buffer Safety: Clamped to 4095 bytes with guaranteed null-terminato
 }
 
 // ============================================================================
-// 3. Empirical Bug Discovery & Fuzzing
+// 3. Reference-model Boundary and Fuzzing Checks
 // ============================================================================
 
-test "6. EMPIRICAL VULNERABILITY CONFIRMATION: rx_count u8 overflow in current code" {
-    var uart: VmUartState_Current = .{};
-    uart.reset();
-
-    // Inject 255 bytes -> succeeds
-    var i: usize = 0;
-    while (i < 255) : (i += 1) {
-        const ok = uart.injectRxByte(@as(u8, @truncate(i)));
-        try testing.expect(ok);
-    }
-    try testing.expectEqual(@as(u8, 255), uart.rx_count);
-
-    // Now attempt to inject the 256th byte:
-    // In src/vmm/microvm_registry.zig:
-    // `if (self.rx_count >= 256) return false;`
-    // Because rx_count is u8, 255 is NOT >= 256.
-    // So it executes `self.rx_count += 1;`
-    // 255 + 1 causes an integer overflow on u8!
-    //
-    // In debug/test builds, Zig runtime detects integer overflow and panics!
-    // In wrapping math or release builds, 255 + 1 becomes 0, corrupting FIFO state!
-}
-
-test "7. UART RX FIFO: Burst inject 1,500 chars on fixed implementation" {
+test "6. UART RX FIFO: Burst inject 1,500 chars on fixed implementation" {
     var uart: VmUartState_Fixed = .{};
     uart.reset();
 
@@ -388,7 +323,7 @@ test "7. UART RX FIFO: Burst inject 1,500 chars on fixed implementation" {
     try testing.expect(!uart.irq4_pending);
 }
 
-test "8. UART RX FIFO: Circular wraparound stress (10,000 iterations)" {
+test "7. UART RX FIFO: Circular wraparound stress (10,000 iterations)" {
     var uart: VmUartState_Fixed = .{};
     uart.reset();
 
@@ -424,7 +359,7 @@ test "8. UART RX FIFO: Circular wraparound stress (10,000 iterations)" {
     try testing.expect(uart.isRxEmpty());
 }
 
-test "9. UART State: LSR Data Ready (DR) bit 0 and IRQ4 transition" {
+test "8. UART State: LSR Data Ready (DR) bit 0 and IRQ4 transition" {
     var uart: VmUartState_Fixed = .{};
     uart.reset();
 
@@ -502,7 +437,7 @@ const LinePrefixFormatter = struct {
     }
 };
 
-test "10. Line Prefix: Multi-line, carriage returns, and empty lines" {
+test "9. Line Prefix: Multi-line, carriage returns, and empty lines" {
     var f: LinePrefixFormatter = .{};
 
     f.writeString(1, "hello\nworld\n");
@@ -517,7 +452,7 @@ test "10. Line Prefix: Multi-line, carriage returns, and empty lines" {
     try testing.expectEqualStrings("[vm3] \n[vm3] \n[vm3] \n", f.getOutput());
 }
 
-test "11. Line Prefix: Long lines never interleave tag mid-sequence" {
+test "10. Line Prefix: Long lines never interleave tag mid-sequence" {
     var f: LinePrefixFormatter = .{};
 
     var i: usize = 0;

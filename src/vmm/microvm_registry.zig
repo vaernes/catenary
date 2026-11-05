@@ -441,6 +441,51 @@ pub fn injectConsoleInput(instance_id: u32, ch: u8) bool {
     return slot.devices.uart.injectRxByte(ch);
 }
 
+pub fn hasConsoleInput(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    return !slot.devices.uart.isRxEmpty();
+}
+
+pub fn readConsoleInput(instance_id: u32) ?u8 {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return null;
+    return slot.devices.uart.readRxByte();
+}
+
+pub fn configureConsoleUartInterrupt(instance_id: u32, ier: u8, irq4_unmasked: bool) void {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return;
+
+    const rx_non_empty = !slot.devices.uart.isRxEmpty();
+    const rda_active = (ier & 0x01) != 0 and rx_non_empty;
+    const thre_active = (ier & 0x02) != 0;
+    slot.devices.uart.ier = ier;
+    if ((rda_active or thre_active) and irq4_unmasked) {
+        slot.devices.uart.irq4_pending = true;
+    } else if (!rda_active and !thre_active) {
+        slot.devices.uart.irq4_pending = false;
+    }
+}
+
+pub fn consoleUartInterruptPending(instance_id: u32, acknowledge: bool) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+
+    const pending = slot.devices.uart.irq4_pending or
+        (!slot.devices.uart.isRxEmpty() and (slot.devices.uart.ier & 0x01) != 0);
+    if (pending and acknowledge) slot.devices.uart.irq4_pending = false;
+    return pending;
+}
+
 /// Appends a raw ASCII character to the guest's console TX log under registry lock.
 pub fn writeConsoleByte(instance_id: u32, ch: u8) void {
     ensureInit();

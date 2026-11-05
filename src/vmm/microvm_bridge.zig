@@ -691,6 +691,62 @@ test "m1: microvm_registry affinity, device state, and uart circular buffer" {
     try std.testing.expect(reg.injectConsoleInput(id, 'Z'));
 }
 
+test "m5: production UART rejects overflow and preserves FIFO order through wraparound" {
+    const reg = @import("microvm_registry.zig");
+    reg.init();
+
+    const name: [32]u8 = "uart-stress".* ++ @as([21]u8, @splat(0));
+    const container: [32]u8 = @splat(0);
+    const id = reg.create(name, container, 1024, 1, 0, 0, 0, 0).?;
+
+    for (0..256) |i| {
+        try std.testing.expect(reg.injectConsoleInput(id, @truncate(i)));
+    }
+    try std.testing.expect(!reg.injectConsoleInput(id, 0xFF));
+    try std.testing.expect(!reg.injectConsoleInput(0xFFFF_FFFF, 0xFF));
+
+    try std.testing.expect(reg.hasConsoleInput(id));
+    reg.configureConsoleUartInterrupt(id, 0x01, true);
+    try std.testing.expect(reg.consoleUartInterruptPending(id, false));
+    try std.testing.expect(reg.consoleUartInterruptPending(id, true));
+
+    for (0..256) |i| {
+        try std.testing.expectEqual(@as(?u8, @truncate(i)), reg.readConsoleInput(id));
+    }
+    try std.testing.expect(!reg.hasConsoleInput(id));
+    try std.testing.expect(!reg.consoleUartInterruptPending(id, false));
+
+    for (0..10) |i| {
+        try std.testing.expect(reg.injectConsoleInput(id, @truncate(i + 10)));
+    }
+    for (0..10) |i| {
+        try std.testing.expectEqual(@as(?u8, @truncate(i + 10)), reg.readConsoleInput(id));
+    }
+}
+
+test "m5: production UART TX logs stay isolated and retain the newest 4096 bytes" {
+    const reg = @import("microvm_registry.zig");
+    reg.init();
+
+    const container: [32]u8 = @splat(0);
+    const first_name: [32]u8 = "uart-tx-1".* ++ @as([23]u8, @splat(0));
+    const second_name: [32]u8 = "uart-tx-2".* ++ @as([23]u8, @splat(0));
+    const first_id = reg.create(first_name, container, 1024, 1, 0, 0, 0, 0).?;
+    const second_id = reg.create(second_name, container, 1024, 1, 0, 0, 0, 0).?;
+
+    for (0..4097) |i| reg.writeConsoleByte(first_id, @truncate(i));
+    reg.writeConsoleByte(second_id, 'B');
+
+    var first_log: [4096]u8 = undefined;
+    var second_log: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4096), reg.getConsoleLog(first_id, &first_log));
+    try std.testing.expectEqual(@as(u8, 1), first_log[0]);
+    try std.testing.expectEqual(@as(u8, 0), first_log[4095]);
+    try std.testing.expectEqual(@as(usize, 1), reg.getConsoleLog(second_id, &second_log));
+    try std.testing.expectEqual(@as(u8, 'B'), second_log[0]);
+    try std.testing.expectEqual(@as(usize, 0), reg.getConsoleLog(0xFFFF_FFFF, &second_log));
+}
+
 test "m1: microvm_bridge synchronized enqueue and dequeue" {
     init();
 

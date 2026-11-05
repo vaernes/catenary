@@ -48,7 +48,7 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=true"
         DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;[UI] MicroVM provisioned: alpine-node-01;[UI] Switched console to MicroVM #2"
         DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
-        DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1;[vm1] Catenary OS Guest Init: SUCCESS;[vm1] guest_rootfs: init started;[vm2] Catenary OS Guest Init: SUCCESS;[vm2] guest_rootfs: init started;[vm2] guest_rootfs: shell ready;[vm2] help env os-release exit"
+        DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1;[vm1] Catenary OS Guest Init: SUCCESS;[vm1] guest_rootfs: init started;[vm1] guest_rootfs: shell ready;[vm2] Catenary OS Guest Init: SUCCESS;[vm2] guest_rootfs: init started;[vm2] guest_rootfs: shell ready;[UI] Switched console to MicroVM #1;[vm1] help env os-release exit;[UI] Switched console to MicroVM #2;[vm2] help env os-release exit"
         ;;
     *)
         echo "[!] Unknown SMOKE_PROFILE: ${SMOKE_PROFILE}" >&2
@@ -179,20 +179,32 @@ send_keys(["right", "right"], 0.15)
 send_keys(["ret", "ret", "ret", "ret"], 0.15)
 time.sleep(0.4)
 
-# 2. Switch focus to Guest Serial Console pane (F6) and switch active console to MicroVM 2 (F8)
+# 2. Switch to MicroVM 2 and wait until both guest shells can accept input
 send_keys(["f6"], 0.2)
 send_keys(["f8"], 0.2)
 
 deadline = time.monotonic() + 60
 while time.monotonic() < deadline:
     with open("qemu_serial.log", "r", errors="replace") as log:
-        if "[vm2] guest_rootfs: shell ready" in log.read():
+        output = log.read()
+        if "[vm1] guest_rootfs: shell ready" in output and "[vm2] guest_rootfs: shell ready" in output:
             break
     time.sleep(0.25)
 else:
-    raise SystemExit("MicroVM 2 guest shell did not become ready")
+    raise SystemExit("Both guest shells did not become ready")
 
-# 3. Forward a command and require the guest shell response in the smoke profile
+# 3. Exercise input/output on VM 2, switch back to VM 1, and exercise it there too
+send_keys(["h", "e", "l", "p", "ret"], 0.1)
+deadline = time.monotonic() + 20
+while time.monotonic() < deadline:
+    with open("qemu_serial.log", "r", errors="replace") as log:
+        if "[vm2] help env os-release exit" in log.read():
+            break
+    time.sleep(0.25)
+else:
+    raise SystemExit("MicroVM 2 did not answer help")
+
+send_keys(["f7"], 0.2)
 send_keys(["h", "e", "l", "p", "ret"], 0.1)
 s.close()
 '

@@ -187,15 +187,19 @@ For durability, use three independently powered physical voting nodes with real 
 
 ## 8. Current Worktree Verification
 
-These results were collected on 2026-11-05 from an isolated copy of the current working tree so QEMU artifacts would not overwrite existing workspace outputs.
+These results were collected on 2026-11-05. QEMU profiles ran in an isolated copy of the current working tree so QEMU artifacts would not overwrite workspace outputs. Build and Zig test commands used the project's Zig 0.17.0 toolchain.
 
 | Check | Result | Evidence and limits |
 |---|---|---|
+| `zig build test-kernel --summary all` | PASS — 72 tests | Production kernel tests, including UART FIFO/IRQ and TX-log isolation regressions and EPT GPA bound checks |
+| `zig test tests/test_ept_walker.zig`; `zig test tests/test_m2_adversarial.zig`; `zig test tests/test_m2_control_vmcs_stress.zig` | PASS — 8, 10, and 8 tests | Standalone EPT and control/UART reference-model stress tests; not system acceptance |
 | `python3 -m unittest discover -s tests -p 'test_*.py'` | PASS — 77 tests | Python tests; not system acceptance |
-| `bash -n test_qemu.sh` and `git diff --check` on modified tracked source files | PASS | Syntax and whitespace checks |
-| `SMOKE_PROFILE=phase9 TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Distinct EPT roots; VM 1/core 0 and VM 2/core 1; both guest-init/rootfs milestones; VM 2 shell-ready marker; UI console switch to VM 2; injected `help` received and answered with `help env os-release exit` |
-| `SMOKE_PROFILE=ui-phase8 TIMEOUT_SECS=120 ./test_qemu.sh` | PASS — QEMU | Existing Phase 8 UI profile |
-| `SMOKE_PROFILE=vmx-linux TIMEOUT_SECS=120 ./test_qemu.sh` | PASS — QEMU | Linux guest boot milestones observed with services disabled |
-| `SMOKE_PROFILE=vmx-linux-services TIMEOUT_SECS=120 ./test_qemu.sh` | PASS — QEMU | Service and Linux guest milestones observed. Profile disables per-syscall UART keepalive, which inserted dots into the literal log markers. |
+| Focused adversarial Python suites (`adversarial_ept_stress`, `test_empirical_m1_smp_affinity`, `test_m2_control_vmcs_stress`, `test_m2_syscall_uart_stress`) | PASS — 33 tests | Includes rejection of GPAs outside the four-level EPT address range |
+| `bash -n test_qemu.sh` and `git diff --check` | PASS | Shell syntax and whitespace checks |
+| `SMP=2 SMOKE_PROFILE=phase9 TIMEOUT_SECS=180 ./test_qemu.sh`; same with `SMP=4` | PASS — KVM-backed QEMU | Distinct EPT roots; both VMs launched on cores 0/1; both shells ready; console switched in both directions; both guests answered `help` |
+| `SMP=2 SMOKE_PROFILE=default TIMEOUT_SECS=180 ./test_qemu.sh`; same with `SMP=4` | PASS — QEMU | Default profile regression |
+| `SMP=2 SMOKE_PROFILE=ui-phase8 TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — QEMU | Existing Phase 8 UI profile |
+| `SMP=2 SMOKE_PROFILE=vmx-linux TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — QEMU | Linux guest boot milestones observed with services disabled |
+| `SMP=2 SMOKE_PROFILE=vmx-linux-services TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — QEMU | Service and Linux guest milestones observed. Linux profiles disable per-syscall UART keepalive, which inserted dots into literal log markers. |
 
-The Phase 9 run also rebuilt the OS with the project Zig version. The shell response demonstrates guest input and output on this QEMU path, not physical hardware behavior. No physical-host, storage durability, cluster quorum, or adversarial isolation acceptance is claimed.
+The QEMU runs rebuilt the OS with the project Zig version. The guest shell responses demonstrate input and output on the exercised QEMU path, not physical hardware behavior. Physical-host acceptance and broader adversarial isolation gates remain open; no storage durability or cluster quorum acceptance is claimed.
