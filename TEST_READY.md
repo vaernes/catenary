@@ -195,6 +195,7 @@ These results were collected on 2026-11-05 from an isolated copy of the current 
 | `bash -n test_qemu.sh` and `git diff --check` on modified tracked source files | PASS | Syntax and whitespace checks |
 | `SMOKE_PROFILE=phase9 TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Distinct EPT roots; VM 1/core 0 and VM 2/core 1; both guest-init/rootfs milestones; VM 2 shell-ready marker; UI console switch to VM 2; injected `help` received and answered with `help env os-release exit` |
 | `SMOKE_PROFILE=ui-phase8 TIMEOUT_SECS=120 ./test_qemu.sh` | PASS — QEMU | Existing Phase 8 UI profile |
-| `SMOKE_PROFILE=vmx-linux-services TIMEOUT_SECS=120 ./test_qemu.sh` | FAIL — timeout | Required service and guest markers were not observed; root cause unresolved |
+| `SMOKE_PROFILE=vmx-linux TIMEOUT_SECS=120 ./test_qemu.sh` | PASS — QEMU | Linux guest boot milestones observed with services disabled |
+| `SMOKE_PROFILE=vmx-linux-services TIMEOUT_SECS=120 ./test_qemu.sh` | PASS — QEMU | Service and Linux guest milestones observed. Profile disables per-syscall UART keepalive, which inserted dots into the literal log markers. |
 
-The Phase 9 run also rebuilt the OS with the project Zig version. The shell response demonstrates guest input and output on this QEMU path, not physical hardware behavior. The failed `vmx-linux-services` profile remains open; no physical-host, storage durability, cluster quorum, or adversarial isolation acceptance is claimed.
+The Phase 9 run also rebuilt the OS with the project Zig version. The shell response demonstrates guest input and output on this QEMU path, not physical hardware behavior. No physical-host, storage durability, cluster quorum, or adversarial isolation acceptance is claimed.

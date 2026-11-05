@@ -69,16 +69,16 @@ Every feature identified during the Survey phase is mapped to a milestone below.
 | M1 | Ring 0 VMX, EPT & SMP Core Affinity | `src/arch/x86_64/vmx.zig`, `smp.zig`, `gdt.zig`, `src/kernel/scheduler.zig`, `src/vmm/microvm_registry.zig`, `microvm_bridge.zig` | none | DONE (EPT walker, per-core VMXON/stacks, TSS base, affinity, spinlocks) |
 | M2 | Console Syscalls & Multi-Instance Control | `src/syscall_abi.zig`, `src/user/lib.zig`, `src/services/service_bootstrap.zig`, `src/arch/x86_64/user_mode.zig`, `src/control/control_handler.zig`, `src/arch/x86_64/vmx.zig` | M1 contracts | LIVE QEMU guest input/output path evidenced; broader adversarial validation pending |
 | M3 | windowd Live Guest Serial Console & Switching | `src/user/windowd.zig`, `src/user/protocols/windowd_protocol.zig` | M2 contracts | Live QEMU console switch and guest response evidenced; broader validation pending |
-| M4 | Automated Phase 9 Smoke Profile & Integration | `test_qemu.sh` | M2, M3 | Phase 9 QEMU profile passes; `vmx-linux-services` regression profile did not pass |
-| M5 | Live Integration & Adversarial Coverage Hardening | Entire codebase | M1, M2, M3, M4, TEST_READY.md | IN PROGRESS (QEMU evidence recorded; adversarial and physical-host gates pending) |
+| M4 | Automated Phase 9 Smoke Profile & Integration | `test_qemu.sh` | M2, M3 | Phase 9, vmx-linux, vmx-linux-services, and ui-phase8 QEMU profiles pass |
+| M5 | Live Integration & Adversarial Coverage Hardening | Entire codebase | M1, M2, M3, M4, TEST_READY.md | IN PROGRESS (listed QEMU profiles pass; adversarial and physical-host gates pending) |
 | E2E | Historical Model Testing Track | `tests/`, test harness, `TEST_INFRA.md`, `TEST_READY.md` | none (models and simulated traces) | DONE (historical report: 50/50 model cases; not live integration) |
 
 ### Current validation evidence (2026-11-05)
 
 - The isolated live `phase9` QEMU profile passed with KVM. It observed distinct EPT roots, VM 1 and VM 2 launched on cores 0 and 1, per-VM guest-init/rootfs milestones, console switching to VM 2, and the guest shell's response to `help`. This verifies the exercised QEMU path only.
-- The `ui-phase8` QEMU regression profile passed.
-- The `vmx-linux-services` QEMU regression profile timed out without its required service and guest milestones. Its cause is unresolved; this profile remains a blocker.
+- The `ui-phase8`, `vmx-linux`, and `vmx-linux-services` QEMU regression profiles passed. The Linux profiles disable per-syscall UART keepalive because its injected dots fragmented the literal log markers.
 - Python discovery passed 77 tests. Physical-host acceptance and broader adversarial M5 testing remain pending.
+- The QEMU-validated software baseline is usable to begin Phase 10 development; this does not close Phase 9 M5 or establish hardware acceptance.
 - See the [current worktree test record](TEST_READY.md#8-current-worktree-verification) for commands and evidence boundaries.
 
 ## Expanded scope and future milestones
