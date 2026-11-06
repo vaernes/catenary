@@ -96,48 +96,55 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     try testing.expectEqualStrings("varde_shell: executed 'ps'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "SID  Service       State        Origin") != null);
 
-    // 3. vm-create
-    varde_shell.dispatch("vm-create test-vm 2 64");
+    // 3. vm-create rejects unsupported multi-vCPU requests without allocating a VM.
+    varde_shell.dispatch("vm-create rejected-vm 2 64");
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "supports one vCPU per MicroVM") != null);
+    try testing.expect(microvm_registry.lookup(1) == null);
+
+    // 4. vm-create accepts the implemented single-vCPU profile.
+    varde_shell.dispatch("vm-create test-vm 1 64");
     try testing.expectEqualStrings("varde_shell: executed 'vm-create'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Created and started MicroVM 'test-vm'") != null);
 
-    // 4. vmlist
+    // 5. vmlist
     varde_shell.dispatch("vmlist");
     try testing.expectEqualStrings("varde_shell: executed 'vmlist'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "test-vm") != null);
 
-    // 5. vm-kill
+    // 6. vm-kill
     varde_shell.dispatch("vm-kill 1");
     try testing.expectEqualStrings("varde_shell: executed 'vm-kill'\n", getMilestone());
-    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "MicroVM 1 stopped.") != null);
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "MicroVM 1 stop requested.") != null);
+    try testing.expect(microvm_registry.completeStop(1));
 
-    // 6. vm-start
+    // 7. vm-start
     varde_shell.dispatch("vm-start 1");
     try testing.expectEqualStrings("varde_shell: executed 'vm-start'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "MicroVM 1 started.") != null);
 
-    // 7. vm-delete (stop first or delete stopped VM)
+    // 8. vm-delete (stop first or delete stopped VM)
     varde_shell.dispatch("vm-kill 1");
+    try testing.expect(microvm_registry.completeStop(1));
     varde_shell.dispatch("vm-delete 1");
     try testing.expectEqualStrings("varde_shell: executed 'vm-delete'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "MicroVM 1 deleted.") != null);
 
-    // 8. cluster
+    // 9. cluster
     varde_shell.dispatch("cluster");
     try testing.expectEqualStrings("varde_shell: executed 'cluster'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Cluster Topology & Node Status:") != null);
 
-    // 9. net-stat
+    // 10. net-stat
     varde_shell.dispatch("net-stat");
     try testing.expectEqualStrings("varde_shell: executed 'net-stat'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Virtio-Net      : RX/TX Queues Ready") != null);
 
-    // 10. storage-stat
+    // 11. storage-stat
     varde_shell.dispatch("storage-stat");
     try testing.expectEqualStrings("varde_shell: executed 'storage-stat'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Storage Subsystem Status:") != null);
 
-    // 11. top
+    // 12. top
     scheduler.threads[0].state = .Running;
     scheduler.threads[0].id = 1;
     varde_shell.dispatch("top");

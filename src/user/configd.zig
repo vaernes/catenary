@@ -235,7 +235,7 @@ fn launchMicroVm(bs: *const BootstrapDescriptor, token: u64, dipc_phys_slot1: u6
 
     const ini_file =
         \\[microvm]
-        \\vcpus=2
+        \\vcpus=1
         \\mem_pages=256
     ;
 

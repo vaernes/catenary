@@ -84,6 +84,22 @@ pub const Op = enum(u16) {
     /// Reply with TCP socket status.
     /// Payload: TcpStatusReplyPayload.
     tcp_status_reply = 18,
+
+    /// Host-configd attaches a host-assigned MicroVM vNIC to a local segment.
+    /// Payload: SwitchPortAttachPayload. Reply: switch_config_ack.
+    switch_port_attach = 19,
+
+    /// Host-configd detaches a vNIC using its current attachment generation.
+    /// Payload: SwitchPortDetachPayload. Reply: switch_config_ack.
+    switch_port_detach = 20,
+
+    /// Host-configd atomically replaces a vNIC policy at an expected revision.
+    /// Payload: SwitchPolicyReplacePayload. Reply: switch_config_ack.
+    switch_policy_replace = 21,
+
+    /// Result for a switch configuration request.
+    /// Payload: SwitchConfigAckPayload.
+    switch_config_ack = 22,
 };
 
 /// Header prepended to every netd DIPC message (after the PageHeader).
@@ -258,4 +274,72 @@ pub const TcpStatusReplyPayload = extern struct {
     remote_port: u16,
     remote_ip: [16]u8 = @splat(0),
     rx_buffered: u32 = 0,
+};
+
+// ---------------------------------------------------------------------------
+// Local virtual-switch configuration
+// ---------------------------------------------------------------------------
+
+pub const SWITCH_MAX_RULES_PER_DIRECTION: usize = 16;
+pub const SWITCH_MAX_ADDRESSES_PER_FAMILY: usize = 4;
+
+pub const SwitchPortAttachPayload = extern struct {
+    vmid: u32,
+    segment: u64,
+    mac: [6]u8,
+    ipv4_count: u8,
+    ipv6_count: u8,
+    ipv4_addresses: [SWITCH_MAX_ADDRESSES_PER_FAMILY][4]u8 = @splat(@splat(0)),
+    ipv6_addresses: [SWITCH_MAX_ADDRESSES_PER_FAMILY][16]u8 = @splat(@splat(0)),
+};
+
+pub const SwitchPortDetachPayload = extern struct {
+    vmid: u32,
+    generation: u64,
+};
+
+pub const SwitchRulePayload = extern struct {
+    ip_version: u8,
+    protocol: u8,
+    destination: [16]u8,
+    destination_port_first: u16,
+    destination_port_last: u16,
+};
+
+pub const SwitchPolicyReplacePayload = extern struct {
+    vmid: u32,
+    generation: u64,
+    expected_revision: u64,
+    ingress_count: u8,
+    egress_count: u8,
+    ingress: [SWITCH_MAX_RULES_PER_DIRECTION]SwitchRulePayload = @splat(.{
+        .ip_version = 0,
+        .protocol = 0,
+        .destination = @splat(0),
+        .destination_port_first = 0,
+        .destination_port_last = 0,
+    }),
+    egress: [SWITCH_MAX_RULES_PER_DIRECTION]SwitchRulePayload = @splat(.{
+        .ip_version = 0,
+        .protocol = 0,
+        .destination = @splat(0),
+        .destination_port_first = 0,
+        .destination_port_last = 0,
+    }),
+};
+
+pub const SwitchConfigStatus = enum(u16) {
+    ok = 0,
+    unauthorized = 1,
+    invalid = 2,
+    stale = 3,
+    no_capacity = 4,
+};
+
+pub const SwitchConfigAckPayload = extern struct {
+    request_op: Op,
+    status: SwitchConfigStatus,
+    vmid: u32,
+    generation: u64,
+    policy_revision: u64,
 };

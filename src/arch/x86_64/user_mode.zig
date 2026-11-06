@@ -326,7 +326,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                     serialWrite("[SECURITY] syscall op=0x");
                     printHex(op);
                     serialWrite(" denied for service kind=0x");
-                    printHex(@intFromEnum(kind));
+                    printHex(@backingInt(kind));
                     serialWrite("\n");
                     return 0xFFFFFFFF;
                 }
@@ -372,11 +372,11 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const dst_node = dipc.Ipv6Addr{ .bytes = [_]u8{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
             const dst_addr = dipc.Address{
                 .node = dst_node,
-                .endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
+                .endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
             };
             const src_addr = dipc.Address{
                 .node = node_config.getLocalNode(),
-                .endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
+                .endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
             };
 
             var payload = control_protocol.ControlHeader{
@@ -385,8 +385,8 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             };
             var sync_payload = control_protocol.RegistrySyncPayload{
                 .service_id = sid,
-                .service_kind = @intFromEnum(kind),
-                .state = @intFromEnum(@import("../../services/service_registry.zig").ServiceState.registered),
+                .service_kind = @backingInt(kind),
+                .state = @backingInt(@import("../../services/service_registry.zig").ServiceState.registered),
             };
 
             var combined_payload: [16]u8 = undefined;
@@ -400,7 +400,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
 
             const configd_addr = dipc.Address{
                 .node = node_config.getLocalNode(),
-                .endpoint = @intFromEnum(identity.ReservedEndpoint.configd),
+                .endpoint = @backingInt(identity.ReservedEndpoint.configd),
             };
             const configd_page = dipc.allocPageMessage(hhdm_offset_local, src_addr, configd_addr, &combined_payload) catch 0;
             if (configd_page != 0) {
@@ -409,7 +409,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
 
             const clusterd_addr = dipc.Address{
                 .node = node_config.getLocalNode(),
-                .endpoint = @intFromEnum(identity.ReservedEndpoint.clusterd),
+                .endpoint = @backingInt(identity.ReservedEndpoint.clusterd),
             };
             const clusterd_page = dipc.allocPageMessage(hhdm_offset_local, src_addr, clusterd_addr, &combined_payload) catch 0;
             if (clusterd_page != 0) {
@@ -529,6 +529,14 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 serialWrite("[SEND_PAGE] Bad magic\n");
                 return 1;
             }
+            const sender_kind = service_registry.getServiceKind(sid6) orelse {
+                serialWrite("[SEND_PAGE] Service identity unavailable\n");
+                return 1;
+            };
+            if (!service_bootstrap.isAuthorizedSourceEndpoint(sender_kind, src_hdr.src.endpoint)) {
+                serialWrite("[SECURITY] DIPC source endpoint does not match service capability\n");
+                return 1;
+            }
             const payload_len6 = @as(usize, src_hdr.payload_len);
             if (payload_len6 > dipc.MAX_PAYLOAD) {
                 serialWrite("[SEND_PAGE] Payload too large\n");
@@ -570,7 +578,7 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const node_config = @import("../../ipc/node_config.zig");
             _ = node_config; // temporarily unused
 
-            const is_kernel_control = dst_hdr.dst.endpoint == @intFromEnum(identity.ReservedEndpoint.kernel_control);
+            const is_kernel_control = dst_hdr.dst.endpoint == @backingInt(identity.ReservedEndpoint.kernel_control);
 
             if (is_kernel_control) {
                 const control_handler = @import("../../control/control_handler.zig");

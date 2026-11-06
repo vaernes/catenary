@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const identity = @import("../ipc/identity.zig");
 const microvm_transport = @import("microvm_transport.zig");
 const virtio_blk = @import("virtio_blk.zig");
+const storaged_protocol = @import("../user/protocols/storaged_protocol.zig");
 const dipc = @import("../ipc/dipc.zig");
 const router = @import("../ipc/router.zig");
 const endpoint_table = @import("../ipc/endpoint_table.zig");
@@ -293,10 +294,24 @@ fn readDescriptor(hhdm: u64, vmid: u32, q: *const virtio_blk.QueueState, idx: u1
 
 const DescriptorChainInfo = struct {
     request: virtio_blk.RequestHeader,
+    storaged_req_type: u32,
     data_hpa: u64,
     data_len: u32,
     status_addr: u64,
 };
+
+fn storagedRequestType(request_type: u32) ?u32 {
+    const fua = request_type & virtio_blk.VIRTIO_BLK_T_FUA != 0;
+    return switch (request_type & ~virtio_blk.VIRTIO_BLK_T_FUA) {
+        virtio_blk.VIRTIO_BLK_T_IN => if (fua) null else @backingInt(storaged_protocol.ReqType.read),
+        virtio_blk.VIRTIO_BLK_T_OUT => if (fua)
+            @backingInt(storaged_protocol.ReqType.write_fua)
+        else
+            @backingInt(storaged_protocol.ReqType.write),
+        virtio_blk.VIRTIO_BLK_T_FLUSH => if (fua) null else @backingInt(storaged_protocol.ReqType.flush),
+        else => null,
+    };
+}
 
 fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_head: u16) !DescriptorChainInfo {
     if (!isQueueValid(q) or !isDescriptorIndexValid(q, chain_head)) return error.InvalidDescriptor;
@@ -311,9 +326,12 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
     var hdr_bytes: [@sizeOf(virtio_blk.RequestHeader)]u8 = undefined;
     if (!readGuestBytes(hhdm, vmid, d1.addr, &hdr_bytes)) return error.InvalidGpa;
     const req = std.mem.bytesToValue(virtio_blk.RequestHeader, &hdr_bytes);
+    const storaged_req_type = storagedRequestType(req.type) orelse return error.UnsupportedOperation;
+    const operation = req.type & ~virtio_blk.VIRTIO_BLK_T_FUA;
 
     var info = DescriptorChainInfo{
         .request = req,
+        .storaged_req_type = storaged_req_type,
         .data_hpa = 0,
         .data_len = 0,
         .status_addr = 0,
@@ -323,11 +341,11 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
     if ((d2.flags & virtio_blk.VIRTQ_DESC_F_INDIRECT) != 0) return error.InvalidDescriptor;
 
     if ((d2.flags & virtio_blk.VIRTQ_DESC_F_NEXT) != 0) {
-        if (d2.len == 0) return error.InvalidDescriptor;
-        if (req.type == virtio_blk.VIRTIO_BLK_T_IN and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0) {
+        if (d2.len == 0 or d2.len > std.math.maxInt(u16) or d2.len % 512 != 0) return error.InvalidDescriptor;
+        if (operation == virtio_blk.VIRTIO_BLK_T_IN and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0) {
             return error.InvalidDescriptor;
         }
-        if (req.type == virtio_blk.VIRTIO_BLK_T_OUT and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) != 0) {
+        if (operation == virtio_blk.VIRTIO_BLK_T_OUT and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) != 0) {
             return error.InvalidDescriptor;
         }
         info.data_len = d2.len;
@@ -345,14 +363,22 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
         info.status_addr = d2.addr;
     }
 
-    if (req.type != virtio_blk.VIRTIO_BLK_T_IN and
-        req.type != virtio_blk.VIRTIO_BLK_T_OUT and
-        req.type != virtio_blk.VIRTIO_BLK_T_FLUSH)
-    {
-        return error.UnsupportedOperation;
-    }
-
     return info;
+}
+
+fn makeStoragedRequest(
+    info: DescriptorChainInfo,
+    vmid: u32,
+    chain_head: u16,
+) storaged_protocol.BlkRequest {
+    return .{
+        .req_type = info.storaged_req_type,
+        .sector = info.request.sector,
+        .vmid = vmid,
+        .chain_head = chain_head,
+        .data_len = @intCast(info.data_len),
+        .data_hpa = info.data_hpa,
+    };
 }
 
 fn findStatusDescriptorAddr(hhdm: u64, vmid: u32, q: *const virtio_blk.QueueState, chain_head: u16) ?u64 {
@@ -432,18 +458,9 @@ fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virti
         .endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
     };
 
-    // Format payload: RequestHeader + metadata
-    var payload: [64]u8 = @splat(0);
-    std.mem.copyForwards(u8, payload[0..@sizeOf(virtio_blk.RequestHeader)], std.mem.asBytes(&info.request));
-    // Additional metadata: VMID (32..36), chain_head (36..38), data_len (38..40), data_hpa (40..48)
-    std.mem.writeInt(u32, payload[32..36][0..4], vmid, .little);
-    std.mem.writeInt(u16, payload[36..38][0..2], chain_head, .little);
-    std.mem.writeInt(u16, payload[38..40][0..2], @as(u16, @truncate(info.data_len)), .little);
-    std.mem.writeInt(u64, payload[40..48][0..8], info.data_hpa, .little);
-    // Also save status_addr so handleVirtioBlkResponse knows where to write the status
-    std.mem.writeInt(u64, payload[48..56][0..8], info.status_addr, .little);
+    const request = makeStoragedRequest(info, vmid, chain_head);
 
-    const msg_page = try dipc.allocPageMessage(hhdm, kernel_addr, storaged_addr, &payload);
+    const msg_page = try dipc.allocPageMessage(hhdm, kernel_addr, storaged_addr, std.mem.asBytes(&request));
     errdefer dipc.freePageMessage(msg_page);
 
     // Send to storaged via router
@@ -642,6 +659,43 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     try std.testing.expectEqual(@as(u16, 2), readGuestInt(u16, hhdm, vmid, q.device_addr + 2).?);
     try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 4 + 8 + 4).?);
     try std.testing.expectEqual(@as(usize, 1), test_irq_count);
+}
+
+test "virtio-blk request metadata matches storaged wire layout" {
+    const info = DescriptorChainInfo{
+        .request = .{ .type = virtio_blk.VIRTIO_BLK_T_OUT, .sector = 0x1122_3344_5566_7788 },
+        .storaged_req_type = @backingInt(storaged_protocol.ReqType.write),
+        .data_hpa = 0x8877_6655_4433_2211,
+        .data_len = 4096,
+        .status_addr = 0xAABB_CCDD_EEFF_0011,
+    };
+    const request = makeStoragedRequest(info, 0x1234_5678, 0x9ABC);
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(@TypeOf(request)));
+    try std.testing.expectEqual(virtio_blk.VIRTIO_BLK_T_OUT, request.req_type);
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), request.sector);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), request.vmid);
+    try std.testing.expectEqual(@as(u16, 0x9ABC), request.chain_head);
+    try std.testing.expectEqual(@as(u16, 4096), request.data_len);
+    try std.testing.expectEqual(@as(u64, 0x8877_6655_4433_2211), request.data_hpa);
+}
+
+test "virtio-blk FUA writes map to write-plus-flush storage requests" {
+    try std.testing.expectEqual(
+        @as(?u32, @backingInt(storaged_protocol.ReqType.write)),
+        storagedRequestType(virtio_blk.VIRTIO_BLK_T_OUT),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, @backingInt(storaged_protocol.ReqType.write_fua)),
+        storagedRequestType(virtio_blk.VIRTIO_BLK_T_OUT | virtio_blk.VIRTIO_BLK_T_FUA),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        storagedRequestType(virtio_blk.VIRTIO_BLK_T_IN | virtio_blk.VIRTIO_BLK_T_FUA),
+    );
+    try std.testing.expectEqual(
+        @as(?u32, null),
+        storagedRequestType(virtio_blk.VIRTIO_BLK_T_FLUSH | virtio_blk.VIRTIO_BLK_T_FUA),
+    );
 }
 
 test "m1: microvm_registry affinity, device state, and uart circular buffer" {

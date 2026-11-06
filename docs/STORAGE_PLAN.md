@@ -20,21 +20,37 @@ implementation required here already exists.
 - [storaged](../src/user/storaged.zig) already scans for NVMe, initializes
 	controller and I/O queues, and has NVMe read/write command paths. It is not
 	accurate to describe NVMe support as entirely future work.
-- When no NVMe device is found, the synthetic event loop returns success without
-	persisting the request. The `vmid == 0` smoke-test write is also acknowledged
-	synthetically in the NVMe path. Neither success proves durable storage.
-- The current guest flush branch returns success as a **no-op**. A completed
-	NVMe write alone does not establish that volatile controller caches reached
-	nonvolatile media. The current path therefore cannot meet the contract below.
+- When no NVMe device is found, requests now complete with I/O error instead of
+	returning synthetic success. Host-local smoke writes use the same NVMe path
+	as other block requests; `vmid == 0` no longer bypasses persistence.
+- Flush requests issue an NVMe Flush when Identify Controller reports a
+	volatile write cache. If that field reports no volatile cache, the flush may
+	complete without a command; if controller identification failed, flush fails.
+	Virtio FUA writes use a write-then-flush fallback and complete only after both
+	commands succeed. This does not issue the NVMe Write FUA bit, provide power-cut
+	evidence, or prove that physical media honors its advertised persistence
+	contract.
 - The [virtio-blk device](../src/vmm/virtio_blk.zig) and
 	[guest bridge](../src/vmm/microvm_bridge.zig) implement queue notification,
 	descriptor handling, DIPC routing, and completion/interrupt plumbing. The
-	bridge currently places request metadata beginning at payload byte 32,
-	whereas the shared [block request](../src/user/protocols/storaged_protocol.zig)
-	places it immediately after the 16-byte request header. This wire-layout
-	discrepancy must be reconciled and tested before claiming a working,
-	persistent end-to-end guest disk. The present direct host-physical-address
-	path is not evidence that the scoped DMA and ownership design below exists.
+	bridge now serializes the shared 32-byte
+	[block request](../src/user/protocols/storaged_protocol.zig) directly,
+	including VM/chain identity and buffer metadata. Descriptor lengths and
+	sector alignment are bounded to the current single-page NVMe PRP path. The
+	present direct host-physical-address path is not evidence that the scoped
+	DMA and ownership design below exists.
+- `containerd` scans all 16 configured partition-header sectors on startup and
+	avoids reusing slots whose headers validate. The default QEMU smoke has
+	recovered existing metadata and completed a new write after the full scan;
+	that exercise also covers NVMe queue doorbell wrap at the configured queue
+	depth. This is a smoke-test allocation aid, not a checksummed journal or
+	crash-consistent metadata recovery protocol; a read error stops the scan and
+	prevents subsequent writes.
+- The default QEMU smoke path now observes an actual NVMe write, an FUA
+	write+flush fallback, and readback of a test partition header. This is QEMU
+	integration evidence only; it does not establish physical power-loss
+	durability, native NVMe FUA behavior, crash recovery, or persistent guest
+	filesystem behavior.
 
 ## 2. Boundaries and service model
 

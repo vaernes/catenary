@@ -18,6 +18,7 @@ pub const HandleError = (error{
     BadPayload,
     NotForKernel,
     Unauthorized,
+    Busy,
     NodeLocked,
 } || dipc.AllocError || router.RouteError);
 
@@ -334,6 +335,33 @@ pub fn handleKernelControlPage(
             const microvm_bridge = @import("../vmm/microvm_bridge.zig");
             microvm_bridge.handleVirtioBlkResponse(p.vmid, p.head_idx, p.status);
         },
+        .virtio_net_ingress => {
+            if (!isAuthorizedControlSource(hdr, ch.op)) return error.Unauthorized;
+            if (remaining < @sizeOf(control_protocol.VirtioNetIngressPayload)) return error.BadPayload;
+            const p: *const control_protocol.VirtioNetIngressPayload = @ptrCast(@alignCast(payload_ptr));
+            const frame_len = @as(usize, p.frame_len);
+            if (frame_len < 14 or frame_len > control_protocol.MAX_VIRTIO_NET_FRAME_SIZE or
+                remaining != @sizeOf(control_protocol.VirtioNetIngressPayload) + frame_len)
+            {
+                return error.BadPayload;
+            }
+
+            const microvm_registry = @import("../vmm/microvm_registry.zig");
+            const inst = microvm_registry.findMutable(p.vmid) orelse return error.BadPayload;
+            if (inst.state != .running) return error.BadPayload;
+
+            const frame: [*]const u8 = payload_ptr + @sizeOf(control_protocol.VirtioNetIngressPayload);
+            const destination = dipc.Address{
+                .node = node_config.getLocalNode(),
+                .endpoint = identity.MICROVM_GUEST_TX_ENDPOINT_BASE + @as(u64, p.vmid),
+            };
+            const page = try dipc.allocPageMessage(hhdm_offset, hdr.src, destination, frame[0..frame_len]);
+            const microvm_bridge = @import("../vmm/microvm_bridge.zig");
+            microvm_bridge.enqueue(p.vmid, page) catch {
+                dipc.freePageMessage(page);
+                return error.Busy;
+            };
+        },
         .registry_sync => {
             if (remaining != @sizeOf(control_protocol.RegistrySyncPayload)) return error.BadPayload;
             const p: *const control_protocol.RegistrySyncPayload = @ptrCast(@alignCast(payload_ptr));
@@ -408,6 +436,11 @@ pub fn handleKernelControlPage(
                 .instance_id = 0,
             };
             const table_const: *const endpoint_table.EndpointTable = table;
+            if (p.vcpus != 1) {
+                reply.status = .invalid_payload;
+                try sendControlReply(control_protocol.CreateMicrovmResult, hhdm_offset, table_const, hdr, .create_microvm, reply);
+                return;
+            }
             const microvm_registry = @import("../vmm/microvm_registry.zig");
             const smp = @import("../arch/x86_64/smp.zig");
             const online_cpus = smp.getCpuCount();
@@ -456,7 +489,9 @@ pub fn handleKernelControlPage(
                         if (hdr.src.endpoint == @backingInt(identity.ReservedEndpoint.windowd)) {
                             if (microvm_registry.start(id)) {
                                 const scheduler = @import("../kernel/scheduler.zig");
-                                _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch {};
+                                _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch {
+                                    _ = microvm_registry.fail(id);
+                                };
                             }
                         }
                     } else {
@@ -501,10 +536,16 @@ pub fn handleKernelControlPage(
             if (build_options.vmm_active) {
                 const vmx = @import("../arch/x86_64/vmx.zig");
                 if (inst.ept_pml4_phys == null) {
-                    vmx.stageGuestForInstance(inst) catch return error.BadPayload;
+                    vmx.stageGuestForInstance(inst) catch {
+                        _ = microvm_registry.fail(p.instance_id);
+                        return error.BadPayload;
+                    };
                 }
                 const scheduler = @import("../kernel/scheduler.zig");
-                _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch return error.BadPayload;
+                _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch {
+                    _ = microvm_registry.fail(p.instance_id);
+                    return error.BadPayload;
+                };
             }
         },
         .stop_microvm => {

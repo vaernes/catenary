@@ -56,6 +56,8 @@ pub const RequestHeader = extern struct {
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
 pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
+pub const VIRTIO_BLK_T_FUA: u32 = 1 << 4;
+pub const VIRTIO_BLK_F_FLUSH: u32 = 1 << 9;
 
 pub const VIRTIO_BLK_S_OK: u8 = 0;
 pub const VIRTIO_BLK_S_IOERR: u8 = 1;
@@ -133,13 +135,13 @@ pub fn handleRead(vmid: u32, offset: u64) u32 {
         return 0;
     }
 
-    const reg: VirtioReg = @enumFromInt(@as(u16, @truncate(offset)));
+    const reg: VirtioReg = @fromBackingInt(@intCast(@as(u16, @truncate(offset))));
     return switch (reg) {
         .MagicValue => VIRTIO_MAGIC,
         .Version => VIRTIO_VERSION,
         .DeviceID => VIRTIO_DEVICE_BLOCK,
         .VendorID => VIRTIO_VENDOR_ID,
-        .DeviceFeatures => if (inst.device_features_sel == 0) VIRTIO_F_EVENT_IDX else 0,
+        .DeviceFeatures => if (inst.device_features_sel == 0) VIRTIO_F_EVENT_IDX | VIRTIO_BLK_F_FLUSH else 0,
         .QueueNumMax => virtio_queue_size_max,
         .QueueReady => if (inst.selected_queue < 1) (if (inst.queues[0].ready) @as(u32, 1) else 0) else 0,
         .InterruptStatus => inst.interrupt_status,
@@ -153,13 +155,13 @@ pub fn handleWrite(vmid: u32, offset: u64, val: u32) void {
     const inst = getInstance(vmid) orelse return;
     if (offset >= 0x100) return; // Read-only config for now
 
-    const reg: VirtioReg = @enumFromInt(@as(u16, @truncate(offset)));
+    const reg: VirtioReg = @fromBackingInt(@intCast(@as(u16, @truncate(offset))));
     switch (reg) {
         .DeviceFeaturesSel => inst.device_features_sel = val,
         .DriverFeaturesSel => inst.driver_features_sel = val,
         .DriverFeatures => {
             if (inst.driver_features_sel == 0) {
-                inst.driver_features = val & VIRTIO_F_EVENT_IDX;
+                inst.driver_features = val & (VIRTIO_F_EVENT_IDX | VIRTIO_BLK_F_FLUSH);
             }
         },
         .QueueSel => inst.selected_queue = val,
@@ -205,4 +207,16 @@ pub fn handleWrite(vmid: u32, offset: u64, val: u32) void {
         },
         else => {},
     }
+}
+
+test "virtio-blk advertises and masks flush feature negotiation" {
+    init();
+    const vmid: u32 = 0xF1;
+    const features = handleRead(vmid, @backingInt(VirtioReg.DeviceFeatures));
+    try std.testing.expect(features & VIRTIO_BLK_F_FLUSH != 0);
+
+    handleWrite(vmid, @backingInt(VirtioReg.DriverFeaturesSel), 0);
+    handleWrite(vmid, @backingInt(VirtioReg.DriverFeatures), VIRTIO_BLK_F_FLUSH | 0x8000_0000);
+    const inst = getInstance(vmid).?;
+    try std.testing.expectEqual(VIRTIO_BLK_F_FLUSH, inst.driver_features);
 }

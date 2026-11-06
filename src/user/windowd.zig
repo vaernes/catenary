@@ -365,7 +365,7 @@ fn initWidgets() void {
     form_name_input = TextInput.init(Rect.init(128, 48, 248, 16), 31);
     form_name_input.setText("alpine-node-01");
 
-    form_vcpu_spinner = NumberSpinner.init(Rect.init(128, 72, 160, 16), 2, 1, 2, 1, " vCPU");
+    form_vcpu_spinner = NumberSpinner.init(Rect.init(128, 72, 160, 16), 1, 1, 1, 1, " vCPU");
 
     form_mem_select = OptionSelect.init(Rect.init(128, 96, 160, 16), &MEM_OPTIONS, 1);
 
@@ -622,14 +622,14 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
     if (is_tab) {
         if (focused_pane == .vm_form) {
             if (is_shift) {
-                if (@intFromEnum(focused_form_field) > 0) {
-                    focused_form_field = @enumFromInt(@intFromEnum(focused_form_field) - 1);
+                if (@backingInt(focused_form_field) > 0) {
+                    focused_form_field = @fromBackingInt(@intCast(@backingInt(focused_form_field) - 1));
                 } else {
                     focused_pane = .guest_console;
                 }
             } else {
-                if (@intFromEnum(focused_form_field) < 6) {
-                    focused_form_field = @enumFromInt(@intFromEnum(focused_form_field) + 1);
+                if (@backingInt(focused_form_field) < 6) {
+                    focused_form_field = @fromBackingInt(@intCast(@backingInt(focused_form_field) + 1));
                 } else {
                     focused_pane = .vm_manager;
                 }
@@ -668,8 +668,8 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
     if (focused_pane == .vm_form) {
         // Vertical field navigation via Up / Down arrow keys
         if (evt.key_code == .down) {
-            focused_form_field = if (@intFromEnum(focused_form_field) < 6)
-                @enumFromInt(@intFromEnum(focused_form_field) + 1)
+            focused_form_field = if (@backingInt(focused_form_field) < 6)
+                @fromBackingInt(@intCast(@backingInt(focused_form_field) + 1))
             else
                 .name;
             syncWidgetFocus();
@@ -678,8 +678,8 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
             return;
         }
         if (evt.key_code == .up) {
-            focused_form_field = if (@intFromEnum(focused_form_field) > 0)
-                @enumFromInt(@intFromEnum(focused_form_field) - 1)
+            focused_form_field = if (@backingInt(focused_form_field) > 0)
+                @fromBackingInt(@intCast(@backingInt(focused_form_field) - 1))
             else
                 .reset_btn;
             syncWidgetFocus();
@@ -819,10 +819,10 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
                         return;
                     }
                 }
-                // Validation 3: vCPUs limit
+                // This VMM currently implements one vCPU per VM.
                 const vcpu_val = form_vcpu_spinner.getValue();
-                if (vcpu_val > 2) {
-                    setFormStatus("[ERR] vCPUs exceed host core count", color.COLOR_RED);
+                if (vcpu_val != 1) {
+                    setFormStatus("[ERR] Only one vCPU is supported", color.COLOR_RED);
                     damage_tracker.addDamage(status_banner_rect);
                     needs_redraw = true;
                     return;
@@ -854,7 +854,7 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
                 evt.key_code == .enter or evt.ascii == '\n' or evt.ascii == ' ';
             if (is_action) {
                 form_name_input.setText("alpine-node-01");
-                form_vcpu_spinner.setValue(2);
+                form_vcpu_spinner.setValue(1);
                 form_mem_select.setSelectedIndex(1); // 32 MB
                 form_kernel_select.setSelectedIndex(0);
                 form_rootfs_select.setSelectedIndex(0);

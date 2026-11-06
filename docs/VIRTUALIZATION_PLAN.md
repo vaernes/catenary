@@ -45,15 +45,33 @@ test result:
   resources. However, the VMX core also has shared or fallback state, including
   PCI and LAPIC state. An instance-level `vcpus` field and a VMCS per instance do
   **not** establish isolated per-vCPU execution, multi-vCPU correctness, or
-  multi-tenant safety.
+  multi-tenant safety. The create path now rejects requests other than one vCPU;
+  that bounds the current profile but is not evidence that the remaining
+  per-VM/per-vCPU isolation requirements are complete.
 * Existing [virtio-net](../src/vmm/virtio_net.zig),
   [virtio-blk](../src/vmm/virtio_blk.zig), and
   [MicroVM bridge](../src/vmm/microvm_bridge.zig) code are bring-up paths, with
   substantial guest device handling still adjacent to Ring 0. They are not
   evidence of the bounded userspace backends described below. The
-  [storage service](../src/user/storaged.zig) has an NVMe path but also synthetic
-  acknowledgements, and its guest flush branch is currently a no-op. Neither a
-  success marker nor that flush establishes durable guest storage.
+  [storage service](../src/user/storaged.zig) now rejects requests without
+  NVMe, serializes the shared block request layout, and issues NVMe Flush when
+  a volatile write cache is present. Virtio FUA is handled with a write-then-
+  flush fallback rather than the NVMe Write FUA bit. Scoped buffer grants,
+  power-loss/recovery evidence, and a durability guarantee remain absent.
+* The initial Phase 10 lifecycle change makes stop asynchronous: a running VM
+  enters `stopping`, and the VM-exit path declines to resume it once a state
+  check observes that request. Deletion stays blocked until guest execution has
+  returned to the host. Launch failures and unexpected VMX exits are recorded as
+  `failed`. Stop has no bounded response time if the guest does not exit. This
+  is not a complete vCPU teardown or proof that VM resources are safely
+  reclaimed; those remain acceptance work. Registry deletion now also refuses
+  to clear an instance while it still owns VMCS, EPT, or guest-pool allocations.
+  This prevents losing the only allocation references and reusing a registry
+  slot before a reclaimer exists; deletion of launched VMs therefore remains
+  unavailable rather than pretending teardown succeeded. The virtio-net
+  backend also rejects TX queue processing and RX injection unless the registry
+  still reports the VM as running; a kernel regression test covers both paths
+  after a stop request.
 * The [QEMU smoke script](../test_qemu.sh) defines Linux guest serial milestones
   and can run Catenary inside QEMU accelerated by the **external host's** KVM.
   Its presence is not a recorded successful run. Some

@@ -587,6 +587,14 @@ fn handleClusterdProtocol(
             const req_ptr: *align(1) const clusterd_proto.LaunchVmRequest = @ptrFromInt(msg_payload_va);
             const req = req_ptr.*;
 
+            if (req.vcpus != 1) {
+                sendLaunchAck(scratch_phys, scratch_va, token, src_node, req.request_id, .{
+                    .status = .invalid_payload,
+                    .instance_id = 0,
+                });
+                return;
+            }
+
             if (g_pending_inbound_launch.active) {
                 sendLaunchAck(scratch_phys, scratch_va, token, IPV6_ALL_NODES_MULTICAST, req.request_id, .{
                     .status = .busy,

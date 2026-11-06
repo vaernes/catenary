@@ -56,7 +56,7 @@ Any failed validation keeps ownership with current holder, which must free or qu
 
 ## Netd Ownership and Extensibility (Phase 10)
 
-- **Boundary**: The intended architecture places external packet interfaces, off-node routing policy, address assignment, and higher-level networking in Ring 3. The current [netd](../src/user/netd.zig) and [router](../src/ipc/router.zig) are partial implementations, not a complete virtual network or policy system.
+- **Boundary**: The intended architecture places external packet interfaces, off-node routing policy, address assignment, and higher-level networking in Ring 3. The current [netd](../src/user/netd.zig), [virtual-switch policy core](../src/user/protocols/virtual_switch.zig), and [router](../src/ipc/router.zig) are partial implementations, not a complete virtual network or policy system. Guest TX no longer falls back to raw NIC transmission; with no configured vNIC binding or policy, it is dropped. Kernel ingress is accepted only from netd for a running MicroVM, but the current DIPC-page path is not yet a scoped guest-memory grant.
 - **Capability tokens**: The [service bootstrap](../src/services/service_bootstrap.zig) supplies a startup token and syscall restrictions. Their existence alone does not prove complete isolation or the capability-limited packet grants proposed below.
 - **Remote authentication**: The current cluster-wide DIPC HMAC is distinct from the node-local page tag and has a known replay gap; it is not encryption or per-node identity. See [cluster orchestration](CLUSTER_ORCHESTRATION.md#current-implementation-and-limits).
 

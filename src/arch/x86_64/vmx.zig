@@ -2086,7 +2086,6 @@ fn handleIoExit(regs: *GuestRegs) void {
     advanceGuestRip();
 }
 
-
 fn decodeMmioWrite(rip_ptr: [*]const u8, regs: *GuestRegs) u32 {
     var i: usize = 0;
     var rex_r = false;
@@ -3007,7 +3006,20 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
 
     // dispatch_vmexit (vmm/microvm_bridge.zig handles Blk/Telemetry;
     // virtio_net.zig handles TX packets from the guest and routes to netd).
-    const should_resume = dispatchVmexit(regs);
+    var should_resume = dispatchVmexit(regs);
+    if (should_resume) {
+        should_resume = if (active_vmid) |id|
+            microvm_registry.isRunning(id)
+        else
+            false;
+    }
+    if (!should_resume) {
+        if (active_vmid) |id| {
+            if (!microvm_registry.completeStop(id)) {
+                _ = microvm_registry.fail(id);
+            }
+        }
+    }
 
     drainMicrovmIngress();
 

@@ -229,7 +229,7 @@ pub fn handleRead(vmid: u32, offset: u64) u32 {
         return 0;
     }
 
-    const reg: VirtioReg = @enumFromInt(reg_int);
+    const reg: VirtioReg = @fromBackingInt(@intCast(reg_int));
 
     return switch (reg) {
         .MagicValue => VIRTIO_MAGIC,
@@ -248,7 +248,7 @@ pub fn handleRead(vmid: u32, offset: u64) u32 {
 /// Handle a write to the Virtio MMIO range
 pub fn handleWrite(vmid: u32, offset: u64, value: u32) void {
     const inst = getInstance(vmid) orelse return;
-    const reg: VirtioReg = @enumFromInt(@as(u16, @intCast(offset & 0xFFF)));
+    const reg: VirtioReg = @fromBackingInt(@intCast(@as(u16, @intCast(offset & 0xFFF))));
 
     switch (reg) {
         .DeviceFeaturesSel => inst.device_features_sel = value,
@@ -306,6 +306,7 @@ pub fn handleWrite(vmid: u32, offset: u64, value: u32) void {
 
 fn processQueueEx(inst: *DeviceInstance, qidx: u8) void {
     if (qidx != 1) return;
+    if (!microvm_registry.isRunning(inst.vmid)) return;
     const q = &inst.queues[qidx];
     const event_idx = inst.hasEventIdx();
     if (!validateQueueMemory(inst.vmid, q, event_idx)) return;
@@ -384,7 +385,10 @@ fn dispatchTxChain(inst: *DeviceInstance, q: *const QueueState, head_idx: u16, t
 
     const msg_phys = dipc.allocPageMessage(
         hhdm_offset,
-        .{ .node = dipc.Ipv6Addr.loopback(), .endpoint = 0x1000 + @as(u64, inst.vmid) },
+        .{
+            .node = dipc.Ipv6Addr.loopback(),
+            .endpoint = identity.MICROVM_GUEST_TX_ENDPOINT_BASE + @as(u64, inst.vmid),
+        },
         .{ .node = dipc.Ipv6Addr.loopback(), .endpoint = @backingInt(identity.ReservedEndpoint.netd) },
         stage[0..total_len],
     ) catch return;
@@ -433,6 +437,7 @@ fn markUsed(inst: *DeviceInstance, qidx: u8, head_idx: u16, len: u32) void {
 
 pub fn injectPacket(vmid: u32, data: []const u8) void {
     if (data.len == 0 or data.len > dipc.MAX_PAYLOAD) return;
+    if (!microvm_registry.isRunning(vmid)) return;
     const inst = getInstance(vmid) orelse return;
     const q = &inst.queues[0];
     const event_idx = inst.hasEventIdx();
@@ -527,6 +532,12 @@ test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppressio
     pmm.init(&memmap, hhdm);
     for (1..6) |p| pmm.setBit(p);
 
+    microvm_registry.init();
+    const vm_name: [32]u8 = @splat(0);
+    const vm_container: [32]u8 = @splat(0);
+    const vmid = microvm_registry.create(vm_name, vm_container, 1, 1, 0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(microvm_registry.start(vmid));
+
     init();
     gpa_to_hpa_fn = netTestTranslateDiscontiguous;
     hhdm_offset = hhdm;
@@ -539,7 +550,6 @@ test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppressio
         system_endpoint_table = null;
     }
 
-    const vmid: u32 = 2;
     const inst = getInstance(vmid).?;
 
     // 1. Test RX multi-descriptor chain across discontiguous pages with VIRTQ_AVAIL_F_NO_INTERRUPT
@@ -570,7 +580,7 @@ test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppressio
     _ = writeGuestInt(u16, vmid, rx_q.driver_addr + 4, 0);
 
     // Notify Queue 0 (RX) must NOT prematurely consume the empty RX buffer!
-    handleWrite(vmid, @intFromEnum(VirtioReg.QueueNotify), 0);
+    handleWrite(vmid, @backingInt(VirtioReg.QueueNotify), 0);
     try std.testing.expectEqual(@as(u16, 0), rx_q.last_avail_idx);
 
     const pkt = "hello-catenary";
@@ -611,7 +621,7 @@ test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppressio
     const probe_before = pmm.allocPage().?;
     pmm.freePage(probe_before);
 
-    handleWrite(vmid, @intFromEnum(VirtioReg.QueueNotify), 1);
+    handleWrite(vmid, @backingInt(VirtioReg.QueueNotify), 1);
 
     // Verify TX DIPC message page was reclaimed after route failure (no netd registered)
     const probe_after = pmm.allocPage().?;
@@ -620,4 +630,15 @@ test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppressio
 
     try std.testing.expectEqual(@as(u16, 1), readGuestInt(u16, vmid, tx_q.device_addr + 2).?);
     try std.testing.expectEqual(@as(u32, 1), inst.interrupt_status);
+
+    try std.testing.expect(microvm_registry.stop(vmid));
+    _ = writeGuestInt(u16, vmid, rx_q.driver_addr + 2, 2);
+    injectPacket(vmid, pkt);
+    try std.testing.expectEqual(@as(u16, 1), rx_q.last_avail_idx);
+
+    _ = writeGuestInt(u16, vmid, tx_q.driver_addr + 2, 2);
+    handleWrite(vmid, @backingInt(VirtioReg.QueueNotify), 1);
+    try std.testing.expectEqual(@as(u16, 1), tx_q.last_avail_idx);
+    try std.testing.expect(microvm_registry.completeStop(vmid));
+    try std.testing.expect(microvm_registry.delete(vmid));
 }

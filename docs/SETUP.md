@@ -28,6 +28,9 @@ SMOKE_PROFILE=vmx-linux ./test_qemu.sh
 # Services-owned VMX/Linux smoke test
 SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh
 
+# Verify storage fails closed when no NVMe device is present
+SMOKE_PROFILE=no-nvme ./test_qemu.sh
+
 # Rebuild the embedded guest initramfs after guest handoff/rootfs changes
 ./dev/rebuild_guest_initramfs.sh
 ```
@@ -71,7 +74,7 @@ SMOKE_PROFILE=vmx-linux-services \
 
 Useful smoke-test environment knobs:
 
-- `SMOKE_PROFILE=default|vmx-linux|vmx-linux-services`
+- `SMOKE_PROFILE=default|vmx-linux|vmx-linux-services|ui-phase8|phase9|no-nvme`
 - `TIMEOUT_SECS=...` to raise or lower the smoke timeout
 - `REQUIRE_KVM=0` to allow best-effort TCG execution when `/dev/kvm` is unavailable
 
@@ -99,5 +102,6 @@ That rootfs currently provides `/sbin/init`, `/bin/sh`, `/usr/bin/env`, and `/et
 
 - `SMOKE_PROFILE=vmx-linux` validates the direct Linux guest boot path.
 - `SMOKE_PROFILE=vmx-linux-services` validates the services-owned launch path through `clusterd` and `kernel_control`.
+- `SMOKE_PROFILE=no-nvme` checks that storage reports missing hardware and that a block write is not reported as successful.
 - Smoke runs generate `catenary.iso`, `qemu_serial.log`, `qemu.pid`, and `test_disk.img` in the repo root.
 - If VMX bring-up fails early, inspect `qemu_serial.log` first; it is the primary source of truth for boot and guest milestones.

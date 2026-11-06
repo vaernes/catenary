@@ -23,6 +23,8 @@ pub const ReqType = enum(u32) {
     write = 1,
     /// Flush the write cache / ensure durability.
     flush = 4,
+    /// Write sectors and do not complete until the write is flushed.
+    write_fua = 17,
 };
 
 /// Block I/O request.  The physical address of the data buffer (for reads:

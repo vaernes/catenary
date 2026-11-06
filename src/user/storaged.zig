@@ -126,6 +126,7 @@ comptime {
 
 // DIPC block request mirror of virtio_blk.RequestHeader (from kernel microvm_bridge).
 const BlkRequest = lib.BlkRequest;
+const BLK_WRITE_FUA = @backingInt(lib.BlkReqType.write_fua);
 
 // Lba size (LBA = logical block address, a 512-byte sector).
 const SECTOR_SIZE: u32 = 512;
@@ -163,6 +164,8 @@ var g_cmd_id: u16 = 0;
 
 var g_ns_lba_count: u64 = 0;
 var g_ns_lba_size: u32 = SECTOR_SIZE;
+var g_controller_identified: bool = false;
+var g_volatile_write_cache: bool = false;
 
 // ---------------------------------------------------------------------------
 // NVMe MMIO helpers (IO window at IO_WINDOW_VA)
@@ -209,7 +212,7 @@ fn submitAdmin(sqe: NvmeSqe) u16 {
     const sq: [*]NvmeSqe = lib.ptrFrom([*]NvmeSqe, ADM_SQ_VA);
     sq[@as(usize, g_adm_sq_tail % ADM_Q_DEPTH)] = sqe;
     g_adm_sq_tail +%= 1;
-    adminSqDoorbell(g_adm_sq_tail);
+    adminSqDoorbell(@as(u32, g_adm_sq_tail % ADM_Q_DEPTH));
 
     // Poll CQ until we see a completion with the correct phase bit.
     const cq: [*]volatile NvmeCqe = lib.ptrFrom([*]volatile NvmeCqe, ADM_CQ_VA);
@@ -221,7 +224,7 @@ fn submitAdmin(sqe: NvmeSqe) u16 {
             const status = (entry.status >> 1) & 0x7FFF;
             g_adm_cq_head +%= 1;
             if (g_adm_cq_head % ADM_Q_DEPTH == 0) g_adm_cq_phase ^= 1;
-            adminCqDoorbell(g_adm_cq_head);
+            adminCqDoorbell(@as(u32, g_adm_cq_head % ADM_Q_DEPTH));
             return @truncate(status);
         }
         spinPauseWithYield(@as(u32, @truncate(timeout)));
@@ -233,7 +236,7 @@ fn submitIO(sqe: NvmeSqe) u16 {
     const sq: [*]NvmeSqe = lib.ptrFrom([*]NvmeSqe, IO_SQ_VA);
     sq[@as(usize, g_io_sq_tail % IO_Q_DEPTH)] = sqe;
     g_io_sq_tail +%= 1;
-    ioSqDoorbell(g_io_sq_tail);
+    ioSqDoorbell(@as(u32, g_io_sq_tail % IO_Q_DEPTH));
 
     const cq: [*]volatile NvmeCqe = lib.ptrFrom([*]volatile NvmeCqe, IO_CQ_VA);
     var timeout: u32 = 100_000;
@@ -244,7 +247,7 @@ fn submitIO(sqe: NvmeSqe) u16 {
             const status = (entry.status >> 1) & 0x7FFF;
             g_io_cq_head +%= 1;
             if (g_io_cq_head % IO_Q_DEPTH == 0) g_io_cq_phase ^= 1;
-            ioCqDoorbell(g_io_cq_head);
+            ioCqDoorbell(@as(u32, g_io_cq_head % IO_Q_DEPTH));
             return @truncate(status);
         }
         spinPauseWithYield(timeout);
@@ -370,6 +373,31 @@ fn cmdCreateIOSQ() u16 {
 
 const NVM_READ: u8 = 0x02;
 const NVM_WRITE: u8 = 0x01;
+const NVM_FLUSH: u8 = 0x00;
+
+fn doFlush() u16 {
+    if (!g_controller_identified) return 0xFFFF;
+    if (!g_volatile_write_cache) return 0;
+    const cid = nextCmdId();
+    return submitIO(NvmeSqe{
+        .cdw0 = makeCdw0(NVM_FLUSH, cid),
+        .nsid = 1,
+        .cdw2 = 0,
+        .cdw3 = 0,
+        .mptr_lo = 0,
+        .mptr_hi = 0,
+        .prp1_lo = 0,
+        .prp1_hi = 0,
+        .prp2_lo = 0,
+        .prp2_hi = 0,
+        .cdw10 = 0,
+        .cdw11 = 0,
+        .cdw12 = 0,
+        .cdw13 = 0,
+        .cdw14 = 0,
+        .cdw15 = 0,
+    });
+}
 
 fn doRead(slba: u64, nlb: u32, prp1: u64) u16 {
     const cid = nextCmdId();
@@ -488,7 +516,7 @@ pub export fn umain() noreturn {
     }
 
     if (!found) {
-        lib.serialWrite("storaged: no NVMe found; entering virtual-storage mode\n");
+        lib.serialWrite("storaged: no NVMe found; block requests will fail\n");
         // Allocate a DIPC scratch page for sending responses.
         const scratch_phys = lib.syscall(SYS_ALLOC_DMA, 1, 5, g_token);
         if (scratch_phys == 0) {
@@ -496,10 +524,7 @@ pub export fn umain() noreturn {
             while (true) asm volatile ("pause");
         }
         g_dipc_scratch_phys = scratch_phys;
-        // Handle synthetic block-write requests (vmid=0) from containerd
-        // even without physical NVMe — this allows the containerd smoke-test
-        // milestone to fire correctly in cluster or diskless configurations.
-        lib.serialWrite("storaged: entering virtual event loop\n");
+        lib.serialWrite("storaged: entering unavailable-device event loop\n");
         while (true) {
             const page_phys = lib.syscall(SYS_RECV, 0, 0, g_token);
             if (page_phys == 0) {
@@ -512,15 +537,14 @@ pub export fn umain() noreturn {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, g_token);
                 continue;
             }
-            const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
-            const req_type = request.req_type;
-            const vmid2 = request.vmid;
-            const chain_head2 = request.chain_head;
-            const io_status2: u8 = 0; // always succeed for virtual storage
-            if (req_type == 1 and vmid2 == 0 and io_status2 == 0) {
-                lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
-            }
             const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+            var vmid2: u32 = 0;
+            var chain_head2: u16 = 0;
+            if (incoming_hdr.payload_len == @sizeOf(BlkRequest)) {
+                const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+                vmid2 = request.vmid;
+                chain_head2 = request.chain_head;
+            }
             const reply_dst = incoming_hdr.src;
             const local_node2 = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
             const scratch2: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
@@ -540,7 +564,7 @@ pub export fn umain() noreturn {
                 .payload_len = @as(u32, @intCast(@sizeOf(lib.VirtioBlkResponsePayload))),
             };
             const resp2: *align(1) lib.VirtioBlkResponsePayload = @ptrFromInt(@intFromPtr(scratch2) + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
-            resp2.* = .{ .vmid = vmid2, .head_idx = chain_head2, .status = io_status2 };
+            resp2.* = .{ .vmid = vmid2, .head_idx = chain_head2, .status = 1 };
             _ = lib.syscall(SYS_SEND_PAGE, g_dipc_scratch_phys, 0, g_token);
             _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
         }
@@ -617,7 +641,14 @@ pub export fn umain() noreturn {
     if (sts_ctrl != 0) {
         lib.serialWrite("storaged: Identify Controller failed\n");
     } else {
+        const identify: [*]const u8 = lib.ptrFrom([*]const u8, DATA_BUF_VA);
+        g_controller_identified = true;
+        g_volatile_write_cache = identify[525] & 1 != 0;
         lib.serialWrite("storaged: Identify Controller OK\n");
+        lib.serialWrite(if (g_volatile_write_cache)
+            "storaged: NVMe volatile write cache present\n"
+        else
+            "storaged: NVMe reports no volatile write cache\n");
     }
 
     // ----- Identify Namespace 1 -----
@@ -645,25 +676,6 @@ pub export fn umain() noreturn {
         while (true) asm volatile ("pause");
     }
     lib.serialWrite("storaged: IO queues ready\n");
-
-    // Drain any DIPC messages that arrived while NVMe was initializing.
-    // containerd's synthetic vmid=0 block-write is the primary case.
-    {
-        var drain_phys = lib.syscall(lib.SYS_TRY_RECV, 0, 0, g_token);
-        while (drain_phys != 0) {
-            const drain_va = lib.syscall(SYS_MAP_RECV, drain_phys, 0, g_token);
-            if (drain_va != 0) {
-                const req: *align(1) const BlkRequest = @ptrFromInt(drain_va + lib.DIPC_HEADER_SIZE);
-                if (req.req_type == 1 and req.vmid == 0) {
-                    lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
-                }
-                _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
-            } else {
-                _ = lib.syscall(SYS_FREE_PAGE, drain_phys, 0, g_token);
-            }
-            drain_phys = lib.syscall(lib.SYS_TRY_RECV, 0, 0, g_token);
-        }
-    }
 
     // Spawn background I/O watchdog thread using DMA slot 7 as its stack.
     const wd_stack_phys = lib.syscall(SYS_ALLOC_DMA, 1, 7, g_token);
@@ -701,45 +713,67 @@ pub export fn umain() noreturn {
 
         lib.serialWrite("storaged: received block IO request\n");
 
-        const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
-        const req_type = request.req_type;
-        const sector = request.sector;
-        const vmid = request.vmid;
-        const chain_head = request.chain_head;
-        const data_len = request.data_len;
-        const data_hpa = request.data_hpa;
-
-        var io_status: u8 = 1; // 1 = error by default
-        const nlb: u32 = if (data_len >= 512) @as(u32, data_len) / 512 else 1;
-
-        if (req_type == 0) { // VIRTIO_BLK_T_IN — read
-            if (sector < g_ns_lba_count) {
-                const sts = doRead(sector, nlb, data_hpa);
-                if (sts == 0) io_status = 0;
-            }
-        } else if (req_type == 1) { // VIRTIO_BLK_T_OUT — write
-            // containerd's host-local image unpack path is a synthetic smoke
-            // request (vmid=0), not a guest virtio-blk completion. Acknowledge
-            // it immediately so the smoke path is decoupled from physical NVMe
-            // write latency, while keeping real guest writes on the hardware path.
-            if (vmid == 0) {
-                io_status = 0;
-            } else if (sector < g_ns_lba_count) {
-                const sts = doWrite(sector, nlb, data_hpa);
-                if (sts == 0) io_status = 0;
-            }
-        } else if (req_type == 4) { // VIRTIO_BLK_T_FLUSH — no-op for now
-            io_status = 0;
+        const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+        var req_type: u32 = std.math.maxInt(u32);
+        var sector: u64 = 0;
+        var vmid: u32 = 0;
+        var chain_head: u16 = 0;
+        var data_len: u16 = 0;
+        var data_hpa: u64 = 0;
+        const request_valid = incoming_hdr.magic == lib.WireMagic and
+            incoming_hdr.version == lib.WireVersion and
+            incoming_hdr.payload_len == @sizeOf(BlkRequest);
+        if (request_valid) {
+            const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+            req_type = request.req_type;
+            sector = request.sector;
+            vmid = request.vmid;
+            chain_head = request.chain_head;
+            data_len = request.data_len;
+            data_hpa = request.data_hpa;
         }
 
-        // --- NEW: containerd block-write success marker for Phase 6 smoke test ---
-        // containerd sends block writes with vmid=0 during image "unpacking" simulation.
-        if (req_type == 1 and vmid == 0 and io_status == 0) {
-            lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
+        var io_status: u8 = 1;
+        if (request_valid) {
+            if (req_type == 4) {
+                if (data_len == 0 and data_hpa == 0 and doFlush() == 0) io_status = 0;
+            } else if ((req_type == 0 or req_type == 1 or req_type == BLK_WRITE_FUA) and data_len > 0 and
+                @as(u64, data_len) % SECTOR_SIZE == 0 and @as(u64, data_len) <= PAGE_SIZE and data_hpa != 0 and
+                @as(u64, data_len) <= PAGE_SIZE - (data_hpa & (PAGE_SIZE - 1)))
+            {
+                const nlb = @as(u32, data_len) / SECTOR_SIZE;
+                if (sector < g_ns_lba_count and nlb <= g_ns_lba_count - sector) {
+                    if (req_type == 0) {
+                        const read_status = doRead(sector, nlb, data_hpa);
+                        if (read_status == 0) {
+                            io_status = 0;
+                        } else {
+                            lib.serialWrite("storaged: NVMe read completion status=");
+                            printHex(read_status);
+                            lib.serialWrite("\n");
+                        }
+                    } else if (doWrite(sector, nlb, data_hpa) == 0) {
+                        if (req_type != BLK_WRITE_FUA or doFlush() == 0) {
+                            io_status = 0;
+                            if (req_type == BLK_WRITE_FUA) lib.serialWrite("storaged: FUA write+flush completed\n");
+                        }
+                    }
+                }
+            }
+        }
+        if (io_status != 0) {
+            lib.serialWrite("storaged: block request failed type=");
+            printHex(req_type);
+            lib.serialWrite(" sector=");
+            printHex(sector);
+            lib.serialWrite(" bytes=");
+            printHex(data_len);
+            lib.serialWrite(" buffer=");
+            printHex(data_hpa);
+            lib.serialWrite("\n");
         }
 
         const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
-        const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
         const reply_dst = incoming_hdr.src;
         const local_node = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
 

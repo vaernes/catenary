@@ -78,7 +78,7 @@ pub fn emitMilestone(cmd_name: []const u8) void {
     if (prefix.len + cmd_name.len + suffix.len > buf.len) return;
     @memcpy(buf[0..prefix.len], prefix);
     @memcpy(buf[prefix.len..][0..cmd_name.len], cmd_name);
-    @memcpy(buf[prefix.len + cmd_name.len..][0..suffix.len], suffix);
+    @memcpy(buf[prefix.len + cmd_name.len ..][0..suffix.len], suffix);
     const total_len = prefix.len + cmd_name.len + suffix.len;
 
     if (builtin.is_test) {
@@ -336,7 +336,11 @@ fn cmdVmCreate(args: []const u8) void {
             var p2: usize = 0;
             while (p2 < rest1.len and rest1[p2] != ' ') : (p2 += 1) {}
             if (parseU32(rest1[0..p2])) |v| {
-                if (v >= 1 and v <= 8) vcpus = v;
+                if (v != 1) {
+                    write("\r\nError: this VMM currently supports one vCPU per MicroVM.\r\n");
+                    return;
+                }
+                vcpus = v;
             }
             const rest2 = trimSpaces(rest1[p2..]);
             if (rest2.len > 0) {
@@ -385,7 +389,7 @@ fn cmdVmAction(args: []const u8, action: enum { start, stop, delete }, cmd_name:
         writeDec(id);
         switch (action) {
             .start => write(" started.\r\n"),
-            .stop => write(" stopped.\r\n"),
+            .stop => write(" stop requested.\r\n"),
             .delete => write(" deleted.\r\n"),
         }
     } else {

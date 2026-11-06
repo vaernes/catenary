@@ -17,6 +17,8 @@ pub const MicrovmState = enum(u8) {
     running = 2,
     stopped = 3,
     deleted = 4,
+    stopping = 5,
+    failed = 6,
 };
 
 // ---------------------------------------------------------------------------
@@ -331,6 +333,8 @@ pub fn create(name: [32]u8, container: [32]u8, mem_pages: u32, vcpus: u32, kerne
 
 /// Allocate a new MicroVM slot with explicit core affinity.
 pub fn createWithAffinity(name: [32]u8, container: [32]u8, mem_pages: u32, vcpus: u32, kernel_phys: u64, kernel_size: u64, initramfs_phys: u64, initramfs_size: u64, pinned_cpu: ?u8) ?u32 {
+    if (vcpus != 1) return null;
+
     ensureInit();
     const flags = acquireLock();
     defer releaseLock(flags);
@@ -379,15 +383,56 @@ pub fn start(instance_id: u32) bool {
     return true;
 }
 
-/// Transition a running instance to stopped.
+fn requestStopState(state: *MicrovmState) bool {
+    if (state.* != .running) return false;
+    state.* = .stopping;
+    return true;
+}
+
+/// Request that a running instance stop at a VM-exit state check.
 pub fn stop(instance_id: u32) bool {
     ensureInit();
     const flags = acquireLock();
     defer releaseLock(flags);
     const slot = findMutableInternal(instance_id) orelse return false;
-    if (slot.state != .running) return false;
-    slot.state = .stopped;
+    return requestStopState(&slot.state);
+}
+
+fn completeStopState(state: *MicrovmState) bool {
+    if (state.* != .stopping) return false;
+    state.* = .stopped;
     return true;
+}
+
+/// Complete a stop request after the VMX exit path has left guest execution.
+pub fn completeStop(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    return completeStopState(&slot.state);
+}
+
+pub fn fail(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    if (slot.state != .created and slot.state != .running and slot.state != .stopping) return false;
+    slot.state = .failed;
+    return true;
+}
+
+fn canDeleteState(state: MicrovmState) bool {
+    return state != .running and state != .stopping;
+}
+
+fn canDeleteInstance(instance: *const Instance) bool {
+    return canDeleteState(instance.state) and
+        instance.vmcs_phys == null and
+        instance.ept_pml4_phys == null and
+        instance.pool_phys == null and
+        instance.pool_used == 0;
 }
 
 /// Release a stopped (or created) instance slot.
@@ -396,7 +441,7 @@ pub fn delete(instance_id: u32) bool {
     const flags = acquireLock();
     defer releaseLock(flags);
     const slot = findMutableInternal(instance_id) orelse return false;
-    if (slot.state == .running) return false;
+    if (!canDeleteInstance(slot)) return false;
     slot.reset();
     return true;
 }
@@ -414,9 +459,69 @@ pub fn lookup(instance_id: u32) ?*const Instance {
     return findMutableInternal(instance_id);
 }
 
+pub fn isRunning(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    return slot.state == .running;
+}
+
 pub fn capacity() usize {
     ensureInit();
     return instances.len;
+}
+
+test "stop request waits for VMX exit before deletion" {
+    var state: MicrovmState = .running;
+    try std.testing.expect(requestStopState(&state));
+    try std.testing.expectEqual(MicrovmState.stopping, state);
+    try std.testing.expect(!canDeleteState(state));
+    try std.testing.expect(!requestStopState(&state));
+    try std.testing.expect(completeStopState(&state));
+    try std.testing.expectEqual(MicrovmState.stopped, state);
+    try std.testing.expect(canDeleteState(state));
+    state = .running;
+    try std.testing.expect(requestStopState(&state));
+    state = .failed;
+    try std.testing.expect(canDeleteState(state));
+}
+
+test "registry refuses deletion while VM-owned pages or VMCS remain" {
+    init();
+    const name: [32]u8 = @splat(0);
+    const container: [32]u8 = @splat(0);
+    const id = create(name, container, 1, 1, 0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    const instance = findMutable(id) orelse return error.TestUnexpectedResult;
+
+    instance.state = .stopped;
+    instance.ept_pml4_phys = 0x1000;
+    try std.testing.expect(!delete(id));
+    try std.testing.expect(lookup(id) != null);
+
+    instance.ept_pml4_phys = null;
+    instance.vmcs_phys = 0x2000;
+    try std.testing.expect(!delete(id));
+
+    instance.vmcs_phys = null;
+    instance.pool_used = 1;
+    try std.testing.expect(!delete(id));
+
+    instance.pool_used = 0;
+    try std.testing.expect(delete(id));
+    try std.testing.expect(lookup(id) == null);
+}
+
+test "registry rejects unsupported multi-vCPU requests without consuming an ID" {
+    init();
+    const name: [32]u8 = @splat(0);
+    const container: [32]u8 = @splat(0);
+    try std.testing.expect(create(name, container, 1, 2, 0, 0, 0, 0) == null);
+
+    const id = create(name, container, 1, 1, 0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), id);
+    try std.testing.expectEqual(@as(u32, 1), lookup(id).?.vcpus);
+    try std.testing.expect(delete(id));
 }
 
 // ---------------------------------------------------------------------------

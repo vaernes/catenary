@@ -1,10 +1,14 @@
 # Virtual Guest Networking Plan
 
-**Status: proposed, not implemented.** This is an independently authored Catenary design, not copied or adapted platform code. Published specifications and well-understood protocols may be used, with reviewed cryptography. The primary execution path is direct Type-1 virtualization; an optional support VM is not a network, bootstrap, or recovery dependency.
+**Status: partial implementation; acceptance gates not passed.** The policy core and a fail-closed local guest-frame path exist, but this is not a complete virtual network. This is an independently authored Catenary design, not copied or adapted platform code. Published specifications and well-understood protocols may be used, with reviewed cryptography. The primary execution path is direct Type-1 virtualization; an optional support VM is not a network, bootstrap, or recovery dependency.
 
 ## Baseline and boundary
 
 [virtio-net](../src/vmm/virtio_net.zig) contains guest queue handling and a DIPC handoff to `netd`; the [MicroVM bridge](../src/vmm/microvm_bridge.zig), [router](../src/ipc/router.zig), and [netd](../src/user/netd.zig) provide other existing transport pieces. They do **not** establish a secure guest vSwitch, microsegmentation policy, host-assigned guest identity, or encrypted multi-node overlay. [DIPC](../src/ipc/dipc.zig) currently uses a shared cluster HMAC, with the [known no-replay gap](PHASE_7_ROADMAP.md); neither that key nor guest-supplied MAC/IP addresses is identity.
+
+The current partial path additionally uses [virtual_switch.zig](../src/user/protocols/virtual_switch.zig) for bounded IPv4/IPv6 TCP/UDP classification, host-provided MAC/IP bindings, per-port ingress/egress rules, attachment generations, and policy revisions. Guest TX is identified by its kernel-generated MicroVM endpoint, never parsed as a `netd` command, and cannot fall through to raw NIC transmit. Local `configd` may request attach/detach and revision-checked policy updates. Only `netd` may request the kernel to queue a policy-approved frame for a currently running VM. Since no guest ports are configured at startup, the implemented data path is default-deny. This path has unit/build coverage but no multi-guest integration evidence.
+
+Not implemented in this partial path: an operator-facing configuration producer, address/bootstrap protocols (ARP, NDP, DHCP, DNS), flow state, remote overlays, authorized uplinks, comprehensive fragment/extension-header handling, counters, and complete detach/stop/restart cleanup. Do not treat the current TCP/UDP policy parser or the path wiring as satisfying the acceptance matrix below.
 
 Keep device access and packet switching, policy, overlay, and address management in Ring 3, using capability-limited handoffs and the proposed [buffer ownership contract](DIPC_OWNERSHIP.md#guest-data-plane-buffers-and-grants--proposed-not-implemented). Ring 0 supplies physical isolation, local IPC, scheduling, and virtualization primitives. DIPC control messages and guest Ethernet frames are distinct planes and must not be interpreted interchangeably.
 

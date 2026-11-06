@@ -23,7 +23,7 @@ A **catenary** is the curve a cable forms under its own weight. **Catenary OS** 
 
 Catenary avoids a monolithic kernel and in-kernel POSIX compatibility. Linux MicroVMs are the intended environment for OCI workloads; full Linux distribution and Windows VMs, secure guest networking, clustered storage, and a common cluster UI are planned. The project is not yet a production platform or a claim of full OCI or guest-OS compatibility.
 
-**Current limits:** the repository contains experimental Linux direct-boot, VMX/EPT, virtio, DIPC, NVMe, cluster-discovery, and native TUI paths. General UEFI-based full VMs, Windows support, VM microsegmentation, replay-protected encrypted cluster transport, and quorum-backed storage are not established end to end. Synthetic storage can report success without persistence, and the current guest flush is a no-op. See the [architecture overview](docs/architecture.md) and [test evidence](TEST_READY.md).
+**Current limits:** the repository contains experimental Linux direct-boot, VMX/EPT, virtio, DIPC, NVMe, cluster-discovery, and native TUI paths. General UEFI-based full VMs, Windows support, complete VM microsegmentation, replay-protected encrypted cluster transport, and quorum-backed storage are not established end to end. Storage now fails without NVMe and sends NVMe Flush when a volatile cache is reported; FUA requests use a write-then-flush fallback. QEMU smoke results do not prove physical power-loss durability or native NVMe FUA behavior. See the [architecture overview](docs/architecture.md) and [test evidence](TEST_READY.md).
 
 ---
 
@@ -129,6 +129,9 @@ SMOKE_PROFILE=vmx-linux ./test_qemu.sh
 
 # Integrated services-owned Linux MicroVM validation
 SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh
+
+# Verify storage fails closed when NVMe is absent
+SMOKE_PROFILE=no-nvme ./test_qemu.sh
 
 # Automated Phase 8 UI, MicroVM form provisioning, and Varde shell verification
 SMOKE_PROFILE=ui-phase8 ./test_qemu.sh

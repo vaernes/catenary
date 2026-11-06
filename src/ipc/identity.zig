@@ -1,3 +1,4 @@
+const std = @import("std");
 const dipc = @import("dipc.zig");
 
 pub const NodeAddr = dipc.Ipv6Addr;
@@ -56,3 +57,19 @@ pub const ReservedEndpoint = enum(EndpointId) {
 };
 
 pub const FIRST_DYNAMIC_ENDPOINT: EndpointId = 0x100;
+
+/// Kernel-originated MicroVM virtio-net TX pages use this base plus the VM ID.
+pub const MICROVM_GUEST_TX_ENDPOINT_BASE: EndpointId = 0x1000;
+
+pub fn microvmIdFromGuestTxEndpoint(endpoint: EndpointId) ?MicrovmId {
+    if (endpoint < MICROVM_GUEST_TX_ENDPOINT_BASE) return null;
+    const microvm_id = endpoint - MICROVM_GUEST_TX_ENDPOINT_BASE;
+    if (microvm_id == 0 or microvm_id > std.math.maxInt(MicrovmId)) return null;
+    return @intCast(microvm_id);
+}
+
+test "guest TX endpoint maps only valid MicroVM IDs" {
+    try std.testing.expectEqual(@as(?MicrovmId, 7), microvmIdFromGuestTxEndpoint(MICROVM_GUEST_TX_ENDPOINT_BASE + 7));
+    try std.testing.expectEqual(@as(?MicrovmId, null), microvmIdFromGuestTxEndpoint(MICROVM_GUEST_TX_ENDPOINT_BASE));
+    try std.testing.expectEqual(@as(?MicrovmId, null), microvmIdFromGuestTxEndpoint(MICROVM_GUEST_TX_ENDPOINT_BASE + std.math.maxInt(MicrovmId) + 1));
+}

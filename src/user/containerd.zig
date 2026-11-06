@@ -1,5 +1,6 @@
 const std = @import("std");
 const lib = @import("lib.zig");
+const partition_metadata = @import("protocols/partition_metadata.zig");
 
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
@@ -32,23 +33,14 @@ fn printHex(n: u64) void {
 // Persistent MicroVM disk partitions on NVMe (via storaged)
 // ---------------------------------------------------------------------------
 
-/// Requester id used for real (non-synthetic) block I/O. storaged only
-/// acknowledges vmid=0 writes without touching the disk, so partition I/O
-/// uses a distinct non-zero id and is routed to the NVMe namespace.
+/// Host-local block requests use a nonzero ID so responses can be correlated.
 const PART_VMID: u32 = 0xC0DE_0001;
-const PART_BASE_LBA: u64 = 8192;
-const PART_SECTORS: u64 = 2048; // 1 MiB per partition
-const MAX_PARTS: usize = 16;
-const PART_MAGIC: u64 = 0x5452_4150_524E_524E; // "NRNRPART"
+const PART_SECTORS = partition_metadata.PART_SECTORS;
+const MAX_PARTS = partition_metadata.MAX_PARTS;
+const PART_MAGIC = partition_metadata.PART_MAGIC;
+const BLK_WRITE_FUA: u32 = @backingInt(lib.BlkReqType.write_fua);
 
-const PartitionHeader = extern struct {
-    magic: u64,
-    slot: u32,
-    _pad: u32 = 0,
-    start_lba: u64,
-    sectors: u64,
-    name: [32]u8,
-};
+const PartitionHeader = partition_metadata.Header;
 
 var part_used: [MAX_PARTS]bool = @splat(false);
 
@@ -64,10 +56,16 @@ fn allocPartition() ?u32 {
 }
 
 fn partitionStart(slot: u32) u64 {
-    return PART_BASE_LBA + @as(u64, slot) * PART_SECTORS;
+    return partition_metadata.startLba(slot);
 }
 
-const PartState = enum { idle, writing, verifying, done };
+const PartState = enum { scanning, priming, priming_flushing, idle, writing, flushing, verifying, done };
+const BlkRetry = struct {
+    req_type: u32,
+    sector: u64,
+    data_phys: u64,
+    data_len: u16,
+};
 
 fn sendBlkRequest(
     dipc_phys: u64,
@@ -78,6 +76,8 @@ fn sendBlkRequest(
     req_type: u32,
     sector: u64,
     data_phys: u64,
+    data_len: u16,
+    request_id: u16,
 ) bool {
     const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA + 1 * 4096);
     const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
@@ -96,18 +96,45 @@ fn sendBlkRequest(
         ._reserved = 0,
         .sector = sector,
         .vmid = PART_VMID,
-        .chain_head = 0,
-        .data_len = 512,
+        .chain_head = request_id,
+        .data_len = data_len,
         .data_hpa = data_phys,
     };
     return lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token) == 0;
 }
 
-fn tryQueueWriteRequest(dipc_phys: u64, token: u64) bool {
-    return lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token) == 0;
+fn sendTrackedBlkRequest(
+    dipc_phys: u64,
+    token: u64,
+    local_node: lib.Ipv6Addr,
+    endpoint: u64,
+    storaged_ep: u64,
+    req_type: u32,
+    sector: u64,
+    data_phys: u64,
+    data_len: u16,
+    request_sequence: *u16,
+    pending_request_id: *u16,
+) bool {
+    request_sequence.* +%= 1;
+    if (request_sequence.* == 0) request_sequence.* = 1;
+    if (!sendBlkRequest(
+        dipc_phys,
+        token,
+        local_node,
+        endpoint,
+        storaged_ep,
+        req_type,
+        sector,
+        data_phys,
+        data_len,
+        request_sequence.*,
+    )) return false;
+    pending_request_id.* = request_sequence.*;
+    return true;
 }
 
-fn markWriteQueued(write_completed: *bool) void {
+fn markWriteCompleted(write_completed: *bool) void {
     if (!write_completed.*) {
         lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
         write_completed.* = true;
@@ -140,74 +167,82 @@ pub export fn umain() noreturn {
         data_va[i] = 0xAB; // Dummy layer byte
     }
 
-    // Send a block write request to storaged via DIPC
-    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA + 1 * 4096);
-
     const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA + 1 * 4096, container_endpoint) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
-    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
-    header.* = .{
-        .magic = lib.WireMagic,
-        .version = lib.WireVersion,
-        .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
-        .payload_len = @as(u32, @intCast(@sizeOf(lib.BlkRequest))),
-        .auth_tag = 0,
-        .src = .{ .node = local_node, .endpoint = container_endpoint },
-        .dst = .{ .node = local_node, .endpoint = bs.reserved_storaged_endpoint },
-    };
-
-    const request: *align(1) lib.BlkRequest = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
-    request.* = .{
-        .req_type = 1,
-        ._reserved = 0,
-        .sector = 1024,
-        .vmid = 0,
-        .chain_head = 0,
-        .data_len = 4096,
-        .data_hpa = data_phys,
-    };
-
     lib.serialWrite("containerd: sending image block to storaged...\n");
     var write_completed = false;
-    var send_ok = tryQueueWriteRequest(dipc_phys, token);
-    if (send_ok) {
-        // vmid=0 is a synthetic smoke-test write — it always succeeds on storaged's end.
-        // Emit the milestone immediately so the smoke test doesn't depend on storaged
-        // finishing NVMe IO queue init before the timeout expires.
-        markWriteQueued(&write_completed);
-    } else {
-        lib.serialWrite("containerd: initial DIPC send failed, will retry\n");
+    var request_sequence: u16 = 0;
+    var pending_request_id: u16 = 0;
+    const verify_phys = lib.syscall(SYS_ALLOC_DMA, 1, 2, token);
+    if (verify_phys == 0) {
+        lib.serialWrite("containerd: partition scan DMA allocation failed\n");
+        while (true) {
+            _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
+        }
+    }
+
+    var part_state: PartState = .scanning;
+    var part_slot: u32 = 0;
+    var scan_slot: u32 = 0;
+    if (!sendTrackedBlkRequest(
+        dipc_phys,
+        token,
+        local_node,
+        container_endpoint,
+        bs.reserved_storaged_endpoint,
+        0,
+        partitionStart(scan_slot),
+        verify_phys,
+        512,
+        &request_sequence,
+        &pending_request_id,
+    )) {
+        lib.serialWrite("containerd: initial partition scan send failed, will retry\n");
     }
     lib.serialWrite("containerd: entering event loop\n");
 
-    const verify_phys = lib.syscall(SYS_ALLOC_DMA, 1, 2, token);
-    var part_state: PartState = .idle;
-    var part_slot: u32 = 0;
-    // storaged may still be bringing up NVMe when the first partition request
-    // arrives (it drops anything queued during init), so resend on silence.
     var part_wait_ticks: u32 = 0;
     var part_retries: u32 = 0;
     const PART_RETRY_TICKS: u32 = 2000;
     const PART_MAX_RETRIES: u32 = 100;
     while (true) {
-        if (part_state == .writing or part_state == .verifying) {
+        if (part_state != .idle and part_state != .done) {
             part_wait_ticks += 1;
             if (part_wait_ticks >= PART_RETRY_TICKS) {
                 part_wait_ticks = 0;
                 part_retries += 1;
                 if (part_retries > PART_MAX_RETRIES) {
-                    lib.serialWrite("containerd: partition I/O timed out\n");
+                    lib.serialWrite("containerd: storage I/O timed out\n");
                     part_state = .done;
-                } else if (part_state == .writing) {
-                    _ = sendBlkRequest(dipc_phys, token, local_node, container_endpoint, bs.reserved_storaged_endpoint, 1, partitionStart(part_slot), data_phys);
                 } else {
-                    _ = sendBlkRequest(dipc_phys, token, local_node, container_endpoint, bs.reserved_storaged_endpoint, 0, partitionStart(part_slot), verify_phys);
+                    const retry: BlkRetry = switch (part_state) {
+                        .scanning => .{ .req_type = 0, .sector = partitionStart(scan_slot), .data_phys = verify_phys, .data_len = 512 },
+                        .priming => .{ .req_type = BLK_WRITE_FUA, .sector = 1024, .data_phys = data_phys, .data_len = 4096 },
+                        .priming_flushing => .{ .req_type = 4, .sector = 1024, .data_phys = 0, .data_len = 0 },
+                        .flushing => .{ .req_type = 4, .sector = partitionStart(part_slot), .data_phys = 0, .data_len = 0 },
+                        .writing => .{ .req_type = BLK_WRITE_FUA, .sector = partitionStart(part_slot), .data_phys = data_phys, .data_len = 512 },
+                        .verifying => .{ .req_type = 0, .sector = partitionStart(part_slot), .data_phys = verify_phys, .data_len = 512 },
+                        .idle, .done => unreachable,
+                    };
+                    _ = sendTrackedBlkRequest(
+                        dipc_phys,
+                        token,
+                        local_node,
+                        container_endpoint,
+                        bs.reserved_storaged_endpoint,
+                        retry.req_type,
+                        retry.sector,
+                        retry.data_phys,
+                        retry.data_len,
+                        &request_sequence,
+                        &pending_request_id,
+                    );
                 }
             }
         }
 
         // Once the smoke write is acknowledged, claim a persistent partition
         // for the image and write its header to NVMe.
-        if (write_completed and part_state == .idle and verify_phys != 0) {
+        if (write_completed and part_state == .idle) {
             if (allocPartition()) |slot| {
                 part_slot = slot;
                 const hdr_va: *align(1) PartitionHeader = lib.ptrFrom(*align(1) PartitionHeader, DMA_BASE_VA);
@@ -220,23 +255,26 @@ pub export fn umain() noreturn {
                     .name = @splat(0),
                 };
                 @memcpy(hdr_va.name[0..6], "rootfs");
-                if (sendBlkRequest(dipc_phys, token, local_node, container_endpoint, bs.reserved_storaged_endpoint, 1, partitionStart(slot), data_phys)) {
-                    part_state = .writing;
-                    lib.serialWrite("containerd: partition header write queued\n");
-                } else {
-                    part_used[slot] = false;
-                }
+                part_slot = slot;
+                part_state = .writing;
+                pending_request_id = 0;
+                _ = sendTrackedBlkRequest(
+                    dipc_phys,
+                    token,
+                    local_node,
+                    container_endpoint,
+                    bs.reserved_storaged_endpoint,
+                    BLK_WRITE_FUA,
+                    partitionStart(slot),
+                    data_phys,
+                    512,
+                    &request_sequence,
+                    &pending_request_id,
+                );
+                lib.serialWrite("containerd: partition header write requested\n");
             } else {
                 part_state = .done;
                 lib.serialWrite("containerd: no free partitions\n");
-            }
-        }
-
-        // Retry send if it failed initially (storaged may not have registered yet)
-        if (!send_ok and !write_completed) {
-            if (tryQueueWriteRequest(dipc_phys, token)) {
-                send_ok = true;
-                markWriteQueued(&write_completed);
             }
         }
 
@@ -247,31 +285,121 @@ pub export fn umain() noreturn {
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
                 if (control.op == .virtio_blk_response and control.payload_len >= @sizeOf(lib.VirtioBlkResponsePayload)) {
                     const response: *align(1) const lib.VirtioBlkResponsePayload = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
-                    if (response.vmid == PART_VMID) {
+                    if (response.vmid == PART_VMID and response.head_idx == pending_request_id) {
                         part_wait_ticks = 0;
+                        part_retries = 0;
+                        pending_request_id = 0;
                         if (response.status != 0) {
-                            lib.serialWrite("containerd: partition I/O FAILED\n");
+                            if (part_state == .scanning) {
+                                lib.serialWrite("containerd: partition metadata read failed at slot ");
+                                printHex(scan_slot);
+                                lib.serialWrite("\n");
+                            }
+                            lib.serialWrite("containerd: block I/O FAILED\n");
                             part_state = .done;
-                        } else if (part_state == .writing) {
-                            // Read the header back from NVMe to verify persistence.
-                            if (sendBlkRequest(dipc_phys, token, local_node, container_endpoint, bs.reserved_storaged_endpoint, 0, partitionStart(part_slot), verify_phys)) {
+                        } else switch (part_state) {
+                            .scanning => {
+                                const verify: [*]const u8 = lib.ptrFrom([*]const u8, DMA_BASE_VA + 2 * 4096);
+                                if (partition_metadata.isValidHeader(verify[0..512], scan_slot)) {
+                                    part_used[scan_slot] = true;
+                                    lib.serialWrite("containerd: recovered partition metadata\n");
+                                }
+                                scan_slot += 1;
+                                if (scan_slot < MAX_PARTS) {
+                                    _ = sendTrackedBlkRequest(
+                                        dipc_phys,
+                                        token,
+                                        local_node,
+                                        container_endpoint,
+                                        bs.reserved_storaged_endpoint,
+                                        0,
+                                        partitionStart(scan_slot),
+                                        verify_phys,
+                                        512,
+                                        &request_sequence,
+                                        &pending_request_id,
+                                    );
+                                } else {
+                                    lib.serialWrite("containerd: partition metadata scan complete\n");
+                                    part_state = .priming;
+                                    _ = sendTrackedBlkRequest(
+                                        dipc_phys,
+                                        token,
+                                        local_node,
+                                        container_endpoint,
+                                        bs.reserved_storaged_endpoint,
+                                        1,
+                                        1024,
+                                        data_phys,
+                                        4096,
+                                        &request_sequence,
+                                        &pending_request_id,
+                                    );
+                                }
+                            },
+                            .priming => {
+                                part_state = .priming_flushing;
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    4,
+                                    1024,
+                                    0,
+                                    0,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .priming_flushing => {
+                                markWriteCompleted(&write_completed);
+                                part_state = .idle;
+                            },
+                            .writing => {
+                                part_state = .flushing;
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    4,
+                                    partitionStart(part_slot),
+                                    0,
+                                    0,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .flushing => {
                                 part_state = .verifying;
-                            } else {
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    0,
+                                    partitionStart(part_slot),
+                                    verify_phys,
+                                    512,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .verifying => {
+                                const got: *align(1) const PartitionHeader = lib.ptrFrom(*align(1) const PartitionHeader, DMA_BASE_VA + 2 * 4096);
+                                if (got.magic == PART_MAGIC and got.slot == part_slot) {
+                                    lib.serialWrite("containerd: partition mounted on NVMe, header verified after flush\n");
+                                } else {
+                                    lib.serialWrite("containerd: partition verify MISMATCH\n");
+                                }
                                 part_state = .done;
-                            }
-                        } else if (part_state == .verifying) {
-                            const got: *align(1) const PartitionHeader = lib.ptrFrom(*align(1) const PartitionHeader, DMA_BASE_VA + 2 * 4096);
-                            if (got.magic == PART_MAGIC and got.slot == part_slot) {
-                                lib.serialWrite("containerd: partition mounted on NVMe, header verified\n");
-                            } else {
-                                lib.serialWrite("containerd: partition verify MISMATCH\n");
-                            }
-                            part_state = .done;
+                            },
+                            .idle, .done => {},
                         }
-                    } else if (!write_completed and response.status == 0) {
-                        markWriteQueued(&write_completed);
-                    } else if (!write_completed) {
-                        lib.serialWrite("containerd: unpack block WRITE FAILED!\n");
                     }
                 }
                 _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
@@ -279,7 +407,7 @@ pub export fn umain() noreturn {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
             }
         }
-        if (write_completed and part_state != .writing and part_state != .verifying) {
+        if (part_state == .done) {
             _ = lib.syscall(lib.SYS_RECV, 0, 0, token);
         } else {
             _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);

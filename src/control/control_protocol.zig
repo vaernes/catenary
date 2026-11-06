@@ -30,6 +30,7 @@ pub const ControlOp = enum(u16) {
     get_node_status = 20,
     get_node_addr = 21,
     get_node_identity = 22,
+    virtio_net_ingress = 23,
 };
 
 pub const ControlHeader = extern struct {
@@ -113,7 +114,8 @@ pub const StartMicrovmPayload = extern struct {
     _reserved: u32 = 0,
 };
 
-/// Request the kernel to stop a running MicroVM instance.
+/// Request the kernel to stop a running MicroVM instance at a VM-exit state check.
+/// The request is asynchronous; list_microvms reports state 5 while stopping.
 pub const StopMicrovmPayload = extern struct {
     instance_id: u32,
     _reserved: u32 = 0,
@@ -127,7 +129,7 @@ pub const DeleteMicrovmPayload = extern struct {
 
 pub const MicrovmInfo = extern struct {
     instance_id: u32,
-    state: u32, // 0=empty, 1=created, 2=running, 3=stopped
+    state: u32, // 0=empty, 1=created, 2=running, 3=stopped, 5=stopping, 6=failed
     mem_pages: u32,
     vcpus: u32,
     name: [32]u8,
@@ -253,6 +255,16 @@ pub const VirtioBlkResponsePayload = extern struct {
     status: u8,
     _pad: u8 = 0,
 };
+
+/// netd returns a policy-approved guest Ethernet frame to its owning MicroVM.
+/// The frame bytes follow this fixed header in the same DIPC payload.
+pub const VirtioNetIngressPayload = extern struct {
+    vmid: u32,
+    frame_len: u16,
+    _pad: u16 = 0,
+};
+
+pub const MAX_VIRTIO_NET_FRAME_SIZE: usize = 1514;
 
 pub const RegistrySyncPayload = extern struct {
     service_id: u32,

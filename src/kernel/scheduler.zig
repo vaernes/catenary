@@ -547,6 +547,7 @@ fn vmx_thread_bridge() void {
     const thread = get_current_thread();
     if (microvm_registry.findMutable(thread.vmid)) |inst| {
         vmx.resumeInstance(inst) catch {
+            _ = microvm_registry.fail(thread.vmid);
             arch.cpu.outb(0x3F8, 'V');
             arch.cpu.outb(0x3F8, 'F');
         };
@@ -711,6 +712,7 @@ pub fn schedule() void {
 pub export fn catenary_vmx_guest_done() callconv(.c) noreturn {
     const vmm_bridge = @import("../vmm/microvm_bridge.zig");
     vmm_bridge.broadcastTelemetryFromContext();
+    _ = microvm_registry.completeStop(get_current_thread().vmid);
     get_current_thread().state = .Waiting;
     if (comptime builtin.cpu.arch == .x86_64) {
         asm volatile ("sti");

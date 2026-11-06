@@ -6,6 +6,7 @@ const std = @import("std");
 const lib = @import("lib.zig");
 const netd_proto = @import("protocols/netd_protocol.zig");
 const tcp = @import("protocols/tcp.zig");
+const virtual_switch = @import("protocols/virtual_switch.zig");
 
 // ---------------------------------------------------------------------------
 // Low-level I/O helpers
@@ -237,6 +238,7 @@ var g_kernel_control_endpoint: u64 = 0;
 
 var g_tx_lock: bool = false;
 var g_tcp_lock: bool = false;
+var g_virtual_switch: virtual_switch.Switch = .{};
 
 fn acquireTxLock() void {
     while (@atomicRmw(bool, &g_tx_lock, .Xchg, true, .seq_cst)) {
@@ -516,6 +518,181 @@ fn sendPeerSnapshotReply(dst_node: *const [16]u8, dst_endpoint: u64) void {
     _ = sendNetdMessageTx(dst_node, dst_endpoint, .peer_snapshot_reply, std.mem.asBytes(&reply));
 }
 
+fn microvmIdFromTxEndpoint(endpoint: u64) ?u32 {
+    if (endpoint < lib.MICROVM_GUEST_TX_ENDPOINT_BASE) return null;
+    const vmid = endpoint - lib.MICROVM_GUEST_TX_ENDPOINT_BASE;
+    if (vmid == 0 or vmid > std.math.maxInt(u32)) return null;
+    return @intCast(vmid);
+}
+
+fn sendGuestFrameToMicrovm(vmid: u32, frame: []const u8) void {
+    if (frame.len < 14 or frame.len > lib.MAX_VIRTIO_NET_FRAME_SIZE) return;
+
+    var payload: [@sizeOf(lib.VirtioNetIngressPayload) + lib.MAX_VIRTIO_NET_FRAME_SIZE]u8 = undefined;
+    const header: *align(1) lib.VirtioNetIngressPayload = @ptrCast(&payload);
+    header.* = .{ .vmid = vmid, .frame_len = @intCast(frame.len) };
+    @memcpy(payload[@sizeOf(lib.VirtioNetIngressPayload)..][0..frame.len], frame);
+
+    const bs: *const BootstrapDescriptor = lib.ptrFrom(*const BootstrapDescriptor, USER_BOOTSTRAP_VADDR);
+    lib.sendControl(
+        bs,
+        g_tx_control_outbox_phys,
+        TX_CONTROL_OUTBOX_VA,
+        g_token,
+        .virtio_net_ingress,
+        payload[0 .. @sizeOf(lib.VirtioNetIngressPayload) + frame.len],
+    );
+}
+
+fn sendSwitchConfigAck(
+    page_hdr: *align(1) const lib.PageHeader,
+    request_op: netd_proto.Op,
+    status: netd_proto.SwitchConfigStatus,
+    vmid: u32,
+    generation: u64,
+    policy_revision: u64,
+) void {
+    const ack = netd_proto.SwitchConfigAckPayload{
+        .request_op = request_op,
+        .status = status,
+        .vmid = vmid,
+        .generation = generation,
+        .policy_revision = policy_revision,
+    };
+    _ = sendNetdMessageTx(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .switch_config_ack, std.mem.asBytes(&ack));
+}
+
+fn handleSwitchConfig(
+    page_hdr: *align(1) const lib.PageHeader,
+    op: netd_proto.Op,
+    payload_va: u64,
+    payload_len: usize,
+) void {
+    if (!isLocalNode(&page_hdr.src.node.bytes) or
+        page_hdr.src.endpoint != @backingInt(lib.ReservedEndpoint.configd))
+    {
+        sendSwitchConfigAck(page_hdr, op, .unauthorized, 0, 0, 0);
+        return;
+    }
+
+    switch (op) {
+        .switch_port_attach => {
+            if (payload_len != @sizeOf(netd_proto.SwitchPortAttachPayload)) {
+                sendSwitchConfigAck(page_hdr, op, .invalid, 0, 0, 0);
+                return;
+            }
+            const request: *align(1) const netd_proto.SwitchPortAttachPayload = @ptrFromInt(payload_va);
+            const generation = g_virtual_switch.attach(.{
+                .id = request.vmid,
+                .segment = request.segment,
+                .mac = request.mac,
+                .ipv4_addresses = request.ipv4_addresses,
+                .ipv4_count = request.ipv4_count,
+                .ipv6_addresses = request.ipv6_addresses,
+                .ipv6_count = request.ipv6_count,
+            });
+            sendSwitchConfigAck(
+                page_hdr,
+                op,
+                if (generation == null) .invalid else .ok,
+                request.vmid,
+                generation orelse 0,
+                if (generation == null) 0 else 1,
+            );
+        },
+        .switch_port_detach => {
+            if (payload_len != @sizeOf(netd_proto.SwitchPortDetachPayload)) {
+                sendSwitchConfigAck(page_hdr, op, .invalid, 0, 0, 0);
+                return;
+            }
+            const request: *align(1) const netd_proto.SwitchPortDetachPayload = @ptrFromInt(payload_va);
+            const detached = g_virtual_switch.detach(request.vmid, request.generation);
+            sendSwitchConfigAck(
+                page_hdr,
+                op,
+                if (detached) .ok else .stale,
+                request.vmid,
+                request.generation,
+                0,
+            );
+        },
+        .switch_policy_replace => {
+            if (payload_len != @sizeOf(netd_proto.SwitchPolicyReplacePayload)) {
+                sendSwitchConfigAck(page_hdr, op, .invalid, 0, 0, 0);
+                return;
+            }
+            const request: *align(1) const netd_proto.SwitchPolicyReplacePayload = @ptrFromInt(payload_va);
+            if (request.ingress_count > request.ingress.len or request.egress_count > request.egress.len) {
+                sendSwitchConfigAck(page_hdr, op, .invalid, request.vmid, request.generation, 0);
+                return;
+            }
+
+            var policy: virtual_switch.Policy = .{};
+            policy.ingress_count = request.ingress_count;
+            policy.egress_count = request.egress_count;
+            for (request.ingress[0..request.ingress_count], 0..) |rule, index| {
+                const ip_version: virtual_switch.IpVersion = switch (rule.ip_version) {
+                    4 => .ipv4,
+                    6 => .ipv6,
+                    else => {
+                        sendSwitchConfigAck(page_hdr, op, .invalid, request.vmid, request.generation, 0);
+                        return;
+                    },
+                };
+                policy.ingress[index] = .{
+                    .ip_version = ip_version,
+                    .protocol = rule.protocol,
+                    .destination = rule.destination,
+                    .destination_port_first = rule.destination_port_first,
+                    .destination_port_last = rule.destination_port_last,
+                };
+            }
+            for (request.egress[0..request.egress_count], 0..) |rule, index| {
+                const ip_version: virtual_switch.IpVersion = switch (rule.ip_version) {
+                    4 => .ipv4,
+                    6 => .ipv6,
+                    else => {
+                        sendSwitchConfigAck(page_hdr, op, .invalid, request.vmid, request.generation, 0);
+                        return;
+                    },
+                };
+                policy.egress[index] = .{
+                    .ip_version = ip_version,
+                    .protocol = rule.protocol,
+                    .destination = rule.destination,
+                    .destination_port_first = rule.destination_port_first,
+                    .destination_port_last = rule.destination_port_last,
+                };
+            }
+
+            const revision = g_virtual_switch.replacePolicy(
+                request.vmid,
+                request.generation,
+                request.expected_revision,
+                policy,
+            );
+            sendSwitchConfigAck(
+                page_hdr,
+                op,
+                if (revision == null) .stale else .ok,
+                request.vmid,
+                request.generation,
+                revision orelse 0,
+            );
+        },
+        else => {},
+    }
+}
+
+fn handleGuestFrame(page_hdr: *align(1) const lib.PageHeader, frame: []const u8) void {
+    const vmid = microvmIdFromTxEndpoint(page_hdr.src.endpoint) orelse return;
+    const generation = g_virtual_switch.currentGeneration(vmid) orelse return;
+    const decision = g_virtual_switch.decide(vmid, generation, frame);
+    for (decision.deliveries[0..decision.count]) |delivery| {
+        sendGuestFrameToMicrovm(delivery.port_id, frame);
+    }
+}
+
 fn lookupNeighbor(ipv6: *const [16]u8) ?[6]u8 {
     for (&g_neighbor_cache) |*e| {
         if (!e.valid) continue;
@@ -619,32 +796,22 @@ fn handleLocalNetdMessage(page_hdr: *align(1) const lib.PageHeader, recv_va: u64
     const total_payload_len = @as(usize, page_hdr.payload_len);
     const payload_ptr = recv_va + lib.DIPC_HEADER_SIZE;
 
-    if (total_payload_len < @sizeOf(netd_proto.NetdHeader)) {
-        const raw_frame: [*]const u8 = @ptrFromInt(payload_ptr);
-        txFrame(raw_frame[0..total_payload_len]);
+    if (microvmIdFromTxEndpoint(page_hdr.src.endpoint) != null) {
+        const frame: [*]const u8 = @ptrFromInt(payload_ptr);
+        handleGuestFrame(page_hdr, frame[0..total_payload_len]);
         return;
     }
 
+    if (total_payload_len < @sizeOf(netd_proto.NetdHeader)) return;
     const msg_hdr: *align(1) const netd_proto.NetdHeader = @ptrFromInt(payload_ptr);
-    if (msg_hdr.magic != netd_proto.MAGIC or msg_hdr.version != netd_proto.VERSION) {
-        const raw_frame: [*]const u8 = @ptrFromInt(payload_ptr);
-        txFrame(raw_frame[0..total_payload_len]);
-        return;
-    }
+    if (msg_hdr.magic != netd_proto.MAGIC or msg_hdr.version != netd_proto.VERSION) return;
 
     const msg_payload_len = total_payload_len - @sizeOf(netd_proto.NetdHeader);
     const msg_payload_va = payload_ptr + @sizeOf(netd_proto.NetdHeader);
 
     switch (msg_hdr.op) {
         .transmit => {
-            if (msg_payload_len < @sizeOf(netd_proto.TransmitPayload)) return;
-            const payload: *align(1) const netd_proto.TransmitPayload = @ptrFromInt(msg_payload_va);
-            const frame_len = @as(usize, payload.frame_len);
-            const frame_offset = msg_payload_va + @sizeOf(netd_proto.TransmitPayload);
-            const available = msg_payload_len - @sizeOf(netd_proto.TransmitPayload);
-            if (frame_len > available) return;
-            const frame: [*]const u8 = @ptrFromInt(frame_offset);
-            txFrame(frame[0..frame_len]);
+            // Raw NIC transmission bypasses the host-assigned vSwitch policy.
         },
         .get_node_addr => sendNodeAddrReply(&page_hdr.src.node.bytes, page_hdr.src.endpoint),
         .route_update => {
@@ -697,6 +864,10 @@ fn handleLocalNetdMessage(page_hdr: *align(1) const lib.PageHeader, recv_va: u64
             handleTcpStatus(page_hdr, msg_payload_va, msg_payload_len);
         },
         .tcp_status_reply => {},
+        .switch_port_attach, .switch_port_detach, .switch_policy_replace => {
+            handleSwitchConfig(page_hdr, msg_hdr.op, msg_payload_va, msg_payload_len);
+        },
+        .switch_config_ack => {},
     }
 }
 

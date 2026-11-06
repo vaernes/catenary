@@ -221,6 +221,8 @@ pub const PageHeader = extern struct {
 };
 
 pub const DIPC_HEADER_SIZE: usize = @sizeOf(PageHeader);
+pub const MICROVM_GUEST_TX_ENDPOINT_BASE: u64 = 0x1000;
+pub const MAX_VIRTIO_NET_FRAME_SIZE: usize = 1514;
 
 pub const ControlOp = enum(u16) {
     register_netd = 1,
@@ -245,6 +247,7 @@ pub const ControlOp = enum(u16) {
     get_node_status = 20,
     get_node_addr = 21,
     get_node_identity = 22,
+    virtio_net_ingress = 23,
 };
 
 pub const ControlHeader = extern struct {
@@ -371,6 +374,7 @@ pub const ConfigNodeResourcePayload = configd_proto.NodeResourcePayload;
 pub const ConfigRegistrySnapshotReply = configd_proto.RegistrySnapshotReply;
 /// Canonical block I/O request type.  Re-exported from storaged_protocol.
 pub const BlkRequest = storaged_proto.BlkRequest;
+pub const BlkReqType = storaged_proto.ReqType;
 
 /// Block I/O completion.  Re-exported from storaged_protocol.
 pub const BlkResponse = storaged_proto.BlkResponse;
@@ -382,7 +386,19 @@ pub const VirtioBlkResponsePayload = extern struct {
     _pad: u8 = 0,
 };
 
+pub const VirtioNetIngressPayload = extern struct {
+    vmid: u32,
+    frame_len: u16,
+    _pad: u16 = 0,
+};
+
 pub const NetdHeader = netd_proto.NetdHeader;
+pub const SwitchPortAttachPayload = netd_proto.SwitchPortAttachPayload;
+pub const SwitchPortDetachPayload = netd_proto.SwitchPortDetachPayload;
+pub const SwitchRulePayload = netd_proto.SwitchRulePayload;
+pub const SwitchPolicyReplacePayload = netd_proto.SwitchPolicyReplacePayload;
+pub const SwitchConfigAckPayload = netd_proto.SwitchConfigAckPayload;
+pub const SwitchConfigStatus = netd_proto.SwitchConfigStatus;
 pub const NetdPeerAnnouncementPayload = netd_proto.PeerAnnouncementPayload;
 pub const NetdPeerSnapshotReply = netd_proto.PeerSnapshotReply;
 pub const ClusterdHeader = clusterd_proto.ClusterdHeader;

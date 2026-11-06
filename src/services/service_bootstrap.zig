@@ -1,5 +1,6 @@
 const std = @import("std");
 const dipc = @import("../ipc/dipc.zig");
+const identity = @import("../ipc/identity.zig");
 const abi = @import("syscall_abi");
 
 pub const DescriptorMagic: u32 = 0x53565442; // 'SVTB'
@@ -16,6 +17,45 @@ pub const ServiceKind = enum(u16) {
     windowd = 8,
     configd = 9,
 };
+
+pub fn reservedEndpointFor(kind: ServiceKind) ?identity.EndpointId {
+    return switch (kind) {
+        .netd => @backingInt(identity.ReservedEndpoint.netd),
+        .storaged => @backingInt(identity.ReservedEndpoint.storaged),
+        .dashd => @backingInt(identity.ReservedEndpoint.dashd),
+        .containerd => @backingInt(identity.ReservedEndpoint.containerd),
+        .clusterd => @backingInt(identity.ReservedEndpoint.clusterd),
+        .inputd => @backingInt(identity.ReservedEndpoint.inputd),
+        .windowd => @backingInt(identity.ReservedEndpoint.windowd),
+        .configd => @backingInt(identity.ReservedEndpoint.configd),
+        .vmm => null,
+    };
+}
+
+pub fn isAuthorizedSourceEndpoint(kind: ServiceKind, endpoint: identity.EndpointId) bool {
+    const expected = reservedEndpointFor(kind) orelse return false;
+    return endpoint == expected;
+}
+
+test "reserved endpoint identity is bound to the service kind" {
+    try std.testing.expectEqual(
+        @as(?identity.EndpointId, @backingInt(identity.ReservedEndpoint.netd)),
+        reservedEndpointFor(.netd),
+    );
+    try std.testing.expectEqual(
+        @as(?identity.EndpointId, @backingInt(identity.ReservedEndpoint.configd)),
+        reservedEndpointFor(.configd),
+    );
+    try std.testing.expectEqual(@as(?identity.EndpointId, null), reservedEndpointFor(.vmm));
+    try std.testing.expect(isAuthorizedSourceEndpoint(
+        .configd,
+        @backingInt(identity.ReservedEndpoint.configd),
+    ));
+    try std.testing.expect(!isAuthorizedSourceEndpoint(
+        .configd,
+        @backingInt(identity.ReservedEndpoint.clusterd),
+    ));
+}
 
 pub const UserId = enum(u32) {
     core = 0,
@@ -158,18 +198,17 @@ fn allowedSyscallMask(kind: ServiceKind) u32 {
 }
 
 fn baseDescriptor(kind: ServiceKind, service_id: u32, user_id: UserId, mode: RuntimeMode, token: u64, local_node: dipc.Ipv6Addr) Descriptor {
-    const identity = @import("../ipc/identity.zig");
     const microvm_transport = @import("../vmm/microvm_transport.zig");
 
     return .{
         .magic = DescriptorMagic,
         .version = DescriptorVersion,
         .descriptor_len = @as(u16, @intCast(@sizeOf(Descriptor))),
-        .class = @intFromEnum(ProcessClass.user_service),
-        .service_kind = @intFromEnum(kind),
-        .runtime_mode = @intFromEnum(mode),
+        .class = @backingInt(ProcessClass.user_service),
+        .service_kind = @backingInt(kind),
+        .runtime_mode = @backingInt(mode),
         .service_id = service_id,
-        .user_id = @intFromEnum(user_id),
+        .user_id = @backingInt(user_id),
         .persistent_trap_vector = if (mode == .persistent) PersistentTrapVector else 0,
         .persistent_heartbeat_op = if (mode == .persistent) PersistentHeartbeatOp else 0,
         .persistent_stop_op = if (mode == .persistent) PersistentStopOp else 0,
@@ -178,16 +217,16 @@ fn baseDescriptor(kind: ServiceKind, service_id: u32, user_id: UserId, mode: Run
         .dipc_wire_version = dipc.WireVersion,
         .dipc_header_len = @as(u16, @intCast(dipc.HEADER_SIZE)),
         .dipc_max_payload = @as(u32, @intCast(dipc.MAX_PAYLOAD)),
-        .reserved_netd_endpoint = @intFromEnum(identity.ReservedEndpoint.netd),
-        .reserved_kernel_control_endpoint = @intFromEnum(identity.ReservedEndpoint.kernel_control),
-        .reserved_router_endpoint = @intFromEnum(identity.ReservedEndpoint.router),
-        .reserved_storaged_endpoint = @intFromEnum(identity.ReservedEndpoint.storaged),
-        .reserved_dashd_endpoint = @intFromEnum(identity.ReservedEndpoint.dashd),
-        .reserved_containerd_endpoint = @intFromEnum(identity.ReservedEndpoint.containerd),
-        .reserved_clusterd_endpoint = @intFromEnum(identity.ReservedEndpoint.clusterd),
-        .reserved_inputd_endpoint = @intFromEnum(identity.ReservedEndpoint.inputd),
-        .reserved_windowd_endpoint = @intFromEnum(identity.ReservedEndpoint.windowd),
-        .reserved_configd_endpoint = @intFromEnum(identity.ReservedEndpoint.configd),
+        .reserved_netd_endpoint = @backingInt(identity.ReservedEndpoint.netd),
+        .reserved_kernel_control_endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
+        .reserved_router_endpoint = @backingInt(identity.ReservedEndpoint.router),
+        .reserved_storaged_endpoint = @backingInt(identity.ReservedEndpoint.storaged),
+        .reserved_dashd_endpoint = @backingInt(identity.ReservedEndpoint.dashd),
+        .reserved_containerd_endpoint = @backingInt(identity.ReservedEndpoint.containerd),
+        .reserved_clusterd_endpoint = @backingInt(identity.ReservedEndpoint.clusterd),
+        .reserved_inputd_endpoint = @backingInt(identity.ReservedEndpoint.inputd),
+        .reserved_windowd_endpoint = @backingInt(identity.ReservedEndpoint.windowd),
+        .reserved_configd_endpoint = @backingInt(identity.ReservedEndpoint.configd),
         .microvm_ingress_magic = microvm_transport.IngressDescriptorMagic,
         .microvm_ingress_version = microvm_transport.IngressDescriptorVersion,
         .microvm_ingress_len = @as(u16, @intCast(@sizeOf(microvm_transport.IngressDescriptor))),

@@ -5,10 +5,7 @@ if [ -d "/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_6
     export PATH="/home/rune/.config/Code/User/globalStorage/ziglang.vscode-zig/zig/x86_64-linux-0.17.0:$PATH"
 fi
 
-# Catenary OS smoke test:
-# - boots Catenary OS under QEMU
-# - launches the nested-VMX path
-# - passes only if the Linux guest reaches an early serial milestone
+# Catenary OS smoke test; the selected profile defines the required milestones.
 
 TIMEOUT_SECS=${TIMEOUT_SECS:-120}
 REQUIRE_KVM=${REQUIRE_KVM:-1}
@@ -18,13 +15,14 @@ DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false"
 DEFAULT_CORE_PATTERNS=""
 DEFAULT_VMX_EPT_PATTERNS=""
 DEFAULT_VMX_LINUX_PATTERNS=""
+NVME_DEVICE_ARGS=(-device nvme,serial=deadbeef,drive=nvm -drive file=test_disk.img,format=raw,if=none,id=nvm)
 
 case "${SMOKE_PROFILE}" in
     default)
         if [ "${SMP:-2}" -eq 1 ]; then
-            DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
+            DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: partition metadata scan complete;storaged: FUA write+flush completed;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified after flush;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
         else
-            DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
+            DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: partition metadata scan complete;storaged: FUA write+flush completed;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified after flush;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch;configd: MicroVM created via DIPC"
         fi
         ;;
     vmx-linux)
@@ -34,7 +32,7 @@ case "${SMOKE_PROFILE}" in
         ;;
     vmx-linux-services)
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=true"
-        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;netd: published kernel node address;netd: NIC ready, entering DIPC/NIC event loop;dashd: starting;containerd: starting;containerd: partition metadata scan complete;storaged: FUA write+flush completed;containerd: unpack block WRITE SUCCESS!;containerd: partition mounted on NVMe, header verified after flush;inputd: registered at endpoint 8;windowd: registered at endpoint 9;clusterd: requesting local MicroVM launch"
         DEFAULT_VMX_LINUX_PATTERNS="kernel_control: staged MicroVM launched via DIPC;VMX: entering guest via vmlaunch;Linux version;Catenary OS Guest Init: SUCCESS;guest_rootfs: init started"
         ;;
     ui-phase8)
@@ -50,9 +48,13 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
         DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1;[vm1] Catenary OS Guest Init: SUCCESS;[vm1] guest_rootfs: init started;[vm1] guest_rootfs: shell ready;[vm2] Catenary OS Guest Init: SUCCESS;[vm2] guest_rootfs: init started;[vm2] guest_rootfs: shell ready;[UI] Switched console to MicroVM #1;[vm1] help env os-release exit;[UI] Switched console to MicroVM #2;[vm2] help env os-release exit"
         ;;
+    no-nvme)
+        NVME_DEVICE_ARGS=()
+        DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;storaged: no NVMe found; block requests will fail;containerd: block I/O FAILED"
+        ;;
     *)
         echo "[!] Unknown SMOKE_PROFILE: ${SMOKE_PROFILE}" >&2
-        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8, phase9" >&2
+        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8, phase9, no-nvme" >&2
         exit 2
         ;;
 esac
@@ -124,7 +126,7 @@ GTK_PATH= qemu-system-x86_64 \
     -no-reboot \
     -daemonize \
     -netdev user,id=net0 -device virtio-net-pci,netdev=net0,romfile= \
-    -device nvme,serial=deadbeef,drive=nvm -drive file=test_disk.img,format=raw,if=none,id=nvm
+    "${NVME_DEVICE_ARGS[@]}"
 
 cleanup() {
     if [ -f qemu.pid ]; then

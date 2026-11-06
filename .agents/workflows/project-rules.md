@@ -58,7 +58,7 @@ This workspace builds a freestanding x86_64 operating system and Type-1 hypervis
 
 - Consult [PROJECT.md](../../PROJECT.md) for phase status and dependencies, [architecture](../../docs/architecture.md) for the current/target split, and the linked subsystem plans for future contracts.
 - The code contains experimental Linux direct-boot, VMX/EPT, virtio bridges, local NVMe, DIPC, and native UI paths. General UEFI-based Windows/Linux VM support, secure guest switching, quorum storage, and a common authenticated cluster UI are not established end to end.
-- The current synthetic storage path may acknowledge without persistence and the guest flush is a no-op. Never infer durability from its smoke markers or immediate readback.
+- The storage path now fails requests when NVMe is unavailable and issues NVMe Flush when the controller reports a volatile write cache. Virtio FUA uses a write-then-flush fallback; QEMU does not establish physical power-loss durability or native NVMe FUA, so never infer those properties from smoke markers or immediate readback.
 - QEMU with host KVM can test Catenary's existing VMX guest path; it does not demonstrate KVM inside a Catenary-hosted support VM. Nested VMX for that separate path is future work.
 
 ## Validation Workflow
