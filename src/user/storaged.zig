@@ -3,6 +3,8 @@
 /// Syscall ABI: rax=op, rbx=arg0, rdx=arg1, r8=token.
 const std = @import("std");
 const lib = @import("lib.zig");
+const partition_metadata = @import("protocols/partition_metadata.zig");
+const storage_protocol = @import("protocols/storaged_protocol.zig");
 
 // ---------------------------------------------------------------------------
 // Low-level serial + lib.syscall interface (same convention as netd.zig)
@@ -127,10 +129,77 @@ comptime {
 // DIPC block request mirror of virtio_blk.RequestHeader (from kernel microvm_bridge).
 const BlkRequest = lib.BlkRequest;
 const BLK_WRITE_FUA = @backingInt(lib.BlkReqType.write_fua);
+const HOST_METADATA_VMID = storage_protocol.HOST_METADATA_VMID;
+const CONTAINERD_ENDPOINT = @backingInt(lib.ReservedEndpoint.containerd);
 
 // Lba size (LBA = logical block address, a 512-byte sector).
 const SECTOR_SIZE: u32 = 512;
 
+fn isAuthorizedBlockClient(
+    src_endpoint: u64,
+    vmid: u32,
+    src_node: *const [16]u8,
+) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    return src_endpoint == CONTAINERD_ENDPOINT and
+        vmid == HOST_METADATA_VMID and
+        std.mem.eql(u8, src_node, &loopback.bytes);
+}
+
+fn isHostMetadataRange(sector: u64, nlb: u32) bool {
+    if (nlb == 0) return false;
+    const end = std.math.add(u64, sector, nlb) catch return false;
+    if (sector >= 1024 and end <= 1032) return true;
+    if (nlb != 1) return false;
+    if (sector == partition_metadata.JOURNAL_LBA) return true;
+    for (0..partition_metadata.MAX_PARTS) |slot| {
+        if (sector == partition_metadata.startLba(@intCast(slot))) return true;
+    }
+    return false;
+}
+
+test "unassigned VM block requests cannot access the host NVMe namespace" {
+    const local_node = lib.Ipv6Addr.loopback().bytes;
+    var remote_node: [16]u8 = @splat(0);
+    remote_node[0] = 0xFE;
+    remote_node[1] = 0x80;
+    remote_node[15] = 1;
+    try std.testing.expect(isAuthorizedBlockClient(
+        CONTAINERD_ENDPOINT,
+        HOST_METADATA_VMID,
+        &local_node,
+    ));
+    try std.testing.expect(!isAuthorizedBlockClient(
+        @backingInt(lib.ReservedEndpoint.kernel_control),
+        1,
+        &local_node,
+    ));
+    try std.testing.expect(!isAuthorizedBlockClient(
+        CONTAINERD_ENDPOINT,
+        1,
+        &local_node,
+    ));
+    try std.testing.expect(!isAuthorizedBlockClient(
+        @backingInt(lib.ReservedEndpoint.dashd),
+        HOST_METADATA_VMID,
+        &local_node,
+    ));
+    try std.testing.expect(!isAuthorizedBlockClient(
+        CONTAINERD_ENDPOINT,
+        HOST_METADATA_VMID,
+        &remote_node,
+    ));
+}
+
+test "host metadata client is confined to its smoke data and metadata sectors" {
+    try std.testing.expect(isHostMetadataRange(1024, 8));
+    try std.testing.expect(isHostMetadataRange(partition_metadata.JOURNAL_LBA, 1));
+    try std.testing.expect(isHostMetadataRange(partition_metadata.startLba(0), 1));
+    try std.testing.expect(!isHostMetadataRange(1024, 9));
+    try std.testing.expect(!isHostMetadataRange(partition_metadata.startLba(0) + 1, 1));
+    try std.testing.expect(!isHostMetadataRange(std.math.maxInt(u64), 1));
+    try std.testing.expect(!isHostMetadataRange(partition_metadata.JOURNAL_LBA, 2));
+}
 // DMA layout (storaged DMA window slots):
 // Slot 0:    Admin SQ  (1 page = 16 entries × 64 bytes = 1024 bytes)
 // Slot 1:    Admin CQ  (1 page = 16 entries × 16 bytes = 256 bytes)
@@ -546,7 +615,7 @@ pub export fn umain() noreturn {
                 chain_head2 = request.chain_head;
             }
             const reply_dst = incoming_hdr.src;
-            const local_node2 = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
+            const local_node2 = lib.Ipv6Addr.loopback();
             const scratch2: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
             const hdr2: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch2));
             hdr2.* = .{
@@ -720,10 +789,12 @@ pub export fn umain() noreturn {
         var chain_head: u16 = 0;
         var data_len: u16 = 0;
         var data_hpa: u64 = 0;
-        const request_valid = incoming_hdr.magic == lib.WireMagic and
+        const request_envelope_valid = incoming_hdr.magic == lib.WireMagic and
             incoming_hdr.version == lib.WireVersion and
+            incoming_hdr.header_len == lib.DIPC_HEADER_SIZE and
+            incoming_hdr.dst.endpoint == bs_desc.reserved_storaged_endpoint and
             incoming_hdr.payload_len == @sizeOf(BlkRequest);
-        if (request_valid) {
+        if (request_envelope_valid) {
             const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
             req_type = request.req_type;
             sector = request.sector;
@@ -732,6 +803,14 @@ pub export fn umain() noreturn {
             data_len = request.data_len;
             data_hpa = request.data_hpa;
         }
+        const loopback = lib.Ipv6Addr.loopback();
+        const request_valid = request_envelope_valid and
+            std.mem.eql(u8, &incoming_hdr.dst.node.bytes, &loopback.bytes) and
+            isAuthorizedBlockClient(
+                incoming_hdr.src.endpoint,
+                vmid,
+                &incoming_hdr.src.node.bytes,
+            );
 
         var io_status: u8 = 1;
         if (request_valid) {
@@ -742,7 +821,9 @@ pub export fn umain() noreturn {
                 @as(u64, data_len) <= PAGE_SIZE - (data_hpa & (PAGE_SIZE - 1)))
             {
                 const nlb = @as(u32, data_len) / SECTOR_SIZE;
-                if (sector < g_ns_lba_count and nlb <= g_ns_lba_count - sector) {
+                if (isHostMetadataRange(sector, nlb) and
+                    sector < g_ns_lba_count and nlb <= g_ns_lba_count - sector)
+                {
                     if (req_type == 0) {
                         const read_status = doRead(sector, nlb, data_hpa);
                         if (read_status == 0) {
@@ -775,7 +856,7 @@ pub export fn umain() noreturn {
 
         const scratch: [*]u8 = lib.ptrFrom([*]u8, DIPC_SCRATCH_VA);
         const reply_dst = incoming_hdr.src;
-        const local_node = lib.Ipv6Addr{ .bytes = bs_desc.local_node };
+        const local_node = lib.Ipv6Addr.loopback();
 
         const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
         header.* = .{

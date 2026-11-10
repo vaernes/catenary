@@ -23,7 +23,7 @@ A **catenary** is the curve a cable forms under its own weight. **Catenary OS** 
 
 Catenary avoids a monolithic kernel and in-kernel POSIX compatibility. Linux MicroVMs are the intended environment for OCI workloads; full Linux distribution and Windows VMs, secure guest networking, clustered storage, and a common cluster UI are planned. The project is not yet a production platform or a claim of full OCI or guest-OS compatibility.
 
-**Current limits:** the repository contains experimental Linux direct-boot, VMX/EPT, virtio, DIPC, NVMe, cluster-discovery, and native TUI paths. General UEFI-based full VMs, Windows support, complete VM microsegmentation, replay-protected encrypted cluster transport, and quorum-backed storage are not established end to end. Storage now fails without NVMe and sends NVMe Flush when a volatile cache is reported; FUA requests use a write-then-flush fallback. QEMU smoke results do not prove physical power-loss durability or native NVMe FUA behavior. See the [architecture overview](docs/architecture.md) and [test evidence](TEST_READY.md).
+**Current limits:** the repository contains experimental Linux direct-boot, VMX/EPT, virtio, DIPC, NVMe, cluster-discovery, and native TUI paths. General UEFI-based full VMs, Windows support, complete VM microsegmentation, replay-protected encrypted cluster transport, and quorum-backed storage are not established end to end. `storaged` currently authorizes only the host-local metadata workflow; guest block requests fail closed until explicit per-VM disk extents exist. Storage fails without NVMe and sends NVMe Flush when a volatile cache is reported; FUA requests use a write-then-flush fallback. QEMU smoke results do not prove physical power-loss durability or native NVMe FUA behavior. See the [architecture overview](docs/architecture.md) and [test evidence](TEST_READY.md).
 
 ---
 
@@ -66,9 +66,9 @@ Catenary OS includes an unprivileged Ring-3 display server and TUI manager (**`w
 
 Processes use page-backed messages addressed by node and endpoint. Local routing and experimental cross-node forwarding exist, but remote delivery, authorization, failure, and ownership remain explicit concerns. The current cluster-wide shared HMAC has a known replay gap and does not provide per-node identity or confidentiality.
 
-### Virtual Networking — Planned
+### Virtual Networking — Partial
 
-The host and cluster control plane are IPv6-first. Guest virtual segments are planned to support IPv4 and IPv6, host-assigned vNIC identities, virtual switches, and default-deny per-VM ingress and egress policies. A protected overlay is planned for extending segments across nodes; these features are not yet established. See the [virtual network plan](docs/VIRTUAL_NETWORK_PLAN.md).
+The host and cluster control plane are IPv6-first. An experimental local switch has host-assigned vNIC identities and default-deny IPv4/IPv6 policy checks. The native shell can replace host-side address bindings with `vnic-bind <vm-id> <ipv4-or-> <ipv6-or->`; this clears allow rules and does not configure the guest. Allowed guest traffic, an operator-facing policy editor, bootstrap protocols, and a protected cross-node overlay are not yet established. See the [virtual network plan](docs/VIRTUAL_NETWORK_PLAN.md).
 
 ### VM Hosting and Storage — Planned
 
@@ -132,6 +132,18 @@ SMOKE_PROFILE=vmx-linux-services ./test_qemu.sh
 
 # Verify storage fails closed when NVMe is absent
 SMOKE_PROFILE=no-nvme ./test_qemu.sh
+
+# Verify corrupted partition metadata blocks allocation and writes
+SMOKE_PROFILE=corrupt-metadata ./test_qemu.sh
+
+# Verify a corrupted journal blocks metadata recovery and writes
+SMOKE_PROFILE=corrupt-journal ./test_qemu.sh
+
+# Verify write-ahead journal recovery and transaction completion
+SMOKE_PROFILE=journal-recovery ./test_qemu.sh
+
+# Verify idempotent recovery when the header was already written
+SMOKE_PROFILE=journal-commit-recovery ./test_qemu.sh
 
 # Automated Phase 8 UI, MicroVM form provisioning, and Varde shell verification
 SMOKE_PROFILE=ui-phase8 ./test_qemu.sh

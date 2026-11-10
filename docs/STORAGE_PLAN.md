@@ -39,18 +39,33 @@ implementation required here already exists.
 	sector alignment are bounded to the current single-page NVMe PRP path. The
 	present direct host-physical-address path is not evidence that the scoped
 	DMA and ownership design below exists.
-- `containerd` scans all 16 configured partition-header sectors on startup and
-	avoids reusing slots whose headers validate. The default QEMU smoke has
-	recovered existing metadata and completed a new write after the full scan;
-	that exercise also covers NVMe queue doorbell wrap at the configured queue
-	depth. This is a smoke-test allocation aid, not a checksummed journal or
-	crash-consistent metadata recovery protocol; a read error stops the scan and
-	prevents subsequent writes.
+- `containerd` reserves LBA 8191 for a single-writer write-ahead journal and
+	scans all 16 configured partition-header sectors on startup. A checksummed
+	intent contains the exact versioned partition header; the writer flushes the
+	intent before writing and flushing that header, verifies it by readback, then
+	clears and flushes the journal. Startup replays a valid intent idempotently
+	before scanning. Invalid nonzero journal or header sectors stop allocation
+	rather than treating possibly damaged metadata as free. Legacy version-1
+	partition headers remain readable. QEMU seeds a valid uncommitted intent and
+	observes replay, scan, a new transaction, header readback, and journal clear.
+	This is single-writer software recovery for the current host-local
+	`containerd` metadata workflow, exercised against QEMU storage, not power-cut
+	evidence or proof that real devices honor flushes. It does not establish
+	per-VM disk extents or general storage authorization. `storaged` currently
+	accepts only the local `containerd` metadata client and confines its data
+	requests to the smoke-data area, journal sector, and partition-header
+	sectors; unassigned VM block requests fail closed. This is not a virtual-disk
+	extent implementation. A read error stops the scan and prevents subsequent
+	writes. The host-local request and response path uses loopback addresses and
+	validates endpoint, node, message length, and response operation, so a change
+	of the node's network address does not invalidate this exchange.
 - The default QEMU smoke path now observes an actual NVMe write, an FUA
-	write+flush fallback, and readback of a test partition header. This is QEMU
-	integration evidence only; it does not establish physical power-loss
-	durability, native NVMe FUA behavior, crash recovery, or persistent guest
-	filesystem behavior.
+	write+flush fallback, and readback of a test partition header. The
+	`journal-recovery` profile seeds a valid intent record and verifies QEMU
+	replay and transaction completion. These are QEMU integration checks only;
+	they do not establish physical power-loss durability, native NVMe FUA
+	behavior, recovery from actual torn writes, or persistent guest filesystem
+	behavior.
 
 ## 2. Boundaries and service model
 

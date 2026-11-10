@@ -187,7 +187,7 @@ For durability, use three independently powered physical voting nodes with real 
 
 ## 8. Current Worktree Verification
 
-These results were collected on 2026-11-05. QEMU profiles ran in an isolated copy of the current working tree so QEMU artifacts would not overwrite workspace outputs. Build and Zig test commands used the project's Zig 0.17.0 toolchain.
+The baseline results below were collected on 2026-11-05; journal-format and QEMU recovery checks were added on 2026-11-06. QEMU profiles ran against the current worktree. Build and Zig test commands used the Zig toolchain available in the environment.
 
 | Check | Result | Evidence and limits |
 |---|---|---|
@@ -201,5 +201,19 @@ These results were collected on 2026-11-05. QEMU profiles ran in an isolated cop
 | `SMP=2 SMOKE_PROFILE=ui-phase8 TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — QEMU | Existing Phase 8 UI profile |
 | `SMP=2 SMOKE_PROFILE=vmx-linux TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — QEMU | Linux guest boot milestones observed with services disabled |
 | `SMP=2 SMOKE_PROFILE=vmx-linux-services TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — QEMU | Service and Linux guest milestones observed. Linux profiles disable per-syscall UART keepalive, which inserted dots into literal log markers. |
+| `zig build --summary all` | PASS — 20/20 steps | Includes the journaled `containerd` service build |
+| `zig test src/user/protocols/partition_metadata.zig` | PASS — 5 tests | CRC-protected header and journal serialization, corruption rejection, and legacy header parsing |
+| `zig test --dep syscall_abi -Mroot=src/user/storaged.zig -Msyscall_abi=src/syscall_abi.zig` | PASS — 2 storaged tests plus 5 imported metadata tests | Only the host metadata client is authorized; unassigned VM requests fail closed and host metadata I/O is range-limited |
+| `SMP=2 SMOKE_PROFILE=journal-recovery TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Seeded valid intent replayed, metadata scan completed, new journaled write/readback completed, journal cleared; simulated recovery only, not a power cut |
+| `SMP=2 SMOKE_PROFILE=journal-commit-recovery TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Seeded intent plus already-written header replayed idempotently; metadata scan recognized the header and journal was cleared |
+| `SMP=2 SMOKE_PROFILE=corrupt-journal TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Invalid nonzero journal rejected before the smoke write; no metadata recovery or allocation continued |
+| Two sequential default QEMU runs with the same `NVME_DISK_IMAGE` | PASS — KVM-backed QEMU | First run journaled and cleared a new header; second run recovered existing metadata after restart |
+| `SMP=2 SMOKE_PROFILE=ui-phase8 TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Host vNIC attach/detach lifecycle acknowledged |
+| `SMP=2 SMOKE_PROFILE=phase9 TIMEOUT_SECS=180 ./test_qemu.sh` | PASS — KVM-backed QEMU | Both guest shells booted and answered after unassigned VM block access was denied |
+| `zig build test-kernel --summary all` (2026-11-10) | PASS — 85 tests | Includes local/remote source-claim and cluster-tag tampering tests, plus kernel/TUI regressions |
+| `zig test` for `virtual_switch`, `netd`, `configd`, `windowd`, partition metadata, `storaged`, and `containerd` (2026-11-10) | PASS | Exercises dual-stack binding/policy decisions, authorization, retries and malformed responses; service tests do not alone prove live guest traffic |
+| `SMOKE_PROFILE=vnic-bind ./test_qemu.sh` (2026-11-10) | PASS — KVM-backed QEMU | Native UI rejected an invalid binding, applied one IPv4 and one IPv6 host-side binding, and observed detach; no guest packet delivery is claimed |
+| `SMOKE_PROFILE=journal-recovery`, `corrupt-journal`, and `no-nvme` (2026-11-10) | PASS — KVM-backed QEMU | Validates loopback-only host metadata IPC, seeded journal replay, corrupt-journal rejection and missing-device failure; not physical power-cut evidence |
+| `SMOKE_PROFILE=phase9 ./test_qemu.sh` and `./test_qemu_cluster.sh` (2026-11-10) | PASS — KVM-backed QEMU | Two guest consoles and two-node discovery/remote launch/telemetry, respectively; cluster smoke used two CPUs per node |
 
-The QEMU runs rebuilt the OS with the project Zig version. The guest shell responses demonstrate input and output on the exercised QEMU path, not physical hardware behavior. Under the project's QEMU-only acceptance scope, Phase 9's documented software and QEMU gates are complete; physical-host acceptance and broader isolation testing are explicitly out of scope, not open blockers. No storage durability or cluster quorum acceptance is claimed.
+The QEMU runs rebuilt the OS with the available Zig toolchain. The guest shell responses demonstrate input and output on the exercised QEMU path, not physical hardware behavior. Under the project's QEMU-only acceptance scope, Phase 9's documented software and QEMU gates are complete; physical-host acceptance and broader isolation testing are explicitly out of scope, not open blockers. The journal QEMU profile demonstrates replay from a seeded intent record, not recovery after an actual interrupted write. No physical storage durability or cluster quorum acceptance is claimed.

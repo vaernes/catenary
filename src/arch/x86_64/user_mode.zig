@@ -533,10 +533,6 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
                 serialWrite("[SEND_PAGE] Service identity unavailable\n");
                 return 1;
             };
-            if (!service_bootstrap.isAuthorizedSourceEndpoint(sender_kind, src_hdr.src.endpoint)) {
-                serialWrite("[SECURITY] DIPC source endpoint does not match service capability\n");
-                return 1;
-            }
             const payload_len6 = @as(usize, src_hdr.payload_len);
             if (payload_len6 > dipc.MAX_PAYLOAD) {
                 serialWrite("[SEND_PAGE] Payload too large\n");
@@ -552,20 +548,27 @@ pub export fn userModeSyscallBridge(op: u64, arg0: u64, arg1: u64, rip: u64, tok
             const src_bytes: [*]const u8 = @ptrFromInt(src_phys + hhdm_offset);
             const dst_bytes: [*]u8 = @ptrFromInt(dst_virt);
             @memcpy(dst_bytes[0 .. dipc.HEADER_SIZE + payload_len6], src_bytes[0 .. dipc.HEADER_SIZE + payload_len6]);
-            // Pages claiming a remote origin must come from netd and carry a valid
-            // cluster tag; this is the only place off-node identity is accepted.
             {
                 const claimed: *const dipc.PageHeader = @ptrFromInt(dst_virt);
+                if (claimed.magic != dipc.WireMagic or claimed.version != dipc.WireVersion or
+                    claimed.header_len != dipc.HEADER_SIZE or claimed.payload_len != payload_len6)
+                {
+                    serialWrite("[SECURITY] DIPC dropped: invalid copied header\n");
+                    pmm.freePage(dst_phys);
+                    return 1;
+                }
                 const node_cfg = @import("../../ipc/node_config.zig");
                 const src_node = claimed.src.node;
                 const src_zero = std.mem.allEqual(u8, &src_node.bytes, 0);
-                if (!src_zero and !node_cfg.isLocalAddress(src_node)) {
-                    const sender_is_netd = if (service_registry.getServiceKind(sid6)) |k| k == .netd else false;
-                    if (!sender_is_netd or !dipc.verifyClusterTag(hhdm_offset, dst_phys)) {
-                        serialWrite("[SECURITY] DIPC dropped: unauthenticated remote origin\n");
-                        pmm.freePage(dst_phys);
-                        return 1;
-                    }
+                const remote = !src_zero and !node_cfg.isLocalAddress(src_node);
+                const cluster_tag_valid = if (remote and sender_kind == .netd)
+                    dipc.verifyClusterTag(hhdm_offset, dst_phys)
+                else
+                    false;
+                if (!service_bootstrap.isAuthorizedSourceClaim(sender_kind, claimed.src.endpoint, remote, cluster_tag_valid)) {
+                    serialWrite("[SECURITY] DIPC dropped: unauthorized source claim\n");
+                    pmm.freePage(dst_phys);
+                    return 1;
                 }
             }
             // Re-sign with kernel auth key.

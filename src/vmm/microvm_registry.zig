@@ -338,11 +338,12 @@ pub fn createWithAffinity(name: [32]u8, container: [32]u8, mem_pages: u32, vcpus
     ensureInit();
     const flags = acquireLock();
     defer releaseLock(flags);
+    if (next_instance_id == 0) return null;
 
     for (0..instances.len) |i| {
         if (!instances[i].in_use) {
             const id = next_instance_id;
-            next_instance_id += 1;
+            next_instance_id = id +% 1;
             const slot = &instances[i];
             slot.reset();
             slot.in_use = true;
@@ -524,6 +525,17 @@ test "registry rejects unsupported multi-vCPU requests without consuming an ID" 
     try std.testing.expect(delete(id));
 }
 
+test "registry exhausts VM IDs instead of wrapping and reusing identities" {
+    init();
+    const name: [32]u8 = @splat(0);
+    const container: [32]u8 = @splat(0);
+    next_instance_id = std.math.maxInt(u32);
+
+    const last_id = create(name, container, 1, 1, 0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(std.math.maxInt(u32), last_id);
+    try std.testing.expect(delete(last_id));
+    try std.testing.expectEqual(@as(?u32, null), create(name, container, 1, 1, 0, 0, 0, 0));
+}
 // ---------------------------------------------------------------------------
 // Console Syscall ABI Helpers (Ops 28 & 29)
 // ---------------------------------------------------------------------------

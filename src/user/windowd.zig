@@ -160,6 +160,187 @@ var needs_redraw: bool = true;
 var last_seen_shell_len: usize = 0;
 
 const proto_dashd = @import("protocols/dashd_protocol.zig");
+const proto_configd = @import("protocols/configd_protocol.zig");
+const proto_netd = @import("protocols/netd_protocol.zig");
+
+const NetworkBindCommand = struct {
+    vmid: u32,
+    ipv4: ?[4]u8 = null,
+    ipv6: ?[16]u8 = null,
+};
+
+const NetworkBindParse = union(enum) {
+    unrelated,
+    invalid,
+    binding: NetworkBindCommand,
+};
+
+const NetworkBindPhase = enum { querying, updating };
+const PendingNetworkBind = struct {
+    request_id: u64,
+    command: NetworkBindCommand,
+    phase: NetworkBindPhase = .querying,
+    generation: u64 = 0,
+    expected_revision: u64 = 0,
+};
+
+const NETWORK_REQUEST_TIMEOUT_TICKS: u32 = 1_000_000;
+var network_request_id: u64 = 0;
+var pending_network_bind: ?PendingNetworkBind = null;
+var network_request_wait: u32 = 0;
+var network_status_buf: [46]u8 = @splat(0);
+var network_status_len: usize = 0;
+var network_status_color: u32 = color.COLOR_WHITE;
+
+fn parseNetworkBindCommand(command: []const u8) NetworkBindParse {
+    var tokens = std.mem.tokenizeAny(u8, command, " \t");
+    const name = tokens.next() orelse return .unrelated;
+    if (!std.mem.eql(u8, name, "vnic-bind")) return .unrelated;
+    const vmid_text = tokens.next() orelse return .invalid;
+    const ipv4_text = tokens.next() orelse return .invalid;
+    const ipv6_text = tokens.next() orelse return .invalid;
+    if (tokens.next() != null) return .invalid;
+    const vmid = std.fmt.parseInt(u32, vmid_text, 10) catch return .invalid;
+    if (vmid == 0) return .invalid;
+    var result = NetworkBindCommand{ .vmid = vmid };
+    if (!std.mem.eql(u8, ipv4_text, "-")) {
+        const address = std.Io.net.Ip4Address.parse(ipv4_text, 0) catch return .invalid;
+        result.ipv4 = address.bytes;
+    }
+    if (!std.mem.eql(u8, ipv6_text, "-")) {
+        const address = std.Io.net.Ip6Address.parse(ipv6_text, 0) catch return .invalid;
+        result.ipv6 = address.bytes;
+    }
+    return .{ .binding = result };
+}
+
+fn setNetworkStatus(message: []const u8, status_color: u32) void {
+    network_status_len = @min(message.len, network_status_buf.len);
+    @memcpy(network_status_buf[0..network_status_len], message[0..network_status_len]);
+    network_status_color = status_color;
+    damage_tracker.addDamage(shell_panel_rect);
+    needs_redraw = true;
+}
+
+fn sendConfigdMessage(dma_phys: u64, token: u64, op: proto_configd.Op, payload: []const u8) bool {
+    const body_len = @sizeOf(proto_configd.ConfigdHeader) + payload.len;
+    if (lib.DIPC_HEADER_SIZE + body_len > lib.PAGE_SIZE) return false;
+    const scratch_phys = dma_phys + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
+    const scratch_va = DMA_BASE_VA + DMA_SCRATCH_SLOT * lib.PAGE_SIZE;
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, scratch_va);
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @intCast(body_len),
+        .auth_tag = 0,
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.windowd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.configd) },
+    };
+    const config_header: *align(1) proto_configd.ConfigdHeader =
+        @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    config_header.* = .{ .op = op, .payload_len = @intCast(payload.len) };
+    if (payload.len > 0) {
+        @memcpy(scratch[lib.DIPC_HEADER_SIZE + @sizeOf(proto_configd.ConfigdHeader) ..][0..payload.len], payload);
+    }
+    return lib.syscall(SYS_SEND_PAGE, scratch_phys, 0, token) == 0;
+}
+
+fn startNetworkBind(command: NetworkBindCommand, dma_phys: u64, token: u64) void {
+    if (pending_network_bind != null) {
+        setNetworkStatus("vNIC request already pending", color.COLOR_RED);
+        return;
+    }
+    const request_id = std.math.add(u64, network_request_id, 1) catch {
+        setNetworkStatus("vNIC request IDs exhausted", color.COLOR_RED);
+        return;
+    };
+    network_request_id = request_id;
+    const request = proto_configd.LocalPortStatusRequest{ .request_id = request_id, .vmid = command.vmid };
+    if (!sendConfigdMessage(dma_phys, token, .local_port_status, std.mem.asBytes(&request))) {
+        setNetworkStatus("Could not query vNIC", color.COLOR_RED);
+        return;
+    }
+    pending_network_bind = .{ .request_id = request_id, .command = command };
+    network_request_wait = 0;
+    setNetworkStatus("Querying vNIC...", color.COLOR_HIGHLIGHT);
+}
+
+fn isLocalConfigdReply(page: *const lib.PageHeader) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    return page.magic == lib.WireMagic and page.version == lib.WireVersion and
+        page.header_len == lib.DIPC_HEADER_SIZE and
+        page.src.endpoint == @backingInt(lib.ReservedEndpoint.configd) and
+        page.dst.endpoint == @backingInt(lib.ReservedEndpoint.windowd) and
+        std.mem.eql(u8, &page.src.node.bytes, &loopback.bytes) and
+        std.mem.eql(u8, &page.dst.node.bytes, &loopback.bytes);
+}
+
+fn finishNetworkBind(message: []const u8, status_color: u32) void {
+    pending_network_bind = null;
+    network_request_wait = 0;
+    setNetworkStatus(message, status_color);
+}
+
+fn handleNetworkBindReply(page: *const lib.PageHeader, payload_va: u64, dma_phys: u64, token: u64) void {
+    var pending = pending_network_bind orelse return;
+    if (!isLocalConfigdReply(page) or page.payload_len < @sizeOf(proto_configd.ConfigdHeader)) return;
+    const header: *align(1) const proto_configd.ConfigdHeader = @ptrFromInt(payload_va);
+    if (header.magic != proto_configd.MAGIC or header.version != proto_configd.VERSION or header._pad != 0 or
+        header.payload_len != page.payload_len - @sizeOf(proto_configd.ConfigdHeader)) return;
+    const op = @as(*align(1) const u16, @ptrCast(&header.op)).*;
+    const body_va = payload_va + @sizeOf(proto_configd.ConfigdHeader);
+    if (op == @backingInt(proto_configd.Op.local_port_status_reply) and pending.phase == .querying) {
+        if (header.payload_len != @sizeOf(proto_configd.LocalPortStatusReply)) return;
+        const reply: *align(1) const proto_configd.LocalPortStatusReply = @ptrFromInt(body_va);
+        if (reply.request_id != pending.request_id or reply.vmid != pending.command.vmid or reply._reserved != 0) return;
+        const status = @as(*align(1) const u16, @ptrCast(&reply.status)).*;
+        if (status > @backingInt(proto_netd.SwitchConfigStatus.no_capacity)) return;
+        if (status != @backingInt(proto_netd.SwitchConfigStatus.ok)) {
+            finishNetworkBind("vNIC unavailable or busy", color.COLOR_RED);
+            return;
+        }
+        if (reply.generation == 0 or reply.policy_revision == 0) return;
+        var request = proto_configd.LocalBindingsRequest{
+            .vmid = pending.command.vmid,
+            .generation = reply.generation,
+            .expected_revision = reply.policy_revision,
+            .request_id = pending.request_id,
+            .ipv4_count = if (pending.command.ipv4 == null) 0 else 1,
+            .ipv6_count = if (pending.command.ipv6 == null) 0 else 1,
+        };
+        if (pending.command.ipv4) |address| request.ipv4_addresses[0] = address;
+        if (pending.command.ipv6) |address| request.ipv6_addresses[0] = address;
+        if (!sendConfigdMessage(dma_phys, token, .local_bindings_replace, std.mem.asBytes(&request))) {
+            finishNetworkBind("Could not send vNIC update", color.COLOR_RED);
+            return;
+        }
+        pending.phase = .updating;
+        pending.generation = reply.generation;
+        pending.expected_revision = reply.policy_revision;
+        pending_network_bind = pending;
+        network_request_wait = 0;
+        setNetworkStatus("Updating vNIC...", color.COLOR_HIGHLIGHT);
+    } else if (op == @backingInt(proto_configd.Op.local_bindings_reply) and pending.phase == .updating) {
+        if (header.payload_len != @sizeOf(proto_configd.LocalBindingsReply)) return;
+        const reply: *align(1) const proto_configd.LocalBindingsReply = @ptrFromInt(body_va);
+        if (reply.request_id != pending.request_id or reply.vmid != pending.command.vmid or
+            reply.generation != pending.generation or reply._reserved != 0) return;
+        const status = @as(*align(1) const u16, @ptrCast(&reply.status)).*;
+        if (status > @backingInt(proto_netd.SwitchConfigStatus.no_capacity)) return;
+        if (status == @backingInt(proto_netd.SwitchConfigStatus.ok)) {
+            const next_revision = std.math.add(u64, pending.expected_revision, 1) catch return;
+            if (reply.policy_revision != next_revision) return;
+            finishNetworkBind("vNIC updated; firewall rules cleared", color.COLOR_GREEN);
+            lib.serialWrite("[UI] vNIC bindings updated (default-deny)\n");
+        } else {
+            if (reply.policy_revision != 0) return;
+            finishNetworkBind("vNIC update rejected; check addresses/state", color.COLOR_RED);
+            lib.serialWrite("[UI] vNIC binding rejected\n");
+        }
+    }
+}
 
 // Cluster Node View
 const MAX_NODES: usize = 8;
@@ -377,7 +558,7 @@ fn initWidgets() void {
     form_reset_btn = Button.init(Rect.init(232, 176, 136, 24), "RESET");
 
     // Varde Shell Line Editor
-    shell_input = TextInput.init(Rect.init(96, 544, 288, 16), 64);
+    shell_input = TextInput.init(Rect.init(96, 544, 288, 16), 96);
     shell_history = HistoryRing.init();
     shell_scroll_offset = 0;
     shell_auto_scroll = true;
@@ -477,6 +658,13 @@ pub export fn umain() noreturn {
         if (needs_redraw) {
             drawTui(dma_phys, token);
             needs_redraw = false;
+        }
+
+        if (pending_network_bind != null) {
+            network_request_wait +|= 1;
+            if (network_request_wait >= NETWORK_REQUEST_TIMEOUT_TICKS) {
+                finishNetworkBind("vNIC request timed out; result unknown", color.COLOR_RED);
+            }
         }
 
         last_poll += 1;
@@ -1053,10 +1241,16 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
         if (evt.key_code == .enter or evt.ascii == '\n' or evt.ascii == '\r') {
             const cmd = shell_input.getText();
             shell_history.push(cmd);
-            for (cmd) |ch| {
-                _ = lib.syscall(SYS_VARDE_INJECT, @as(u64, ch), 0, token);
+            switch (parseNetworkBindCommand(cmd)) {
+                .unrelated => {
+                    for (cmd) |ch| {
+                        _ = lib.syscall(SYS_VARDE_INJECT, @as(u64, ch), 0, token);
+                    }
+                    _ = lib.syscall(SYS_VARDE_INJECT, '\n', 0, token);
+                },
+                .invalid => setNetworkStatus("Invalid vNIC binding command", color.COLOR_RED),
+                .binding => |binding| startNetworkBind(binding, dma_phys, token),
             }
-            _ = lib.syscall(SYS_VARDE_INJECT, '\n', 0, token);
             shell_input.clear();
             shell_scroll_offset = 0;
             shell_auto_scroll = true;
@@ -1146,6 +1340,13 @@ fn handleMessage(page_va: u64, bs: *const lib.BootstrapDescriptor, dma_phys: u64
             damage_tracker.addDamage(right_panel_rect);
             needs_redraw = true;
         }
+        return;
+    }
+
+    if (hdr.src.endpoint == @backingInt(lib.ReservedEndpoint.configd) and
+        hdr.payload_len >= @sizeOf(proto_configd.ConfigdHeader))
+    {
+        handleNetworkBindReply(hdr, payload_va, dma_phys, token);
         return;
     }
 
@@ -1413,19 +1614,24 @@ fn drawShellPrompt(surface: Surface) void {
 
     const text = shell_input.getText();
     const max_vis: usize = 34;
-    const vis_len = @min(text.len, max_vis);
+    const start = shellInputViewStart(shell_input.cursor_pos, max_vis);
+    const vis_len = @min(text.len - start, max_vis);
     if (vis_len > 0) {
-        surface.drawText(prompt_row, 12, color.COLOR_WHITE, color.COLOR_INPUT_BG, text[0..vis_len]);
+        surface.drawText(prompt_row, 12, color.COLOR_WHITE, color.COLOR_INPUT_BG, text[start .. start + vis_len]);
     }
     if (is_shell) {
-        const cur_col: u32 = 12 + @as(u32, @intCast(@min(shell_input.cursor_pos, max_vis)));
-        if (shell_input.cursor_pos < vis_len) {
+        const cur_col: u32 = 12 + @as(u32, @intCast(shell_input.cursor_pos - start));
+        if (shell_input.cursor_pos < start + vis_len) {
             const ch_slice = text[shell_input.cursor_pos .. shell_input.cursor_pos + 1];
             surface.drawText(prompt_row, cur_col, color.COLOR_INPUT_BG, color.COLOR_HIGHLIGHT, ch_slice);
         } else {
             surface.drawText(prompt_row, cur_col, color.COLOR_HIGHLIGHT, color.COLOR_INPUT_BG, "_");
         }
     }
+}
+
+fn shellInputViewStart(cursor: usize, max_visible: usize) usize {
+    return if (cursor > max_visible) cursor - max_visible else 0;
 }
 
 fn drawShellPane(surface: Surface, dma_phys: u64, token: u64) void {
@@ -1438,7 +1644,7 @@ fn drawShellPane(surface: Surface, dma_phys: u64, token: u64) void {
     const log_ptr = lib.ptrFrom([*]const u8, log_va);
 
     const base_row: u32 = 42;
-    const max_rows: u32 = 24;
+    const max_rows: u32 = if (network_status_len > 0) 23 else 24;
     const max_cols: usize = 46;
 
     // Parse lines from kernel varde_shell log
@@ -1509,6 +1715,9 @@ fn drawShellPane(surface: Surface, dma_phys: u64, token: u64) void {
         }
     }
 
+    if (network_status_len > 0) {
+        surface.drawText(base_row + 23, 2, network_status_color, color.COLOR_PANEL_BG, network_status_buf[0..network_status_len]);
+    }
     drawShellPrompt(surface);
 }
 
@@ -1814,4 +2023,49 @@ fn drawHelpModal(surface: Surface) void {
     surface.drawText(base_row + 26, col, color.COLOR_WHITE, color.COLOR_MODAL_BG, "  [F5] Refresh telemetry  |  [F12] Quit  |  [F1] / '?' Help");
 
     surface.drawText(base_row + 30, col + 12, color.COLOR_HIGHLIGHT, color.COLOR_MODAL_BG, "Press [Esc] or [Enter] to Close Help");
+}
+
+test "vNIC binding command accepts explicit dual-stack addresses" {
+    const parsed = parseNetworkBindCommand("vnic-bind 7 10.77.0.7 fd00::7");
+    try std.testing.expect(parsed == .binding);
+    const binding = parsed.binding;
+    try std.testing.expectEqual(@as(u32, 7), binding.vmid);
+    try std.testing.expectEqual([4]u8{ 10, 77, 0, 7 }, binding.ipv4.?);
+    try std.testing.expectEqual([16]u8{ 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 }, binding.ipv6.?);
+    const cleared = parseNetworkBindCommand("vnic-bind 7 - -");
+    try std.testing.expect(cleared == .binding);
+    try std.testing.expect(cleared.binding.ipv4 == null and cleared.binding.ipv6 == null);
+    try std.testing.expect(parseNetworkBindCommand("ps") == .unrelated);
+    try std.testing.expect(parseNetworkBindCommand("vnic-bind 0 - -") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-bind 7 999.1.1.1 -") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-bind 7 - not-ipv6") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-bind 7 -") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-bind 7 - - extra") == .invalid);
+}
+
+test "shell input keeps the cursor visible for long commands" {
+    try std.testing.expectEqual(@as(usize, 0), shellInputViewStart(34, 34));
+    try std.testing.expectEqual(@as(usize, 1), shellInputViewStart(35, 34));
+    try std.testing.expectEqual(@as(usize, 62), shellInputViewStart(96, 34));
+}
+
+test "vNIC configuration replies require the local configd endpoint" {
+    var page = lib.PageHeader{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @sizeOf(proto_configd.ConfigdHeader),
+        .auth_tag = 0,
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.configd) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.windowd) },
+    };
+    try std.testing.expect(isLocalConfigdReply(&page));
+    page.src.endpoint = @backingInt(lib.ReservedEndpoint.netd);
+    try std.testing.expect(!isLocalConfigdReply(&page));
+    page.src.endpoint = @backingInt(lib.ReservedEndpoint.configd);
+    page.src.node.bytes[0] = 0xFE;
+    try std.testing.expect(!isLocalConfigdReply(&page));
+    page.src.node = lib.Ipv6Addr.loopback();
+    page.dst.node.bytes[0] = 0xFE;
+    try std.testing.expect(!isLocalConfigdReply(&page));
 }

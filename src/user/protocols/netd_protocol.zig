@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// netd DIPC protocol
 ///
 /// Endpoint: ReservedEndpoint.netd (1)
@@ -100,6 +102,9 @@ pub const Op = enum(u16) {
     /// Result for a switch configuration request.
     /// Payload: SwitchConfigAckPayload.
     switch_config_ack = 22,
+
+    switch_bindings_replace = 23,
+    switch_bindings_ack = 24,
 };
 
 /// Header prepended to every netd DIPC message (after the PageHeader).
@@ -108,6 +113,17 @@ pub const NetdHeader = extern struct {
     version: u16 = VERSION,
     op: Op,
 };
+
+pub fn hostAssignedMac(vmid: u32) [6]u8 {
+    return .{
+        0x02,
+        0xCA,
+        @truncate(vmid >> 24),
+        @truncate(vmid >> 16),
+        @truncate(vmid >> 8),
+        @truncate(vmid),
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Per-op payloads
@@ -298,6 +314,19 @@ pub const SwitchPortDetachPayload = extern struct {
     generation: u64,
 };
 
+pub const SwitchBindingsReplacePayload = extern struct {
+    vmid: u32,
+    _reserved: u32 = 0,
+    generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    ipv4_count: u8,
+    ipv6_count: u8,
+    _pad: [6]u8 = @splat(0),
+    ipv4_addresses: [SWITCH_MAX_ADDRESSES_PER_FAMILY][4]u8 = @splat(@splat(0)),
+    ipv6_addresses: [SWITCH_MAX_ADDRESSES_PER_FAMILY][16]u8 = @splat(@splat(0)),
+};
+
 pub const SwitchRulePayload = extern struct {
     ip_version: u8,
     protocol: u8,
@@ -343,3 +372,32 @@ pub const SwitchConfigAckPayload = extern struct {
     generation: u64,
     policy_revision: u64,
 };
+
+pub const SwitchBindingsAckPayload = extern struct {
+    request_id: u64,
+    vmid: u32,
+    status: SwitchConfigStatus,
+    _reserved: u16 = 0,
+    generation: u64,
+    policy_revision: u64,
+};
+
+test "host-assigned virtual NIC MACs are unique unicast addresses" {
+    const first = hostAssignedMac(1);
+    const second = hostAssignedMac(2);
+    const high = hostAssignedMac(0xFFFF_FFFF);
+    try std.testing.expectEqual(@as(u8, 0x02), first[0]);
+    try std.testing.expectEqual(@as(u8, 0xCA), first[1]);
+    try std.testing.expect(first[0] & 1 == 0);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    try std.testing.expectEqual(@as(u8, 0xFF), high[5]);
+}
+
+test "switch binding request has a bounded stable wire layout" {
+    try std.testing.expectEqual(@as(usize, 120), @sizeOf(SwitchBindingsReplacePayload));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SwitchBindingsReplacePayload, "generation"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(SwitchBindingsReplacePayload, "request_id"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(SwitchBindingsReplacePayload, "ipv4_addresses"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(SwitchBindingsReplacePayload, "ipv6_addresses"));
+    try std.testing.expectEqual(@as(usize, 32), @sizeOf(SwitchBindingsAckPayload));
+}

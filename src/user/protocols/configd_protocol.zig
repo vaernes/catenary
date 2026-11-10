@@ -17,6 +17,8 @@
 ///   PageHeader          (lib.DIPC_HEADER_SIZE bytes)
 ///   lib.ControlHeader   (op = .registry_sync)
 ///   RegistrySyncPayload
+const netd_proto = @import("netd_protocol.zig");
+
 pub const MAGIC: u32 = 0x434F4E46; // 'CONF'
 pub const VERSION: u16 = 1;
 
@@ -69,6 +71,11 @@ pub const Op = enum(u16) {
     /// Reply to registry_snapshot_request.
     /// Payload: RegistrySnapshotReply.
     registry_snapshot_reply = 6,
+
+    local_port_status = 7,
+    local_port_status_reply = 8,
+    local_bindings_replace = 9,
+    local_bindings_reply = 10,
 };
 
 pub const ConfigdHeader = extern struct {
@@ -78,6 +85,24 @@ pub const ConfigdHeader = extern struct {
     payload_len: u32,
     _pad: u32 = 0,
 };
+
+pub const LocalPortStatusRequest = extern struct {
+    request_id: u64,
+    vmid: u32,
+    _reserved: u32 = 0,
+};
+
+pub const LocalPortStatusReply = extern struct {
+    request_id: u64,
+    vmid: u32,
+    status: netd_proto.SwitchConfigStatus,
+    _reserved: u16 = 0,
+    generation: u64,
+    policy_revision: u64,
+};
+
+pub const LocalBindingsRequest = netd_proto.SwitchBindingsReplacePayload;
+pub const LocalBindingsReply = netd_proto.SwitchBindingsAckPayload;
 
 /// Op.node_joined — a new node has been discovered.
 pub const NodeJoinPayload = extern struct {

@@ -313,6 +313,14 @@ fn isLocalNode(addr: *const [16]u8) bool {
     return ipv6Eq(addr, &g_our_ipv6) or isLoopbackIpv6(addr) or isUnspecifiedIpv6(addr);
 }
 
+fn isRemoteDipcSource(addr: *const [16]u8, local_node: *const [16]u8) bool {
+    return !ipv6Eq(addr, local_node) and !isLoopbackIpv6(addr) and !isUnspecifiedIpv6(addr);
+}
+
+fn isRemoteDipcClaim(source: *const [16]u8, claimed: *const [16]u8, local_node: *const [16]u8) bool {
+    return isRemoteDipcSource(source, local_node) and ipv6Eq(source, claimed);
+}
+
 fn isZeroMac(mac: *const [6]u8) bool {
     for (mac) |byte| {
         if (byte != 0) return false;
@@ -451,6 +459,7 @@ fn resolveNextHop(dst_node: *const [16]u8, next_hop_out: *[16]u8) void {
 fn sendNetdMessageWithOutbox(
     outbox_va: u64,
     outbox_phys: u64,
+    src_node: *const [16]u8,
     dst_node: *const [16]u8,
     dst_endpoint: u64,
     op: netd_proto.Op,
@@ -469,7 +478,7 @@ fn sendNetdMessageWithOutbox(
         .header_len = @as(u16, @intCast(lib.DIPC_HEADER_SIZE)),
         .payload_len = @as(u32, @intCast(total_payload_len)),
         .auth_tag = 0,
-        .src = .{ .node = .{ .bytes = g_our_ipv6 }, .endpoint = NETD_ENDPOINT },
+        .src = .{ .node = .{ .bytes = src_node.* }, .endpoint = NETD_ENDPOINT },
         .dst = .{ .node = .{ .bytes = dst_node.* }, .endpoint = dst_endpoint },
     };
 
@@ -488,12 +497,17 @@ fn sendNetdMessageWithOutbox(
 
 // For umain (thread 0):
 fn sendNetdMessageTx(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op, payload: []const u8) bool {
-    return sendNetdMessageWithOutbox(TX_CONTROL_OUTBOX_VA, g_tx_control_outbox_phys, dst_node, dst_endpoint, op, payload);
+    return sendNetdMessageWithOutbox(TX_CONTROL_OUTBOX_VA, g_tx_control_outbox_phys, &g_our_ipv6, dst_node, dst_endpoint, op, payload);
+}
+
+fn sendLocalSwitchMessage(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op, payload: []const u8) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    return sendNetdMessageWithOutbox(TX_CONTROL_OUTBOX_VA, g_tx_control_outbox_phys, &loopback.bytes, dst_node, dst_endpoint, op, payload);
 }
 
 // For rxPollerLoop (thread 1):
 fn sendNetdMessageRx(dst_node: *const [16]u8, dst_endpoint: u64, op: netd_proto.Op, payload: []const u8) bool {
-    return sendNetdMessageWithOutbox(RX_CONTROL_OUTBOX_VA, g_rx_control_outbox_phys, dst_node, dst_endpoint, op, payload);
+    return sendNetdMessageWithOutbox(RX_CONTROL_OUTBOX_VA, g_rx_control_outbox_phys, &g_our_ipv6, dst_node, dst_endpoint, op, payload);
 }
 
 fn sendSelfPeerAnnouncement(dst_node: *const [16]u8) bool {
@@ -559,7 +573,56 @@ fn sendSwitchConfigAck(
         .generation = generation,
         .policy_revision = policy_revision,
     };
-    _ = sendNetdMessageTx(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .switch_config_ack, std.mem.asBytes(&ack));
+    _ = sendLocalSwitchMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .switch_config_ack, std.mem.asBytes(&ack));
+}
+
+fn applySwitchPortAttach(
+    switcher: *virtual_switch.Switch,
+    request: *align(1) const netd_proto.SwitchPortAttachPayload,
+) netd_proto.SwitchConfigAckPayload {
+    const generation = switcher.attach(.{
+        .id = request.vmid,
+        .segment = request.segment,
+        .mac = request.mac,
+        .ipv4_addresses = request.ipv4_addresses,
+        .ipv4_count = request.ipv4_count,
+        .ipv6_addresses = request.ipv6_addresses,
+        .ipv6_count = request.ipv6_count,
+    });
+    return .{
+        .request_op = .switch_port_attach,
+        .status = if (generation == null) .invalid else .ok,
+        .vmid = request.vmid,
+        .generation = generation orelse 0,
+        .policy_revision = if (generation) |current| switcher.policyRevision(request.vmid, current) orelse 0 else 0,
+    };
+}
+
+fn applySwitchBindings(
+    switcher: *virtual_switch.Switch,
+    request: *align(1) const netd_proto.SwitchBindingsReplacePayload,
+) netd_proto.SwitchBindingsAckPayload {
+    var ack = netd_proto.SwitchBindingsAckPayload{
+        .request_id = request.request_id,
+        .status = .ok,
+        .vmid = request.vmid,
+        .generation = request.generation,
+        .policy_revision = 0,
+    };
+    ack.policy_revision = switcher.replaceBindings(request.vmid, request.generation, request.expected_revision, .{
+        .ipv4_addresses = request.ipv4_addresses,
+        .ipv4_count = request.ipv4_count,
+        .ipv6_addresses = request.ipv6_addresses,
+        .ipv6_count = request.ipv6_count,
+    }) catch |err| {
+        ack.status = switch (err) {
+            error.InvalidBindings, error.AddressConflict => .invalid,
+            error.Stale => .stale,
+            error.RevisionExhausted => .no_capacity,
+        };
+        return ack;
+    };
+    return ack;
 }
 
 fn handleSwitchConfig(
@@ -582,22 +645,14 @@ fn handleSwitchConfig(
                 return;
             }
             const request: *align(1) const netd_proto.SwitchPortAttachPayload = @ptrFromInt(payload_va);
-            const generation = g_virtual_switch.attach(.{
-                .id = request.vmid,
-                .segment = request.segment,
-                .mac = request.mac,
-                .ipv4_addresses = request.ipv4_addresses,
-                .ipv4_count = request.ipv4_count,
-                .ipv6_addresses = request.ipv6_addresses,
-                .ipv6_count = request.ipv6_count,
-            });
+            const ack = applySwitchPortAttach(&g_virtual_switch, request);
             sendSwitchConfigAck(
                 page_hdr,
                 op,
-                if (generation == null) .invalid else .ok,
-                request.vmid,
-                generation orelse 0,
-                if (generation == null) 0 else 1,
+                ack.status,
+                ack.vmid,
+                ack.generation,
+                ack.policy_revision,
             );
         },
         .switch_port_detach => {
@@ -615,6 +670,15 @@ fn handleSwitchConfig(
                 request.generation,
                 0,
             );
+        },
+        .switch_bindings_replace => {
+            if (payload_len != @sizeOf(netd_proto.SwitchBindingsReplacePayload)) {
+                sendSwitchConfigAck(page_hdr, op, .invalid, 0, 0, 0);
+                return;
+            }
+            const request: *align(1) const netd_proto.SwitchBindingsReplacePayload = @ptrFromInt(payload_va);
+            const ack = applySwitchBindings(&g_virtual_switch, request);
+            _ = sendLocalSwitchMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .switch_bindings_ack, std.mem.asBytes(&ack));
         },
         .switch_policy_replace => {
             if (payload_len != @sizeOf(netd_proto.SwitchPolicyReplacePayload)) {
@@ -864,10 +928,10 @@ fn handleLocalNetdMessage(page_hdr: *align(1) const lib.PageHeader, recv_va: u64
             handleTcpStatus(page_hdr, msg_payload_va, msg_payload_len);
         },
         .tcp_status_reply => {},
-        .switch_port_attach, .switch_port_detach, .switch_policy_replace => {
+        .switch_port_attach, .switch_port_detach, .switch_policy_replace, .switch_bindings_replace => {
             handleSwitchConfig(page_hdr, msg_hdr.op, msg_payload_va, msg_payload_len);
         },
-        .switch_config_ack => {},
+        .switch_config_ack, .switch_bindings_ack => {},
     }
 }
 
@@ -1866,6 +1930,8 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
             const udp_dst_port = be16(f[56..58]);
             const udp_len = be16(f[58..60]);
             if (udp_dst_port == DIPC_UDP_PORT and udp_len >= 8) {
+                if (!isRemoteDipcSource(src_ip, &g_our_ipv6) or udp_len > payload_len or
+                    @as(usize, frame_len) < 54 + @as(usize, udp_len)) return;
                 const udp_payload = f[62..]; // after UDP header
                 const udp_payload_len = udp_len - 8;
                 if (udp_payload_len >= 4) {
@@ -1882,15 +1948,14 @@ fn handleFrame(frame_va: u64, frame_len: u32, token: u64) void {
                         if (scratch_hdr.version == DIPC_WIRE_VERSION and
                             @as(usize, scratch_hdr.header_len) == DIPC_HEADER_SIZE)
                         {
+                            if (@as(usize, scratch_hdr.payload_len) > copy_len - DIPC_HEADER_SIZE or
+                                !isRemoteDipcClaim(src_ip, &scratch_hdr.src.node.bytes, &g_our_ipv6)) return;
                             if (isAllNodesMulticast(&scratch_hdr.dst.node.bytes)) {
                                 for (g_our_ipv6, 0..) |byte, index| {
                                     scratch_hdr.dst.node.bytes[index] = byte;
                                 }
                             }
-                            if (isLoopbackIpv6(&scratch_hdr.src.node.bytes) or isUnspecifiedIpv6(&scratch_hdr.src.node.bytes)) {
-                                @memcpy(&scratch_hdr.src.node.bytes, src_ip);
-                            }
-                        }
+                        } else return;
 
                         _ = lib.syscall(SYS_SEND_PAGE, g_rx_dipc_scratch_phys, 0, token);
                     }
@@ -2186,4 +2251,60 @@ pub export fn umain() noreturn {
 export fn _user_start() callconv(.c) noreturn {
     umain();
     while (true) {}
+}
+
+test "switch binding request reports revisions and rejects invalid updates" {
+    var switcher: virtual_switch.Switch = .{};
+    const attach = netd_proto.SwitchPortAttachPayload{
+        .vmid = 7,
+        .segment = 1,
+        .mac = netd_proto.hostAssignedMac(7),
+        .ipv4_count = 0,
+        .ipv6_count = 0,
+    };
+    const initial = applySwitchPortAttach(&switcher, &attach);
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, initial.status);
+    try std.testing.expectEqual(@as(u64, 1), initial.policy_revision);
+
+    var request = netd_proto.SwitchBindingsReplacePayload{
+        .vmid = 7,
+        .generation = initial.generation,
+        .expected_revision = 1,
+        .request_id = 42,
+        .ipv4_count = 1,
+        .ipv6_count = 1,
+    };
+    request.ipv4_addresses[0] = .{ 10, 0, 0, 7 };
+    request.ipv6_addresses[0] = .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7 };
+    const updated = applySwitchBindings(&switcher, &request);
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, updated.status);
+    try std.testing.expectEqual(@as(u64, 42), updated.request_id);
+    try std.testing.expectEqual(@as(u64, 2), updated.policy_revision);
+    try std.testing.expectEqual(@as(u64, 2), applySwitchBindings(&switcher, &request).policy_revision);
+    const attach_retry = applySwitchPortAttach(&switcher, &attach);
+    try std.testing.expectEqual(initial.generation, attach_retry.generation);
+    try std.testing.expectEqual(@as(u64, 2), attach_retry.policy_revision);
+
+    request.generation += 1;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, applySwitchBindings(&switcher, &request).status);
+    request.generation = initial.generation;
+    request.expected_revision = 2;
+    request.ipv4_count = 5;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.invalid, applySwitchBindings(&switcher, &request).status);
+    try std.testing.expectEqual(@as(?u64, 2), switcher.policyRevision(7, initial.generation));
+}
+
+test "wire DIPC source cannot impersonate a local or unspecified node" {
+    const local = [_]u8{ 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const remote = [_]u8{ 0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    const loopback = lib.Ipv6Addr.loopback();
+    const unspecified: [16]u8 = @splat(0);
+    try std.testing.expect(isRemoteDipcSource(&remote, &local));
+    try std.testing.expect(!isRemoteDipcSource(&local, &local));
+    try std.testing.expect(!isRemoteDipcSource(&loopback.bytes, &local));
+    try std.testing.expect(!isRemoteDipcSource(&unspecified, &local));
+    try std.testing.expect(isRemoteDipcClaim(&remote, &remote, &local));
+    try std.testing.expect(!isRemoteDipcClaim(&remote, &local, &local));
+    try std.testing.expect(!isRemoteDipcClaim(&remote, &loopback.bytes, &local));
+    try std.testing.expect(!isRemoteDipcClaim(&loopback.bytes, &loopback.bytes, &local));
 }

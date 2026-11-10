@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const partition_metadata = @import("protocols/partition_metadata.zig");
+const storage_protocol = @import("protocols/storaged_protocol.zig");
 
 const SYS_REGISTER = 2;
 const SYS_RECV = 3;
@@ -34,10 +35,8 @@ fn printHex(n: u64) void {
 // ---------------------------------------------------------------------------
 
 /// Host-local block requests use a nonzero ID so responses can be correlated.
-const PART_VMID: u32 = 0xC0DE_0001;
-const PART_SECTORS = partition_metadata.PART_SECTORS;
+const PART_VMID: u32 = storage_protocol.HOST_METADATA_VMID;
 const MAX_PARTS = partition_metadata.MAX_PARTS;
-const PART_MAGIC = partition_metadata.PART_MAGIC;
 const BLK_WRITE_FUA: u32 = @backingInt(lib.BlkReqType.write_fua);
 
 const PartitionHeader = partition_metadata.Header;
@@ -59,7 +58,22 @@ fn partitionStart(slot: u32) u64 {
     return partition_metadata.startLba(slot);
 }
 
-const PartState = enum { scanning, priming, priming_flushing, idle, writing, flushing, verifying, done };
+const PartState = enum {
+    journal_reading,
+    journal_replaying,
+    journal_clearing,
+    journal_writing,
+    journal_flushing,
+    journal_clear_flushing,
+    scanning,
+    priming,
+    priming_flushing,
+    idle,
+    writing,
+    flushing,
+    verifying,
+    done,
+};
 const BlkRetry = struct {
     req_type: u32,
     sector: u64,
@@ -103,6 +117,22 @@ fn sendBlkRequest(
     return lib.syscall(SYS_SEND_PAGE, dipc_phys, 0, token) == 0;
 }
 
+fn isStorageReplyEnvelope(
+    page: *align(1) const lib.PageHeader,
+    control: *align(1) const lib.ControlHeader,
+) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    return page.magic == lib.WireMagic and page.version == lib.WireVersion and
+        page.header_len == lib.DIPC_HEADER_SIZE and
+        page.payload_len == lib.CONTROL_HEADER_SIZE + @sizeOf(lib.VirtioBlkResponsePayload) and
+        page.src.endpoint == @backingInt(lib.ReservedEndpoint.storaged) and
+        page.dst.endpoint == @backingInt(lib.ReservedEndpoint.containerd) and
+        std.mem.eql(u8, &page.src.node.bytes, &loopback.bytes) and
+        std.mem.eql(u8, &page.dst.node.bytes, &loopback.bytes) and
+        @as(*align(1) const u16, @ptrCast(&control.op)).* == @backingInt(lib.ControlOp.virtio_blk_response) and
+        control._reserved == 0 and control.payload_len == @sizeOf(lib.VirtioBlkResponsePayload);
+}
+
 fn sendTrackedBlkRequest(
     dipc_phys: u64,
     token: u64,
@@ -136,7 +166,7 @@ fn sendTrackedBlkRequest(
 
 fn markWriteCompleted(write_completed: *bool) void {
     if (!write_completed.*) {
-        lib.serialWrite("containerd: unpack block WRITE SUCCESS!\n");
+        lib.serialWrite("containerd: smoke block WRITE SUCCESS!\n");
         write_completed.* = true;
     }
 }
@@ -167,7 +197,7 @@ pub export fn umain() noreturn {
         data_va[i] = 0xAB; // Dummy layer byte
     }
 
-    const local_node = lib.queryCurrentNode(bs, token, dipc_phys, DMA_BASE_VA + 1 * 4096, container_endpoint) orelse lib.Ipv6Addr{ .bytes = bs.local_node };
+    const local_node = lib.Ipv6Addr.loopback();
     lib.serialWrite("containerd: sending image block to storaged...\n");
     var write_completed = false;
     var request_sequence: u16 = 0;
@@ -179,10 +209,18 @@ pub export fn umain() noreturn {
             _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
         }
     }
+    const journal_phys = lib.syscall(SYS_ALLOC_DMA, 1, 3, token);
+    if (journal_phys == 0) {
+        lib.serialWrite("containerd: journal DMA allocation failed\n");
+        while (true) {
+            _ = lib.syscall(lib.SYS_YIELD, 0, 0, token);
+        }
+    }
 
-    var part_state: PartState = .scanning;
+    var part_state: PartState = .journal_reading;
     var part_slot: u32 = 0;
     var scan_slot: u32 = 0;
+    var journal_recovery_pending_scan = false;
     if (!sendTrackedBlkRequest(
         dipc_phys,
         token,
@@ -190,13 +228,13 @@ pub export fn umain() noreturn {
         container_endpoint,
         bs.reserved_storaged_endpoint,
         0,
-        partitionStart(scan_slot),
+        partition_metadata.JOURNAL_LBA,
         verify_phys,
         512,
         &request_sequence,
         &pending_request_id,
     )) {
-        lib.serialWrite("containerd: initial partition scan send failed, will retry\n");
+        lib.serialWrite("containerd: initial journal read send failed, will retry\n");
     }
     lib.serialWrite("containerd: entering event loop\n");
 
@@ -215,6 +253,12 @@ pub export fn umain() noreturn {
                     part_state = .done;
                 } else {
                     const retry: BlkRetry = switch (part_state) {
+                        .journal_reading => .{ .req_type = 0, .sector = partition_metadata.JOURNAL_LBA, .data_phys = verify_phys, .data_len = 512 },
+                        .journal_replaying => .{ .req_type = BLK_WRITE_FUA, .sector = partitionStart(part_slot), .data_phys = data_phys, .data_len = 512 },
+                        .journal_clearing => .{ .req_type = BLK_WRITE_FUA, .sector = partition_metadata.JOURNAL_LBA, .data_phys = journal_phys, .data_len = 512 },
+                        .journal_writing => .{ .req_type = BLK_WRITE_FUA, .sector = partition_metadata.JOURNAL_LBA, .data_phys = journal_phys, .data_len = 512 },
+                        .journal_flushing => .{ .req_type = 4, .sector = partition_metadata.JOURNAL_LBA, .data_phys = 0, .data_len = 0 },
+                        .journal_clear_flushing => .{ .req_type = 4, .sector = partition_metadata.JOURNAL_LBA, .data_phys = 0, .data_len = 0 },
                         .scanning => .{ .req_type = 0, .sector = partitionStart(scan_slot), .data_phys = verify_phys, .data_len = 512 },
                         .priming => .{ .req_type = BLK_WRITE_FUA, .sector = 1024, .data_phys = data_phys, .data_len = 4096 },
                         .priming_flushing => .{ .req_type = 4, .sector = 1024, .data_phys = 0, .data_len = 0 },
@@ -240,23 +284,17 @@ pub export fn umain() noreturn {
             }
         }
 
-        // Once the smoke write is acknowledged, claim a persistent partition
-        // for the image and write its header to NVMe.
+        // Once the smoke write is acknowledged, commit a partition-header
+        // transaction through the reserved write-ahead journal sector.
         if (write_completed and part_state == .idle) {
             if (allocPartition()) |slot| {
                 part_slot = slot;
+                const journal_va: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA + 3 * 4096);
+                @memcpy(journal_va[0..512], &partition_metadata.makeJournalSector(slot, 1));
                 const hdr_va: *align(1) PartitionHeader = lib.ptrFrom(*align(1) PartitionHeader, DMA_BASE_VA);
                 @memset(lib.ptrFrom([*]u8, DMA_BASE_VA)[0..512], 0);
-                hdr_va.* = .{
-                    .magic = PART_MAGIC,
-                    .slot = slot,
-                    .start_lba = partitionStart(slot),
-                    .sectors = PART_SECTORS,
-                    .name = @splat(0),
-                };
-                @memcpy(hdr_va.name[0..6], "rootfs");
-                part_slot = slot;
-                part_state = .writing;
+                hdr_va.* = partition_metadata.makeHeader(slot);
+                part_state = .journal_writing;
                 pending_request_id = 0;
                 _ = sendTrackedBlkRequest(
                     dipc_phys,
@@ -265,13 +303,13 @@ pub export fn umain() noreturn {
                     container_endpoint,
                     bs.reserved_storaged_endpoint,
                     BLK_WRITE_FUA,
-                    partitionStart(slot),
-                    data_phys,
+                    partition_metadata.JOURNAL_LBA,
+                    journal_phys,
                     512,
                     &request_sequence,
                     &pending_request_id,
                 );
-                lib.serialWrite("containerd: partition header write requested\n");
+                lib.serialWrite("containerd: partition journal intent write requested\n");
             } else {
                 part_state = .done;
                 lib.serialWrite("containerd: no free partitions\n");
@@ -282,15 +320,18 @@ pub export fn umain() noreturn {
         if (page_phys != 0) {
             const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (recv_va != 0) {
+                const page_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
                 const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
-                if (control.op == .virtio_blk_response and control.payload_len >= @sizeOf(lib.VirtioBlkResponsePayload)) {
+                if (isStorageReplyEnvelope(page_header, control)) {
                     const response: *align(1) const lib.VirtioBlkResponsePayload = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(lib.ControlHeader));
                     if (response.vmid == PART_VMID and response.head_idx == pending_request_id) {
                         part_wait_ticks = 0;
                         part_retries = 0;
                         pending_request_id = 0;
                         if (response.status != 0) {
-                            if (part_state == .scanning) {
+                            if (part_state == .journal_reading) {
+                                lib.serialWrite("containerd: partition journal read failed\n");
+                            } else if (part_state == .scanning) {
                                 lib.serialWrite("containerd: partition metadata read failed at slot ");
                                 printHex(scan_slot);
                                 lib.serialWrite("\n");
@@ -298,14 +339,31 @@ pub export fn umain() noreturn {
                             lib.serialWrite("containerd: block I/O FAILED\n");
                             part_state = .done;
                         } else switch (part_state) {
-                            .scanning => {
+                            .journal_reading => {
                                 const verify: [*]const u8 = lib.ptrFrom([*]const u8, DMA_BASE_VA + 2 * 4096);
-                                if (partition_metadata.isValidHeader(verify[0..512], scan_slot)) {
-                                    part_used[scan_slot] = true;
-                                    lib.serialWrite("containerd: recovered partition metadata\n");
-                                }
-                                scan_slot += 1;
-                                if (scan_slot < MAX_PARTS) {
+                                if (partition_metadata.readJournalRecord(verify[0..512])) |record| {
+                                    part_slot = record.slot;
+                                    journal_recovery_pending_scan = true;
+                                    const replay_data_va: [*]u8 = lib.ptrFrom([*]u8, DMA_BASE_VA);
+                                    @memset(replay_data_va[0..512], 0);
+                                    @memcpy(replay_data_va[0..@sizeOf(PartitionHeader)], std.mem.asBytes(&record.header));
+                                    part_state = .journal_replaying;
+                                    _ = sendTrackedBlkRequest(
+                                        dipc_phys,
+                                        token,
+                                        local_node,
+                                        container_endpoint,
+                                        bs.reserved_storaged_endpoint,
+                                        BLK_WRITE_FUA,
+                                        partitionStart(part_slot),
+                                        data_phys,
+                                        512,
+                                        &request_sequence,
+                                        &pending_request_id,
+                                    );
+                                } else if (partition_metadata.isEmptySector(verify[0..512])) {
+                                    part_state = .scanning;
+                                    scan_slot = 0;
                                     _ = sendTrackedBlkRequest(
                                         dipc_phys,
                                         token,
@@ -320,21 +378,147 @@ pub export fn umain() noreturn {
                                         &pending_request_id,
                                     );
                                 } else {
-                                    lib.serialWrite("containerd: partition metadata scan complete\n");
-                                    part_state = .priming;
+                                    lib.serialWrite("containerd: invalid partition journal; refusing metadata recovery\n");
+                                    part_state = .done;
+                                }
+                            },
+                            .journal_replaying => {
+                                lib.serialWrite("containerd: journal recovery replayed slot ");
+                                printHex(part_slot);
+                                lib.serialWrite("\n");
+                                @memset(lib.ptrFrom([*]u8, DMA_BASE_VA + 3 * 4096)[0..512], 0);
+                                part_state = .journal_clearing;
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    BLK_WRITE_FUA,
+                                    partition_metadata.JOURNAL_LBA,
+                                    journal_phys,
+                                    512,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .journal_writing => {
+                                part_state = .journal_flushing;
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    4,
+                                    partition_metadata.JOURNAL_LBA,
+                                    0,
+                                    0,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .journal_flushing => {
+                                part_state = .writing;
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    BLK_WRITE_FUA,
+                                    partitionStart(part_slot),
+                                    data_phys,
+                                    512,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .journal_clearing => {
+                                part_state = .journal_clear_flushing;
+                                _ = sendTrackedBlkRequest(
+                                    dipc_phys,
+                                    token,
+                                    local_node,
+                                    container_endpoint,
+                                    bs.reserved_storaged_endpoint,
+                                    4,
+                                    partition_metadata.JOURNAL_LBA,
+                                    0,
+                                    0,
+                                    &request_sequence,
+                                    &pending_request_id,
+                                );
+                            },
+                            .journal_clear_flushing => {
+                                if (journal_recovery_pending_scan) {
+                                    journal_recovery_pending_scan = false;
+                                    lib.serialWrite("containerd: journal recovery complete\n");
+                                    part_state = .scanning;
+                                    scan_slot = 0;
                                     _ = sendTrackedBlkRequest(
                                         dipc_phys,
                                         token,
                                         local_node,
                                         container_endpoint,
                                         bs.reserved_storaged_endpoint,
-                                        1,
-                                        1024,
-                                        data_phys,
-                                        4096,
+                                        0,
+                                        partitionStart(scan_slot),
+                                        verify_phys,
+                                        512,
                                         &request_sequence,
                                         &pending_request_id,
                                     );
+                                } else {
+                                    lib.serialWrite("containerd: partition journal cleared\n");
+                                    part_state = .done;
+                                }
+                            },
+                            .scanning => {
+                                const verify: [*]const u8 = lib.ptrFrom([*]const u8, DMA_BASE_VA + 2 * 4096);
+                                if (partition_metadata.isValidHeader(verify[0..512], scan_slot)) {
+                                    part_used[scan_slot] = true;
+                                    lib.serialWrite("containerd: recovered partition metadata\n");
+                                } else if (!partition_metadata.isEmptySector(verify[0..512])) {
+                                    lib.serialWrite("containerd: invalid partition metadata; refusing slot reuse\n");
+                                    lib.serialWrite("containerd: invalid metadata slot ");
+                                    printHex(scan_slot);
+                                    lib.serialWrite("\n");
+                                    part_state = .done;
+                                }
+                                if (part_state != .done) {
+                                    scan_slot += 1;
+                                    if (scan_slot < MAX_PARTS) {
+                                        _ = sendTrackedBlkRequest(
+                                            dipc_phys,
+                                            token,
+                                            local_node,
+                                            container_endpoint,
+                                            bs.reserved_storaged_endpoint,
+                                            0,
+                                            partitionStart(scan_slot),
+                                            verify_phys,
+                                            512,
+                                            &request_sequence,
+                                            &pending_request_id,
+                                        );
+                                    } else {
+                                        lib.serialWrite("containerd: partition metadata scan complete\n");
+                                        part_state = .priming;
+                                        _ = sendTrackedBlkRequest(
+                                            dipc_phys,
+                                            token,
+                                            local_node,
+                                            container_endpoint,
+                                            bs.reserved_storaged_endpoint,
+                                            1,
+                                            1024,
+                                            data_phys,
+                                            4096,
+                                            &request_sequence,
+                                            &pending_request_id,
+                                        );
+                                    }
                                 }
                             },
                             .priming => {
@@ -390,13 +574,28 @@ pub export fn umain() noreturn {
                                 );
                             },
                             .verifying => {
-                                const got: *align(1) const PartitionHeader = lib.ptrFrom(*align(1) const PartitionHeader, DMA_BASE_VA + 2 * 4096);
-                                if (got.magic == PART_MAGIC and got.slot == part_slot) {
-                                    lib.serialWrite("containerd: partition mounted on NVMe, header verified after flush\n");
+                                const verify: [*]const u8 = lib.ptrFrom([*]const u8, DMA_BASE_VA + 2 * 4096);
+                                if (partition_metadata.isValidHeader(verify[0..512], part_slot)) {
+                                    lib.serialWrite("containerd: partition header verified after flush\n");
+                                    @memset(lib.ptrFrom([*]u8, DMA_BASE_VA + 3 * 4096)[0..512], 0);
+                                    part_state = .journal_clearing;
+                                    _ = sendTrackedBlkRequest(
+                                        dipc_phys,
+                                        token,
+                                        local_node,
+                                        container_endpoint,
+                                        bs.reserved_storaged_endpoint,
+                                        BLK_WRITE_FUA,
+                                        partition_metadata.JOURNAL_LBA,
+                                        journal_phys,
+                                        512,
+                                        &request_sequence,
+                                        &pending_request_id,
+                                    );
                                 } else {
                                     lib.serialWrite("containerd: partition verify MISMATCH\n");
+                                    part_state = .done;
                                 }
-                                part_state = .done;
                             },
                             .idle, .done => {},
                         }
@@ -419,4 +618,30 @@ pub export fn umain() noreturn {
 export fn _user_start() callconv(.c) noreturn {
     umain();
     while (true) {}
+}
+
+test "host storage replies require the local storaged endpoint" {
+    var page = lib.PageHeader{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = lib.CONTROL_HEADER_SIZE + @sizeOf(lib.VirtioBlkResponsePayload),
+        .auth_tag = 0,
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.storaged) },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.containerd) },
+    };
+    var control = lib.ControlHeader{ .op = .virtio_blk_response, .payload_len = @sizeOf(lib.VirtioBlkResponsePayload) };
+    try std.testing.expect(isStorageReplyEnvelope(&page, &control));
+    page.src.node.bytes[0] = 0xFE;
+    try std.testing.expect(!isStorageReplyEnvelope(&page, &control));
+    page.src.node = lib.Ipv6Addr.loopback();
+    page.src.endpoint = @backingInt(lib.ReservedEndpoint.netd);
+    try std.testing.expect(!isStorageReplyEnvelope(&page, &control));
+    page.src.endpoint = @backingInt(lib.ReservedEndpoint.storaged);
+    page.payload_len -= 1;
+    try std.testing.expect(!isStorageReplyEnvelope(&page, &control));
+    page.payload_len += 1;
+    const op: *align(1) u16 = @ptrCast(&control.op);
+    op.* = 0xFFFF;
+    try std.testing.expect(!isStorageReplyEnvelope(&page, &control));
 }

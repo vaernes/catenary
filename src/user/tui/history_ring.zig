@@ -5,7 +5,7 @@ const std = @import("std");
 /// (in-progress typing) stashing and restoration.
 pub const HistoryRing = struct {
     pub const CAPACITY: usize = 16;
-    pub const MAX_CMD_LEN: usize = 64;
+    pub const MAX_CMD_LEN: usize = 96;
 
     entries: [CAPACITY][MAX_CMD_LEN]u8 = @splat(@splat(0)),
     lens: [CAPACITY]usize = @splat(0),

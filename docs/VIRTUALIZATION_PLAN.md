@@ -72,6 +72,11 @@ test result:
   backend also rejects TX queue processing and RX injection unless the registry
   still reports the VM as running; a kernel regression test covers both paths
   after a stop request.
+  Safe reclamation is additionally blocked by incomplete ownership and
+  invalidation mechanisms: the guest pool records only a page count, not the
+  allocated page addresses; the VMCS is not cleared from its host CPU on the
+  final exit; and the VMX code has no INVEPT path before EPT pages could be
+  reused. Until all three are addressed, these allocations must remain retained.
 * The [QEMU smoke script](../test_qemu.sh) defines Linux guest serial milestones
   and can run Catenary inside QEMU accelerated by the **external host's** KVM.
   Its presence is not a recorded successful run. Some
@@ -130,6 +135,11 @@ same evidence as a direct-boot MicroVM with a custom Linux kernel.
   space/EPT root, RAM and MMIO map, device/IRQ routing, clocks, volumes, console,
   network ports, and, for full VMs, firmware variables and optional vTPM state.
   No VM may address another VM's pages, devices, queues, variables, or keys.
+  The current local registry allocates monotonically increasing 32-bit VM IDs
+  and fails closed at counter exhaustion instead of wrapping to an ID that may
+  still appear in a stale message. This counter is not durable across host
+  reboot and is not the stable, generation-bearing identity required by the
+  target design.
 * Each **vCPU** has its own VMCS, registers including extended/FPU state,
   control/MSR state, interruptibility and pending events, local APIC/timers, and
   scheduling/accounting state. vCPUs of one VM share that VM's EPT under

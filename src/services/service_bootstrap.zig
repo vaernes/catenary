@@ -37,6 +37,11 @@ pub fn isAuthorizedSourceEndpoint(kind: ServiceKind, endpoint: identity.Endpoint
     return endpoint == expected;
 }
 
+pub fn isAuthorizedSourceClaim(kind: ServiceKind, endpoint: identity.EndpointId, remote: bool, cluster_tag_valid: bool) bool {
+    if (!remote) return isAuthorizedSourceEndpoint(kind, endpoint);
+    return kind == .netd and cluster_tag_valid;
+}
+
 test "reserved endpoint identity is bound to the service kind" {
     try std.testing.expectEqual(
         @as(?identity.EndpointId, @backingInt(identity.ReservedEndpoint.netd)),
@@ -55,6 +60,15 @@ test "reserved endpoint identity is bound to the service kind" {
         .configd,
         @backingInt(identity.ReservedEndpoint.clusterd),
     ));
+}
+
+test "remote source claims require authenticated netd forwarding" {
+    const remote_endpoint = @backingInt(identity.ReservedEndpoint.clusterd);
+    try std.testing.expect(isAuthorizedSourceClaim(.netd, remote_endpoint, true, true));
+    try std.testing.expect(!isAuthorizedSourceClaim(.netd, remote_endpoint, true, false));
+    try std.testing.expect(!isAuthorizedSourceClaim(.clusterd, remote_endpoint, true, true));
+    try std.testing.expect(!isAuthorizedSourceClaim(.netd, remote_endpoint, false, true));
+    try std.testing.expect(isAuthorizedSourceClaim(.netd, @backingInt(identity.ReservedEndpoint.netd), false, false));
 }
 
 pub const UserId = enum(u32) {

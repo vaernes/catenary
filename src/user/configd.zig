@@ -1,3 +1,4 @@
+const std = @import("std");
 const lib = @import("lib.zig");
 
 /// configd — OS Configuration Application
@@ -15,13 +16,14 @@ const lib = @import("lib.zig");
 ///   'r' — Refresh display
 ///   'q' — Shutdown request (idles)
 const configd_proto = @import("protocols/configd_protocol.zig");
+const netd_proto = @import("protocols/netd_protocol.zig");
 
 // ---------------------------------------------------------------------------
 // Syscall shim
 // ---------------------------------------------------------------------------
 
 const SYS_REGISTER = lib.SYS_REGISTER;
-const SYS_RECV = lib.SYS_RECV;
+const SYS_TRY_RECV = lib.SYS_TRY_RECV;
 const SYS_FREE_PAGE = lib.SYS_FREE_PAGE;
 const SYS_ALLOC_DMA = lib.SYS_ALLOC_DMA;
 const SYS_SEND_PAGE = lib.SYS_SEND_PAGE;
@@ -50,6 +52,305 @@ const DMA_DIPC_SLOT: u64 = DMA_BASE_VA + PAGE_SIZE;
 
 const BootstrapDescriptor = lib.BootstrapDescriptor;
 
+fn sendVmSnapshotRequest(bs: *const BootstrapDescriptor, token: u64, dma_phys: u64) bool {
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_DIPC_SLOT);
+    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @intCast(lib.CONTROL_HEADER_SIZE),
+        .auth_tag = 0,
+        .src = .{ .node = local_node, .endpoint = EP_CONFIGD },
+        .dst = .{ .node = local_node, .endpoint = @backingInt(lib.ReservedEndpoint.kernel_control) },
+    };
+    const control: *align(1) lib.ControlHeader = @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    control.* = .{ .op = .list_microvms, .payload_len = 0 };
+    return lib.syscall(SYS_SEND_PAGE, dma_phys, 0, token) == 0;
+}
+
+fn sendNetdConfig(
+    bs: *const BootstrapDescriptor,
+    token: u64,
+    dma_phys: u64,
+    op: netd_proto.Op,
+    payload: []const u8,
+) bool {
+    const payload_len = @sizeOf(netd_proto.NetdHeader) + payload.len;
+    if (lib.DIPC_HEADER_SIZE + payload_len > lib.PAGE_SIZE) return false;
+
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_DIPC_SLOT);
+    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @intCast(payload_len),
+        .auth_tag = 0,
+        .src = .{ .node = local_node, .endpoint = EP_CONFIGD },
+        .dst = .{ .node = local_node, .endpoint = EP_NETD },
+    };
+    const netd_header: *align(1) netd_proto.NetdHeader =
+        @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    netd_header.* = .{ .op = op };
+    if (payload.len > 0) {
+        @memcpy(
+            scratch[lib.DIPC_HEADER_SIZE + @sizeOf(netd_proto.NetdHeader) ..][0..payload.len],
+            payload,
+        );
+    }
+    return lib.syscall(SYS_SEND_PAGE, dma_phys, 0, token) == 0;
+}
+
+fn sendLocalConfigReply(token: u64, dma_phys: u64, op: configd_proto.Op, payload: []const u8) bool {
+    const payload_len = @sizeOf(configd_proto.ConfigdHeader) + payload.len;
+    if (lib.DIPC_HEADER_SIZE + payload_len > lib.PAGE_SIZE) return false;
+
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_DIPC_SLOT);
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @intCast(payload_len),
+        .auth_tag = 0,
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = EP_CONFIGD },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = EP_WINDOWD },
+    };
+    const config_header: *align(1) configd_proto.ConfigdHeader =
+        @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    config_header.* = .{ .op = op, .payload_len = @intCast(payload.len) };
+    if (payload.len > 0) {
+        @memcpy(scratch[lib.DIPC_HEADER_SIZE + @sizeOf(configd_proto.ConfigdHeader) ..][0..payload.len], payload);
+    }
+    return lib.syscall(SYS_SEND_PAGE, dma_phys, 0, token) == 0;
+}
+
+fn findNetworkPort(vmid: u32) ?*NetworkPort {
+    for (&network_ports) |*port| {
+        if (port.used and port.vmid == vmid) return port;
+    }
+    return null;
+}
+
+fn vmIsRunning(snapshot: *align(1) const lib.VmSnapshotListPayload, vmid: u32) bool {
+    const count = @min(@as(usize, snapshot.count), snapshot.entries.len);
+    for (snapshot.entries[0..count]) |entry| {
+        if (entry.instance_id == vmid and entry.state == VM_STATE_RUNNING) return true;
+    }
+    return false;
+}
+
+fn requestPortAttach(bs: *const BootstrapDescriptor, token: u64, dma_phys: u64, port: *NetworkPort) void {
+    const request = netd_proto.SwitchPortAttachPayload{
+        .vmid = port.vmid,
+        .segment = DEFAULT_LOCAL_SEGMENT,
+        .mac = netd_proto.hostAssignedMac(port.vmid),
+        .ipv4_count = 0,
+        .ipv6_count = 0,
+    };
+    if (sendNetdConfig(bs, token, dma_phys, .switch_port_attach, std.mem.asBytes(&request))) {
+        port.state = .attach_pending;
+    } else {
+        lib.serialWrite("configd: vNIC attach request send failed\n");
+    }
+}
+
+fn progressPendingBindings(bs: *const BootstrapDescriptor, token: u64, dma_phys: u64, port: *NetworkPort) void {
+    const request = port.pending_bindings orelse return;
+    if (port.pending_binding_reply) |reply| {
+        if (sendLocalConfigReply(token, dma_phys, .local_bindings_reply, std.mem.asBytes(&reply))) {
+            port.pending_bindings = null;
+            port.pending_binding_reply = null;
+            if (reply.status == .ok) lib.serialWrite("configd: vNIC address bindings updated (default-deny)\n");
+        }
+    } else {
+        _ = sendNetdConfig(bs, token, dma_phys, .switch_bindings_replace, std.mem.asBytes(&request));
+    }
+}
+
+fn reconcileNetworkPorts(
+    bs: *const BootstrapDescriptor,
+    token: u64,
+    dma_phys: u64,
+    snapshot: *align(1) const lib.VmSnapshotListPayload,
+) void {
+    const count = @min(@as(usize, snapshot.count), snapshot.entries.len);
+    for (snapshot.entries[0..count]) |entry| {
+        if (entry.instance_id == 0 or entry.state != VM_STATE_RUNNING) continue;
+        if (findNetworkPort(entry.instance_id) != null) continue;
+
+        var free_port: ?*NetworkPort = null;
+        for (&network_ports) |*port| {
+            if (!port.used) {
+                free_port = port;
+                break;
+            }
+        }
+        const port = free_port orelse {
+            lib.serialWrite("configd: vNIC table full; VM remains unconfigured\n");
+            continue;
+        };
+        port.* = .{ .used = true, .vmid = entry.instance_id };
+    }
+
+    for (&network_ports) |*port| {
+        if (!port.used) continue;
+        const is_running = vmIsRunning(snapshot, port.vmid);
+        if (is_running) {
+            if (port.state == .unused or port.state == .attach_pending) {
+                requestPortAttach(bs, token, dma_phys, port);
+            } else if (port.state == .attached) {
+                progressPendingBindings(bs, token, dma_phys, port);
+            }
+        } else if (port.state == .attached or port.state == .detach_pending) {
+            if (port.pending_bindings) |request| {
+                const reply = port.pending_binding_reply orelse configd_proto.LocalBindingsReply{
+                    .request_id = request.request_id,
+                    .vmid = request.vmid,
+                    .status = .stale,
+                    .generation = request.generation,
+                    .policy_revision = 0,
+                };
+                _ = sendLocalConfigReply(token, dma_phys, .local_bindings_reply, std.mem.asBytes(&reply));
+                port.pending_bindings = null;
+                port.pending_binding_reply = null;
+            }
+            const request = netd_proto.SwitchPortDetachPayload{
+                .vmid = port.vmid,
+                .generation = port.generation,
+            };
+            if (sendNetdConfig(bs, token, dma_phys, .switch_port_detach, std.mem.asBytes(&request))) {
+                port.state = .detach_pending;
+            } else {
+                lib.serialWrite("configd: vNIC detach request send failed\n");
+            }
+        }
+    }
+}
+
+fn handleVmSnapshot(
+    bs: *const BootstrapDescriptor,
+    token: u64,
+    dma_phys: u64,
+    recv_va: u64,
+) void {
+    const snapshot: *align(1) const lib.VmSnapshotListPayload =
+        @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+    lib.serialWrite("configd: VM lifecycle snapshot received\n");
+    reconcileNetworkPorts(bs, token, dma_phys, snapshot);
+}
+
+fn handleNetdConfigAck(bs: *const BootstrapDescriptor, recv_va: u64, payload_len: usize) void {
+    const page_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+    const netd_header: *align(1) const netd_proto.NetdHeader =
+        @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+    if (!isNetdConfigAckEnvelope(page_header, netd_header, payload_len, &bs.local_node)) {
+        lib.serialWrite("configd: invalid netd configuration response length\n");
+        return;
+    }
+    const ack: *align(1) const netd_proto.SwitchConfigAckPayload =
+        @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(netd_proto.NetdHeader));
+    const port = findNetworkPort(ack.vmid) orelse return;
+    switch (applySwitchConfigAck(port, ack)) {
+        .attached => lib.serialWrite("configd: host-assigned vNIC attached (default-deny)\n"),
+        .attach_rejected => lib.serialWrite("configd: vNIC attach rejected by netd\n"),
+        .detached => lib.serialWrite("configd: vNIC detached\n"),
+        .detach_rejected => lib.serialWrite("configd: vNIC detach rejected by netd\n"),
+        .ignored => {},
+    }
+}
+
+fn handleNetdBindingsAck(bs: *const BootstrapDescriptor, token: u64, dma_phys: u64, recv_va: u64, payload_len: usize) void {
+    const page_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+    const netd_header: *align(1) const netd_proto.NetdHeader =
+        @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+    if (!isNetdAckEnvelope(page_header, netd_header, payload_len, &bs.local_node, .switch_bindings_ack, @sizeOf(netd_proto.SwitchBindingsAckPayload))) return;
+    const ack: *align(1) const netd_proto.SwitchBindingsAckPayload =
+        @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(netd_proto.NetdHeader));
+    const port = findNetworkPort(ack.vmid) orelse return;
+    if (!applySwitchBindingsAck(port, ack)) return;
+    progressPendingBindings(bs, token, dma_phys, port);
+}
+
+fn isNetdConfigAckEnvelope(
+    page: *align(1) const lib.PageHeader,
+    netd: *align(1) const netd_proto.NetdHeader,
+    payload_len: usize,
+    local_node: *const [16]u8,
+) bool {
+    return isNetdAckEnvelope(page, netd, payload_len, local_node, .switch_config_ack, @sizeOf(netd_proto.SwitchConfigAckPayload));
+}
+
+fn isNetdAckEnvelope(
+    page: *align(1) const lib.PageHeader,
+    netd: *align(1) const netd_proto.NetdHeader,
+    payload_len: usize,
+    local_node: *const [16]u8,
+    expected_op: netd_proto.Op,
+    body_size: usize,
+) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    return payload_len == @sizeOf(netd_proto.NetdHeader) + body_size and
+        page.magic == lib.WireMagic and
+        page.version == lib.WireVersion and
+        page.header_len == lib.DIPC_HEADER_SIZE and
+        page.payload_len == payload_len and
+        page.src.endpoint == EP_NETD and
+        page.dst.endpoint == EP_CONFIGD and
+        std.mem.eql(u8, &page.src.node.bytes, &loopback.bytes) and
+        std.mem.eql(u8, &page.dst.node.bytes, local_node) and
+        netd.magic == netd_proto.MAGIC and
+        netd.version == netd_proto.VERSION and
+        @as(*align(1) const u16, @ptrCast(&netd.op)).* == @backingInt(expected_op);
+}
+
+fn isLocalWindowdRequest(page: *align(1) const lib.PageHeader) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    return page.magic == lib.WireMagic and
+        page.version == lib.WireVersion and
+        page.header_len == lib.DIPC_HEADER_SIZE and
+        page.src.endpoint == EP_WINDOWD and
+        page.dst.endpoint == EP_CONFIGD and
+        std.mem.eql(u8, &page.src.node.bytes, &loopback.bytes) and
+        std.mem.eql(u8, &page.dst.node.bytes, &loopback.bytes);
+}
+
+fn handleLocalSwitchAdmin(bs: *const BootstrapDescriptor, token: u64, dma_phys: u64, recv_va: u64) void {
+    const page: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+    if (!isLocalWindowdRequest(page) or page.payload_len < @sizeOf(configd_proto.ConfigdHeader)) return;
+    const header: *align(1) const configd_proto.ConfigdHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+    if (header.magic != configd_proto.MAGIC or header.version != configd_proto.VERSION or
+        header.payload_len != page.payload_len - @sizeOf(configd_proto.ConfigdHeader)) return;
+    const op = @as(*align(1) const u16, @ptrCast(&header.op)).*;
+    const body_va = recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(configd_proto.ConfigdHeader);
+    if (op == @backingInt(configd_proto.Op.local_port_status)) {
+        if (header.payload_len != @sizeOf(configd_proto.LocalPortStatusRequest)) return;
+        const request: *align(1) const configd_proto.LocalPortStatusRequest = @ptrFromInt(body_va);
+        const reply = makeLocalPortStatus(findNetworkPort(request.vmid), request);
+        _ = sendLocalConfigReply(token, dma_phys, .local_port_status_reply, std.mem.asBytes(&reply));
+    } else if (op == @backingInt(configd_proto.Op.local_bindings_replace)) {
+        if (header.payload_len != @sizeOf(configd_proto.LocalBindingsRequest)) return;
+        const request: *align(1) const configd_proto.LocalBindingsRequest = @ptrFromInt(body_va);
+        const port = findNetworkPort(request.vmid);
+        const status = if (port) |found| beginSwitchBindings(found, request) else netd_proto.SwitchConfigStatus.stale;
+        if (status == .ok) {
+            progressPendingBindings(bs, token, dma_phys, port.?);
+        } else {
+            const reply = configd_proto.LocalBindingsReply{
+                .request_id = request.request_id,
+                .vmid = request.vmid,
+                .status = status,
+                .generation = request.generation,
+                .policy_revision = 0,
+            };
+            _ = sendLocalConfigReply(token, dma_phys, .local_bindings_reply, std.mem.asBytes(&reply));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared DIPC / control protocol constants
 // ---------------------------------------------------------------------------
@@ -57,6 +358,11 @@ const BootstrapDescriptor = lib.BootstrapDescriptor;
 const EP_CLUSTERD: u64 = 7;
 const EP_WINDOWD: u64 = 9;
 const EP_CONFIGD: u64 = 10;
+const EP_NETD: u64 = @backingInt(lib.ReservedEndpoint.netd);
+const VM_STATE_RUNNING: u8 = 2;
+const DEFAULT_LOCAL_SEGMENT: u64 = 1;
+const SNAPSHOT_INTERVAL_TICKS: u32 = 20_000;
+const SNAPSHOT_TIMEOUT_TICKS: u32 = 100_000;
 
 // ---------------------------------------------------------------------------
 // Intra-service state
@@ -80,6 +386,127 @@ const VmEntry = struct {
 var cluster_nodes: [MAX_CLUSTER_NODES]NodeEntry = @splat(.{});
 var vms: [MAX_VMS]VmEntry = @splat(.{});
 var next_vmid: u32 = 1;
+
+const NetworkPortState = enum {
+    unused,
+    attach_pending,
+    attached,
+    detach_pending,
+};
+
+const NetworkPort = struct {
+    used: bool = false,
+    vmid: u32 = 0,
+    generation: u64 = 0,
+    policy_revision: u64 = 0,
+    state: NetworkPortState = .unused,
+    pending_bindings: ?netd_proto.SwitchBindingsReplacePayload = null,
+    pending_binding_reply: ?netd_proto.SwitchBindingsAckPayload = null,
+};
+
+var network_ports: [MAX_VMS]NetworkPort = @splat(.{});
+
+const ConfigAckTransition = enum {
+    ignored,
+    attached,
+    attach_rejected,
+    detached,
+    detach_rejected,
+};
+
+fn applySwitchConfigAck(port: *NetworkPort, ack: *align(1) const netd_proto.SwitchConfigAckPayload) ConfigAckTransition {
+    if (!port.used or ack.vmid != port.vmid) return .ignored;
+
+    const request_op = @as(*align(1) const u16, @ptrCast(&ack.request_op)).*;
+    const status = @as(*align(1) const u16, @ptrCast(&ack.status)).*;
+    if (request_op == @backingInt(netd_proto.Op.switch_port_attach)) {
+        if (port.state != .attach_pending) return .ignored;
+        if (status != @backingInt(netd_proto.SwitchConfigStatus.ok)) {
+            if (status > @backingInt(netd_proto.SwitchConfigStatus.no_capacity)) return .ignored;
+            port.* = .{};
+            return .attach_rejected;
+        }
+        if (ack.generation == 0 or ack.policy_revision == 0) return .ignored;
+        port.generation = ack.generation;
+        port.policy_revision = ack.policy_revision;
+        port.state = .attached;
+        return .attached;
+    }
+    if (request_op == @backingInt(netd_proto.Op.switch_port_detach)) {
+        if (port.state != .detach_pending or ack.generation != port.generation) return .ignored;
+        if (status == @backingInt(netd_proto.SwitchConfigStatus.ok)) {
+            port.* = .{};
+            return .detached;
+        }
+        if (status > @backingInt(netd_proto.SwitchConfigStatus.no_capacity)) return .ignored;
+        port.state = .attached;
+        return .detach_rejected;
+    }
+    return .ignored;
+}
+
+fn makeLocalPortStatus(port: ?*const NetworkPort, request: *align(1) const configd_proto.LocalPortStatusRequest) configd_proto.LocalPortStatusReply {
+    var reply = configd_proto.LocalPortStatusReply{
+        .request_id = request.request_id,
+        .vmid = request.vmid,
+        .status = .stale,
+        .generation = 0,
+        .policy_revision = 0,
+    };
+    if (request.request_id == 0 or request.vmid == 0 or request._reserved != 0) {
+        reply.status = .invalid;
+    } else if (port) |found| {
+        if (found.used and found.state == .attached) {
+            reply.status = if (found.pending_bindings == null) .ok else .no_capacity;
+            reply.generation = found.generation;
+            reply.policy_revision = found.policy_revision;
+        }
+    }
+    return reply;
+}
+
+fn beginSwitchBindings(port: *NetworkPort, request: *align(1) const netd_proto.SwitchBindingsReplacePayload) netd_proto.SwitchConfigStatus {
+    if (request.request_id == 0 or request.vmid == 0 or request._reserved != 0 or
+        !std.mem.allEqual(u8, &request._pad, 0) or
+        request.ipv4_count > request.ipv4_addresses.len or request.ipv6_count > request.ipv6_addresses.len)
+    {
+        return .invalid;
+    }
+    if (!port.used or port.state != .attached or request.vmid != port.vmid or
+        request.generation != port.generation)
+    {
+        return .stale;
+    }
+    if (port.pending_bindings) |pending| {
+        return if (std.meta.eql(pending, request.*)) .ok else .no_capacity;
+    }
+    if (request.expected_revision != port.policy_revision) return .stale;
+    port.pending_bindings = request.*;
+    return .ok;
+}
+
+fn applySwitchBindingsAck(port: *NetworkPort, ack: *align(1) const netd_proto.SwitchBindingsAckPayload) bool {
+    const pending = port.pending_bindings orelse return false;
+    if (!port.used or port.state != .attached or ack.vmid != port.vmid or
+        ack.request_id != pending.request_id or ack.generation != pending.generation or
+        ack._reserved != 0)
+    {
+        return false;
+    }
+    const status = @as(*align(1) const u16, @ptrCast(&ack.status)).*;
+    if (status > @backingInt(netd_proto.SwitchConfigStatus.no_capacity)) return false;
+    if (port.pending_binding_reply) |reply| return std.meta.eql(reply, ack.*);
+    if (status == @backingInt(netd_proto.SwitchConfigStatus.ok)) {
+        const next_revision = std.math.add(u64, pending.expected_revision, 1) catch return false;
+        if (ack.policy_revision != next_revision or
+            (port.policy_revision != pending.expected_revision and port.policy_revision != next_revision)) return false;
+        port.policy_revision = ack.policy_revision;
+    } else if (ack.policy_revision != 0) {
+        return false;
+    }
+    port.pending_binding_reply = ack.*;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Serial helpers (for debug output before windowd is ready)
@@ -449,26 +876,73 @@ pub export fn umain() noreturn {
     // (windowd owns the framebuffer — configd is now a headless data backend)
     lib.serialWrite("configd: started (headless mode, windowd owns UI)\n");
 
+    var snapshot_requested = false;
+    var snapshot_interval: u32 = 0;
+    var snapshot_wait: u32 = 0;
+    if (sendVmSnapshotRequest(bs, token, dipc_phys)) {
+        snapshot_requested = true;
+        lib.serialWrite("configd: VM lifecycle snapshot requested\n");
+    } else {
+        lib.serialWrite("configd: initial VM snapshot request failed\n");
+    }
+
     // Main event loop — receive DIPC messages; UI is handled by windowd
     while (true) {
         // --- Poll DIPC inbox ---
-        const page_phys = lib.syscall(SYS_RECV, 0, 0, token);
+        const page_phys = lib.syscall(SYS_TRY_RECV, 0, 0, token);
         if (page_phys != 0) {
             const recv_va = lib.syscall(SYS_MAP_RECV, page_phys, 0, token);
             if (recv_va != 0) {
-                const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
-                switch (control.op) {
-                    .registry_sync => {
-                        handleRegistrySync(recv_va);
-                    },
-                    .list_microvms => {
-                        handleListMicrovms(bs, token, text_phys, recv_va);
-                    },
-                    else => {},
+                const page_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+                if (page_header.src.endpoint == @backingInt(lib.ReservedEndpoint.kernel_control) and
+                    page_header.payload_len == @sizeOf(lib.VmSnapshotListPayload))
+                {
+                    handleVmSnapshot(bs, token, dipc_phys, recv_va);
+                    snapshot_requested = false;
+                    snapshot_wait = 0;
+                } else if (page_header.src.endpoint == EP_NETD and
+                    page_header.payload_len == @sizeOf(netd_proto.NetdHeader) + @sizeOf(netd_proto.SwitchConfigAckPayload))
+                {
+                    handleNetdConfigAck(bs, recv_va, page_header.payload_len);
+                } else if (page_header.src.endpoint == EP_NETD and
+                    page_header.payload_len == @sizeOf(netd_proto.NetdHeader) + @sizeOf(netd_proto.SwitchBindingsAckPayload))
+                {
+                    handleNetdBindingsAck(bs, token, dipc_phys, recv_va, page_header.payload_len);
+                } else if (page_header.src.endpoint == EP_WINDOWD) {
+                    handleLocalSwitchAdmin(bs, token, dipc_phys, recv_va);
+                } else if (page_header.payload_len >= lib.CONTROL_HEADER_SIZE) {
+                    const control: *align(1) const lib.ControlHeader = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+                    switch (control.op) {
+                        .registry_sync => {
+                            handleRegistrySync(recv_va);
+                        },
+                        .list_microvms => {
+                            handleListMicrovms(bs, token, text_phys, recv_va);
+                        },
+                        else => {},
+                    }
                 }
                 _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
             } else {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            }
+        }
+
+        snapshot_interval +%= 1;
+        if (snapshot_requested) {
+            snapshot_wait +%= 1;
+            if (snapshot_wait >= SNAPSHOT_TIMEOUT_TICKS) {
+                snapshot_requested = false;
+                snapshot_wait = 0;
+                lib.serialWrite("configd: VM snapshot request timed out\n");
+            }
+        } else if (snapshot_interval >= SNAPSHOT_INTERVAL_TICKS) {
+            snapshot_interval = 0;
+            if (sendVmSnapshotRequest(bs, token, dipc_phys)) {
+                snapshot_requested = true;
+                lib.serialWrite("configd: VM lifecycle snapshot requested\n");
+            } else {
+                lib.serialWrite("configd: VM snapshot request send failed\n");
             }
         }
 
@@ -480,4 +954,236 @@ pub export fn umain() noreturn {
 export fn _user_start() callconv(.c) noreturn {
     umain();
     while (true) {}
+}
+
+test "switch attach acknowledgements require a matching pending request and valid generation" {
+    var port = NetworkPort{ .used = true, .vmid = 7, .state = .attach_pending };
+    var ack = netd_proto.SwitchConfigAckPayload{
+        .request_op = .switch_port_attach,
+        .status = .ok,
+        .vmid = 7,
+        .generation = 0,
+        .policy_revision = 1,
+    };
+
+    try std.testing.expectEqual(ConfigAckTransition.ignored, applySwitchConfigAck(&port, &ack));
+    try std.testing.expectEqual(NetworkPortState.attach_pending, port.state);
+
+    ack.generation = 3;
+    ack.policy_revision = 0;
+    try std.testing.expectEqual(ConfigAckTransition.ignored, applySwitchConfigAck(&port, &ack));
+    try std.testing.expectEqual(NetworkPortState.attach_pending, port.state);
+
+    ack.policy_revision = 1;
+    ack.vmid = 8;
+    try std.testing.expectEqual(ConfigAckTransition.ignored, applySwitchConfigAck(&port, &ack));
+    try std.testing.expectEqual(NetworkPortState.attach_pending, port.state);
+
+    ack.vmid = 7;
+    try std.testing.expectEqual(ConfigAckTransition.attached, applySwitchConfigAck(&port, &ack));
+    try std.testing.expectEqual(NetworkPortState.attached, port.state);
+    try std.testing.expectEqual(@as(u64, 3), port.generation);
+}
+
+test "switch acknowledgements with unknown enum values leave port state unchanged" {
+    var port = NetworkPort{ .used = true, .vmid = 11, .state = .attach_pending };
+    var ack = netd_proto.SwitchConfigAckPayload{
+        .request_op = .switch_port_attach,
+        .status = .ok,
+        .vmid = 11,
+        .generation = 2,
+        .policy_revision = 1,
+    };
+    const request_op: *align(1) u16 = @ptrCast(&ack.request_op);
+    request_op.* = 0xFFFF;
+    try std.testing.expectEqual(ConfigAckTransition.ignored, applySwitchConfigAck(&port, &ack));
+    try std.testing.expectEqual(NetworkPortState.attach_pending, port.state);
+
+    request_op.* = @backingInt(netd_proto.Op.switch_port_attach);
+    const status: *align(1) u16 = @ptrCast(&ack.status);
+    status.* = 0xFFFF;
+    try std.testing.expectEqual(ConfigAckTransition.ignored, applySwitchConfigAck(&port, &ack));
+    try std.testing.expectEqual(NetworkPortState.attach_pending, port.state);
+}
+
+test "netd acknowledgement envelope checks transport and destination identity" {
+    const local_node: [16]u8 = @splat(0x2A);
+    var page = lib.PageHeader{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @intCast(@sizeOf(netd_proto.NetdHeader) + @sizeOf(netd_proto.SwitchConfigAckPayload)),
+        .auth_tag = 0,
+        .src = .{
+            .node = lib.Ipv6Addr.loopback(),
+            .endpoint = EP_NETD,
+        },
+        .dst = .{
+            .node = .{ .bytes = local_node },
+            .endpoint = EP_CONFIGD,
+        },
+    };
+    var netd = netd_proto.NetdHeader{ .op = .switch_config_ack };
+    const payload_len = @as(usize, page.payload_len);
+
+    try std.testing.expect(isNetdConfigAckEnvelope(&page, &netd, payload_len, &local_node));
+    page.src.node.bytes[0] = 0xFE;
+    try std.testing.expect(!isNetdConfigAckEnvelope(&page, &netd, payload_len, &local_node));
+    page.src.node = lib.Ipv6Addr.loopback();
+    page.dst.node.bytes[0] ^= 1;
+    try std.testing.expect(!isNetdConfigAckEnvelope(&page, &netd, payload_len, &local_node));
+    page.dst.node.bytes[0] ^= 1;
+
+    page.src.endpoint = EP_CONFIGD;
+    try std.testing.expect(!isNetdConfigAckEnvelope(&page, &netd, payload_len, &local_node));
+    page.src.endpoint = EP_NETD;
+
+    const op: *align(1) u16 = @ptrCast(&netd.op);
+    op.* = 0xFFFF;
+    try std.testing.expect(!isNetdConfigAckEnvelope(&page, &netd, payload_len, &local_node));
+}
+
+test "stale switch detach acknowledgements retain the attachment reference" {
+    var port = NetworkPort{
+        .used = true,
+        .vmid = 9,
+        .generation = 4,
+        .state = .detach_pending,
+    };
+    const mismatched_generation_ack = netd_proto.SwitchConfigAckPayload{
+        .request_op = .switch_port_detach,
+        .status = .stale,
+        .vmid = 9,
+        .generation = 3,
+        .policy_revision = 0,
+    };
+
+    try std.testing.expectEqual(ConfigAckTransition.ignored, applySwitchConfigAck(&port, &mismatched_generation_ack));
+    try std.testing.expect(port.used);
+    try std.testing.expectEqual(NetworkPortState.detach_pending, port.state);
+
+    var stale_status_ack = mismatched_generation_ack;
+    stale_status_ack.generation = 4;
+    try std.testing.expectEqual(ConfigAckTransition.detach_rejected, applySwitchConfigAck(&port, &stale_status_ack));
+    try std.testing.expect(port.used);
+    try std.testing.expectEqual(NetworkPortState.attached, port.state);
+
+    var confirmed_ack = stale_status_ack;
+    port.state = .detach_pending;
+    confirmed_ack.status = .ok;
+    try std.testing.expectEqual(ConfigAckTransition.detached, applySwitchConfigAck(&port, &confirmed_ack));
+    try std.testing.expect(!port.used);
+}
+
+test "local switch administration accepts only loopback windowd messages" {
+    var page = lib.PageHeader{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @sizeOf(configd_proto.ConfigdHeader),
+        .auth_tag = 0,
+        .src = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = EP_WINDOWD },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = EP_CONFIGD },
+    };
+    try std.testing.expect(isLocalWindowdRequest(&page));
+    page.src.endpoint = EP_CLUSTERD;
+    try std.testing.expect(!isLocalWindowdRequest(&page));
+    page.src.endpoint = EP_WINDOWD;
+    page.src.node.bytes[0] = 0xFE;
+    try std.testing.expect(!isLocalWindowdRequest(&page));
+    page.src.node = lib.Ipv6Addr.loopback();
+    page.dst.node.bytes[0] = 0xFE;
+    try std.testing.expect(!isLocalWindowdRequest(&page));
+}
+
+test "binding updates serialize retries and validate correlated acknowledgements" {
+    var port = NetworkPort{
+        .used = true,
+        .vmid = 7,
+        .generation = 4,
+        .policy_revision = 3,
+        .state = .attached,
+    };
+    const status_request = configd_proto.LocalPortStatusRequest{ .request_id = 20, .vmid = 7 };
+    const status = makeLocalPortStatus(&port, &status_request);
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, status.status);
+    try std.testing.expectEqual(@as(u64, 4), status.generation);
+    try std.testing.expectEqual(@as(u64, 3), status.policy_revision);
+
+    var request = netd_proto.SwitchBindingsReplacePayload{
+        .vmid = 7,
+        .generation = 4,
+        .expected_revision = 3,
+        .request_id = 20,
+        .ipv4_count = 1,
+        .ipv6_count = 0,
+    };
+    request.ipv4_addresses[0] = .{ 10, 0, 0, 7 };
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, beginSwitchBindings(&port, &request));
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, beginSwitchBindings(&port, &request));
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.no_capacity, makeLocalPortStatus(&port, &status_request).status);
+    var conflicting = request;
+    conflicting.ipv4_addresses[0][3] = 8;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.no_capacity, beginSwitchBindings(&port, &conflicting));
+
+    var ack = netd_proto.SwitchBindingsAckPayload{
+        .request_id = 21,
+        .vmid = 7,
+        .status = .ok,
+        .generation = 4,
+        .policy_revision = 4,
+    };
+    try std.testing.expect(!applySwitchBindingsAck(&port, &ack));
+    ack.request_id = 20;
+    ack.generation = 5;
+    try std.testing.expect(!applySwitchBindingsAck(&port, &ack));
+    ack.generation = 4;
+    ack.policy_revision = 5;
+    try std.testing.expect(!applySwitchBindingsAck(&port, &ack));
+    ack.policy_revision = 4;
+    try std.testing.expect(applySwitchBindingsAck(&port, &ack));
+    try std.testing.expectEqual(@as(u64, 4), port.policy_revision);
+    try std.testing.expect(port.pending_bindings != null);
+    try std.testing.expect(applySwitchBindingsAck(&port, &ack));
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, beginSwitchBindings(&port, &request));
+    var delayed_failure = ack;
+    delayed_failure.status = .stale;
+    delayed_failure.policy_revision = 0;
+    try std.testing.expect(!applySwitchBindingsAck(&port, &delayed_failure));
+    const invalid_status: *align(1) u16 = @ptrCast(&delayed_failure.status);
+    invalid_status.* = 0xFFFF;
+    try std.testing.expect(!applySwitchBindingsAck(&port, &delayed_failure));
+    port.pending_bindings = null;
+    port.pending_binding_reply = null;
+    try std.testing.expect(!applySwitchBindingsAck(&port, &ack));
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, beginSwitchBindings(&port, &request));
+}
+
+test "binding updates reject invalid requests and stale port generations" {
+    var port = NetworkPort{
+        .used = true,
+        .vmid = 7,
+        .generation = 4,
+        .policy_revision = 3,
+        .state = .attached,
+    };
+    var request = netd_proto.SwitchBindingsReplacePayload{
+        .vmid = 7,
+        .generation = 4,
+        .expected_revision = 3,
+        .request_id = 0,
+        .ipv4_count = 0,
+        .ipv6_count = 0,
+    };
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.invalid, beginSwitchBindings(&port, &request));
+    request.request_id = 1;
+    request.ipv6_count = 5;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.invalid, beginSwitchBindings(&port, &request));
+    request.ipv6_count = 0;
+    request.generation = 3;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, beginSwitchBindings(&port, &request));
+    request.generation = 4;
+    port.state = .detach_pending;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, beginSwitchBindings(&port, &request));
+    try std.testing.expect(port.pending_bindings == null);
 }

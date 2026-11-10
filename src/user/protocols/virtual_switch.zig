@@ -30,6 +30,15 @@ pub const Policy = struct {
     egress_count: u8 = 0,
 };
 
+pub const AddressBindings = struct {
+    ipv4_addresses: [4][4]u8 = @splat(@splat(0)),
+    ipv4_count: u8 = 0,
+    ipv6_addresses: [4][16]u8 = @splat(@splat(0)),
+    ipv6_count: u8 = 0,
+};
+
+pub const BindingError = error{ InvalidBindings, AddressConflict, Stale, RevisionExhausted };
+
 pub const PortConfig = struct {
     id: PortId,
     segment: SegmentId,
@@ -68,6 +77,7 @@ const Port = struct {
     active: bool = false,
     generation: AttachmentGeneration = 0,
     policy_revision: u64 = 0,
+    initial_bindings: AddressBindings = .{},
     config: PortConfig = undefined,
 };
 
@@ -82,6 +92,7 @@ const ParsedFrame = struct {
 
 pub const Switch = struct {
     ports: [MAX_PORTS]Port = @splat(.{}),
+    next_generation: AttachmentGeneration = 0,
 
     pub fn attach(self: *Switch, config: PortConfig) ?AttachmentGeneration {
         if (config.id == 0 or config.segment == 0) return null;
@@ -97,7 +108,10 @@ pub const Switch = struct {
         var free_slot: ?usize = null;
         for (&self.ports, 0..) |*port, idx| {
             if (port.active) {
-                if (port.config.id == config.id) return null;
+                if (port.config.id == config.id) {
+                    if (sameAttachment(port, config)) return port.generation;
+                    return null;
+                }
                 if (port.config.segment == config.segment and std.mem.eql(u8, &port.config.mac, &config.mac)) return null;
                 if (port.config.segment == config.segment and addressBindingConflicts(&port.config, &config)) return null;
             } else if (free_slot == null) {
@@ -106,22 +120,30 @@ pub const Switch = struct {
         }
 
         const idx = free_slot orelse return null;
-        const next_generation = std.math.add(AttachmentGeneration, self.ports[idx].generation, 1) catch return null;
+        const next_generation = std.math.add(AttachmentGeneration, self.next_generation, 1) catch return null;
+        self.next_generation = next_generation;
         self.ports[idx] = .{
             .active = true,
             .generation = next_generation,
             .policy_revision = 1,
+            .initial_bindings = bindingsForConfig(&config),
             .config = config,
         };
         return next_generation;
     }
 
     pub fn detach(self: *Switch, id: PortId, generation: AttachmentGeneration) bool {
-        const port = self.findPort(id) orelse return false;
-        if (port.generation != generation) return false;
-        port.generation = std.math.add(AttachmentGeneration, port.generation, 1) catch return false;
-        port.active = false;
-        return true;
+        for (&self.ports) |*port| {
+            if (port.generation == 0) continue;
+            if (port.config.id != id) continue;
+            if (!port.active) {
+                return port.generation == generation;
+            }
+            if (port.generation != generation) return false;
+            port.active = false;
+            return true;
+        }
+        return false;
     }
 
     pub fn replacePolicy(
@@ -140,6 +162,52 @@ pub const Switch = struct {
         if (port.generation != generation or port.policy_revision != expected_revision) return null;
         const next_revision = std.math.add(u64, port.policy_revision, 1) catch return null;
         port.config.policy = policy;
+        port.policy_revision = next_revision;
+        return next_revision;
+    }
+
+    pub fn replaceBindings(
+        self: *Switch,
+        id: PortId,
+        generation: AttachmentGeneration,
+        expected_revision: u64,
+        bindings: AddressBindings,
+    ) BindingError!u64 {
+        if (bindings.ipv4_count > bindings.ipv4_addresses.len or
+            bindings.ipv6_count > bindings.ipv6_addresses.len)
+        {
+            return error.InvalidBindings;
+        }
+        const port = self.findPort(id) orelse return error.Stale;
+        if (port.generation != generation) return error.Stale;
+
+        var updated = port.config;
+        updated.ipv4_addresses = bindings.ipv4_addresses;
+        updated.ipv4_count = bindings.ipv4_count;
+        updated.ipv6_addresses = bindings.ipv6_addresses;
+        updated.ipv6_count = bindings.ipv6_count;
+        if (!validAddresses(&updated)) return error.InvalidBindings;
+
+        const next_revision = std.math.add(u64, expected_revision, 1) catch return error.RevisionExhausted;
+        if (port.policy_revision != expected_revision) {
+            const current_bindings = bindingsForConfig(&port.config);
+            if (port.policy_revision == next_revision and sameBindings(&current_bindings, &bindings) and
+                port.config.policy.ingress_count == 0 and port.config.policy.egress_count == 0)
+            {
+                return port.policy_revision;
+            }
+            return error.Stale;
+        }
+        for (&self.ports) |*candidate| {
+            if (candidate.active and candidate.config.id != id and
+                candidate.config.segment == updated.segment and addressBindingConflicts(&candidate.config, &updated))
+            {
+                return error.AddressConflict;
+            }
+        }
+
+        updated.policy = .{};
+        port.config = updated;
         port.policy_revision = next_revision;
         return next_revision;
     }
@@ -220,6 +288,29 @@ pub const Switch = struct {
     }
 };
 
+fn bindingsForConfig(config: *const PortConfig) AddressBindings {
+    return .{
+        .ipv4_addresses = config.ipv4_addresses,
+        .ipv4_count = config.ipv4_count,
+        .ipv6_addresses = config.ipv6_addresses,
+        .ipv6_count = config.ipv6_count,
+    };
+}
+
+fn sameBindings(first: *const AddressBindings, second: *const AddressBindings) bool {
+    return first.ipv4_count == second.ipv4_count and
+        first.ipv6_count == second.ipv6_count and
+        std.mem.eql(u8, std.mem.sliceAsBytes(first.ipv4_addresses[0..first.ipv4_count]), std.mem.sliceAsBytes(second.ipv4_addresses[0..second.ipv4_count])) and
+        std.mem.eql(u8, std.mem.sliceAsBytes(first.ipv6_addresses[0..first.ipv6_count]), std.mem.sliceAsBytes(second.ipv6_addresses[0..second.ipv6_count]));
+}
+
+fn sameAttachment(existing: *const Port, requested: PortConfig) bool {
+    const requested_bindings = bindingsForConfig(&requested);
+    return existing.config.segment == requested.segment and
+        std.mem.eql(u8, &existing.config.mac, &requested.mac) and
+        sameBindings(&existing.initial_bindings, &requested_bindings);
+}
+
 fn isUnicastMac(mac: *const [6]u8) bool {
     return mac[0] & 1 == 0 and !isZeroMac(mac);
 }
@@ -234,13 +325,14 @@ fn isZeroMac(mac: *const [6]u8) bool {
 
 fn validAddresses(config: *const PortConfig) bool {
     for (config.ipv4_addresses[0..config.ipv4_count], 0..) |*address, idx| {
-        if (std.mem.allEqual(u8, address, 0)) return false;
+        if (address[0] == 0 or address[0] == 127 or address[0] >= 224) return false;
         for (config.ipv4_addresses[0..idx]) |*previous| {
             if (std.mem.eql(u8, address, previous)) return false;
         }
     }
     for (config.ipv6_addresses[0..config.ipv6_count], 0..) |*address, idx| {
-        if (std.mem.allEqual(u8, address, 0)) return false;
+        if (address[0] == 0xFF or std.mem.allEqual(u8, address, 0) or
+            std.mem.eql(u8, address, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 })) return false;
         for (config.ipv6_addresses[0..idx]) |*previous| {
             if (std.mem.eql(u8, address, previous)) return false;
         }
@@ -300,7 +392,7 @@ fn parseIpv4(destination_mac: []const u8, packet: []const u8) ?ParsedFrame {
     const total_len = std.mem.readInt(u16, packet[2..4], .big);
     if (header_len < 20 or total_len < header_len + 4 or total_len > packet.len) return null;
     const fragment = std.mem.readInt(u16, packet[6..8], .big);
-    if (fragment & 0x3FFF != 0) return null;
+    if (fragment & 0xBFFF != 0) return null;
 
     const protocol = packet[9];
     const transport = packet[header_len..total_len];
@@ -464,6 +556,34 @@ test "dual-stack policy requires source egress and destination ingress" {
     std.mem.writeInt(u16, fragmented[20..22], 0x2000, .big);
     try std.testing.expectEqual(DropReason.malformed_frame, switcher.decide(1, source_generation, &fragmented).drop_reason);
 
+    var reserved_fragment_flag = ipv4_frame;
+    std.mem.writeInt(u16, reserved_fragment_flag[20..22], 0x8000, .big);
+    try std.testing.expectEqual(
+        DropReason.malformed_frame,
+        switcher.decide(1, source_generation, &reserved_fragment_flag).drop_reason,
+    );
+
+    var truncated_ipv4_packet = ipv4_frame;
+    std.mem.writeInt(u16, truncated_ipv4_packet[16..18], 27, .big);
+    try std.testing.expectEqual(
+        DropReason.malformed_frame,
+        switcher.decide(1, source_generation, &truncated_ipv4_packet).drop_reason,
+    );
+
+    var oversized_udp_length = ipv4_frame;
+    std.mem.writeInt(u16, oversized_udp_length[38..40], 9, .big);
+    try std.testing.expectEqual(
+        DropReason.malformed_frame,
+        switcher.decide(1, source_generation, &oversized_udp_length).drop_reason,
+    );
+
+    var ipv6_extension_header = ipv6_frame;
+    ipv6_extension_header[20] = 0;
+    try std.testing.expectEqual(
+        DropReason.malformed_frame,
+        switcher.decide(1, source_generation, &ipv6_extension_header).drop_reason,
+    );
+
     try std.testing.expectEqual(DropReason.stale_generation, switcher.decide(1, source_generation + 1, &ipv4_frame).drop_reason);
     try std.testing.expect(switcher.detach(2, target_generation));
     try std.testing.expectEqual(DropReason.no_eligible_destination, switcher.decide(1, source_generation, &ipv4_frame).drop_reason);
@@ -601,6 +721,219 @@ test "unconfigured and invalid switch ports fail closed" {
         DropReason.egress_denied,
         switcher.decide(3, source_generation, &frame).drop_reason,
     );
+}
+
+test "repeated identical attachment requests are idempotent" {
+    var switcher: Switch = .{};
+    const config = PortConfig{
+        .id = 7,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 7 },
+    };
+    const first = switcher.attach(config) orelse return error.TestUnexpectedResult;
+    var policy: Policy = .{};
+    policy.egress[0] = .{
+        .ip_version = .ipv4,
+        .protocol = 17,
+        .destination = @splat(0),
+        .destination_port_first = 53,
+        .destination_port_last = 53,
+    };
+    policy.egress_count = 1;
+    try std.testing.expectEqual(@as(?u64, 2), switcher.replacePolicy(7, first, 1, policy));
+    try std.testing.expectEqual(first, switcher.attach(config).?);
+    try std.testing.expectEqual(@as(?u64, 2), switcher.policyRevision(7, first));
+
+    var changed = config;
+    changed.segment = 2;
+    try std.testing.expectEqual(@as(?AttachmentGeneration, null), switcher.attach(changed));
+}
+
+test "address binding replacement revokes policy and preserves attachment retries" {
+    var switcher: Switch = .{};
+    const initial = PortConfig{
+        .id = 7,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 7 },
+    };
+    const generation = switcher.attach(initial) orelse return error.TestUnexpectedResult;
+    var old_policy: Policy = .{};
+    old_policy.egress[0] = .{
+        .ip_version = .ipv4,
+        .protocol = 17,
+        .destination = ip4Wide(.{ 10, 0, 0, 2 }),
+        .destination_port_first = 53,
+        .destination_port_last = 53,
+    };
+    old_policy.egress_count = 1;
+    try std.testing.expectEqual(@as(?u64, 2), switcher.replacePolicy(7, generation, 1, old_policy));
+
+    const bindings = AddressBindings{
+        .ipv4_addresses = .{ .{ 10, 0, 0, 1 }, @splat(0), @splat(0), @splat(0) },
+        .ipv4_count = 1,
+        .ipv6_addresses = .{ .{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, @splat(0), @splat(0), @splat(0) },
+        .ipv6_count = 1,
+    };
+    try std.testing.expectEqual(@as(u64, 3), try switcher.replaceBindings(7, generation, 2, bindings));
+    try std.testing.expectEqual(@as(u64, 3), try switcher.replaceBindings(7, generation, 2, bindings));
+    try std.testing.expectEqual(generation, switcher.attach(initial).?);
+    try std.testing.expectEqual(@as(?u64, 3), switcher.policyRevision(7, generation));
+
+    const port = switcher.findPortConst(7).?;
+    try std.testing.expectEqual(@as(u8, 1), port.config.ipv4_count);
+    try std.testing.expectEqual(@as(u8, 1), port.config.ipv6_count);
+    try std.testing.expectEqual(@as(u8, 0), port.config.policy.egress_count);
+    try std.testing.expectEqual(@as(?u64, 4), switcher.replacePolicy(7, generation, 3, old_policy));
+    try std.testing.expectError(error.Stale, switcher.replaceBindings(7, generation, 2, bindings));
+    try std.testing.expectEqual(@as(u8, 1), switcher.findPortConst(7).?.config.policy.egress_count);
+}
+
+test "address binding replacement rejects stale or conflicting updates atomically" {
+    var switcher: Switch = .{};
+    const generation = switcher.attach(.{
+        .id = 1,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 1 },
+    }) orelse return error.TestUnexpectedResult;
+    _ = switcher.attach(.{
+        .id = 2,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 2 },
+        .ipv4_addresses = .{ .{ 10, 0, 0, 2 }, @splat(0), @splat(0), @splat(0) },
+        .ipv4_count = 1,
+    }) orelse return error.TestUnexpectedResult;
+    const bindings = AddressBindings{
+        .ipv4_addresses = .{ .{ 10, 0, 0, 1 }, @splat(0), @splat(0), @splat(0) },
+        .ipv4_count = 1,
+    };
+    try std.testing.expectError(error.Stale, switcher.replaceBindings(1, generation + 1, 1, bindings));
+    try std.testing.expectError(error.Stale, switcher.replaceBindings(1, generation, 2, bindings));
+    var invalid = bindings;
+    invalid.ipv4_count = 5;
+    try std.testing.expectError(error.InvalidBindings, switcher.replaceBindings(1, generation, 1, invalid));
+    invalid = bindings;
+    invalid.ipv4_addresses[0] = .{ 10, 0, 0, 2 };
+    try std.testing.expectError(error.AddressConflict, switcher.replaceBindings(1, generation, 1, invalid));
+    invalid = bindings;
+    invalid.ipv4_addresses[1] = invalid.ipv4_addresses[0];
+    invalid.ipv4_count = 2;
+    try std.testing.expectError(error.InvalidBindings, switcher.replaceBindings(1, generation, 1, invalid));
+    invalid = bindings;
+    invalid.ipv4_addresses[0] = .{ 224, 0, 0, 1 };
+    try std.testing.expectError(error.InvalidBindings, switcher.replaceBindings(1, generation, 1, invalid));
+    invalid = bindings;
+    invalid.ipv6_count = 1;
+    invalid.ipv6_addresses[0] = .{ 0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expectError(error.InvalidBindings, switcher.replaceBindings(1, generation, 1, invalid));
+    try std.testing.expectEqual(@as(?u64, 1), switcher.policyRevision(1, generation));
+    try std.testing.expectEqual(@as(u8, 0), switcher.findPortConst(1).?.config.ipv4_count);
+    try std.testing.expectEqual(@as(u64, 2), try switcher.replaceBindings(1, generation, 1, bindings));
+}
+
+test "updated bindings require fresh explicit ingress and egress policy" {
+    var switcher: Switch = .{};
+    const source_mac = [_]u8{ 0x02, 0, 0, 0, 0, 1 };
+    const target_mac = [_]u8{ 0x02, 0, 0, 0, 0, 2 };
+    const source4 = [_]u8{ 10, 0, 0, 1 };
+    const target4 = [_]u8{ 10, 0, 0, 2 };
+    const source6 = [_]u8{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const target6 = [_]u8{ 0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+    const source_ip = ip4Wide(source4);
+    const target_ip = ip4Wide(target4);
+    const source_generation = switcher.attach(.{ .id = 1, .segment = 1, .mac = source_mac }) orelse return error.TestUnexpectedResult;
+    const target_generation = switcher.attach(.{ .id = 2, .segment = 1, .mac = target_mac }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), try switcher.replaceBindings(1, source_generation, 1, .{
+        .ipv4_addresses = .{ source4, @splat(0), @splat(0), @splat(0) },
+        .ipv4_count = 1,
+        .ipv6_addresses = .{ source6, @splat(0), @splat(0), @splat(0) },
+        .ipv6_count = 1,
+    }));
+    try std.testing.expectEqual(@as(u64, 2), try switcher.replaceBindings(2, target_generation, 1, .{
+        .ipv4_addresses = .{ target4, @splat(0), @splat(0), @splat(0) },
+        .ipv4_count = 1,
+        .ipv6_addresses = .{ target6, @splat(0), @splat(0), @splat(0) },
+        .ipv6_count = 1,
+    }));
+    const frame = buildUdpFrame(source_mac, target_mac, 0x0800, &source_ip, &target_ip, 17);
+    const ipv6_frame = buildUdpFrame(source_mac, target_mac, 0x86DD, &source6, &target6, 17);
+    try std.testing.expectEqual(DropReason.egress_denied, switcher.decide(1, source_generation, &frame).drop_reason);
+    try std.testing.expectEqual(DropReason.egress_denied, switcher.decide(1, source_generation, &ipv6_frame).drop_reason);
+
+    var source_policy: Policy = .{};
+    source_policy.egress[0] = .{ .ip_version = .ipv4, .protocol = 17, .destination = target_ip, .destination_port_first = 53, .destination_port_last = 53 };
+    source_policy.egress[1] = .{ .ip_version = .ipv6, .protocol = 17, .destination = target6, .destination_port_first = 53, .destination_port_last = 53 };
+    source_policy.egress_count = 2;
+    var target_policy: Policy = .{};
+    target_policy.ingress[0] = source_policy.egress[0];
+    target_policy.ingress[1] = source_policy.egress[1];
+    target_policy.ingress_count = 2;
+    try std.testing.expectEqual(@as(?u64, 3), switcher.replacePolicy(1, source_generation, 2, source_policy));
+    try std.testing.expectEqual(DropReason.no_eligible_destination, switcher.decide(1, source_generation, &frame).drop_reason);
+    try std.testing.expectEqual(@as(?u64, 3), switcher.replacePolicy(2, target_generation, 2, target_policy));
+    try std.testing.expectEqual(@as(usize, 1), switcher.decide(1, source_generation, &frame).count);
+    try std.testing.expectEqual(@as(usize, 1), switcher.decide(1, source_generation, &ipv6_frame).count);
+
+    try std.testing.expectEqual(@as(u64, 4), try switcher.replaceBindings(1, source_generation, 3, .{
+        .ipv4_addresses = .{ source4, @splat(0), @splat(0), @splat(0) },
+        .ipv4_count = 1,
+    }));
+    try std.testing.expectEqual(DropReason.egress_denied, switcher.decide(1, source_generation, &frame).drop_reason);
+}
+
+test "repeated detach after a lost acknowledgement is idempotent" {
+    var switcher: Switch = .{};
+    try std.testing.expect(!switcher.detach(5, 0));
+    try std.testing.expect(!switcher.detach(5, 1));
+    const config = PortConfig{
+        .id = 5,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 5 },
+    };
+    const generation = switcher.attach(config) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(switcher.detach(5, generation));
+    try std.testing.expect(switcher.detach(5, generation));
+    try std.testing.expect(!switcher.detach(5, generation + 1));
+    const reattached = switcher.attach(config) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reattached > generation);
+    try std.testing.expect(!switcher.detach(5, generation));
+}
+
+test "attachment generations cannot alias across reused port slots" {
+    var switcher: Switch = .{};
+    const first = switcher.attach(.{
+        .id = 1,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 1 },
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), first);
+    try std.testing.expect(switcher.detach(1, first));
+
+    const second = switcher.attach(.{
+        .id = 2,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 2 },
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), second);
+    const reattached = switcher.attach(.{
+        .id = 1,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 1 },
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(u64, 3), reattached);
+    try std.testing.expect(!switcher.detach(1, first));
+    try std.testing.expect(switcher.detach(1, reattached));
+}
+
+test "attachment generation exhaustion fails closed" {
+    var switcher: Switch = .{ .next_generation = std.math.maxInt(AttachmentGeneration) };
+    try std.testing.expect(switcher.attach(.{
+        .id = 1,
+        .segment = 1,
+        .mac = .{ 0x02, 0xCA, 0, 0, 0, 1 },
+    }) == null);
+    try std.testing.expect(switcher.currentGeneration(1) == null);
 }
 
 fn ip4Wide(address: [4]u8) [16]u8 {

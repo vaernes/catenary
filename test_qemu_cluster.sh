@@ -54,6 +54,7 @@ echo "[+] Starting Node A (accel=${ACCEL})..."
 GTK_PATH= stdbuf -o0 qemu-system-x86_64 \
     -M q35 -m 1024 \
     -cpu "${CPU}" -accel "${ACCEL}" \
+    -smp "${SMP:-2}" \
     -cdrom catenary.iso -boot d \
     -chardev file,id=s0,path=qemu_serial_A.log \
     -serial chardev:s0 \
@@ -69,6 +70,7 @@ echo "[+] Starting Node B (accel=${ACCEL})..."
 GTK_PATH= stdbuf -o0 qemu-system-x86_64 \
     -M q35 -m 1024 \
     -cpu "${CPU}" -accel "${ACCEL}" \
+    -smp "${SMP:-2}" \
     -cdrom catenary.iso -boot d \
     -chardev file,id=s1,path=qemu_serial_B.log \
     -serial chardev:s1 \

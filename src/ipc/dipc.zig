@@ -206,3 +206,38 @@ pub fn payloadSliceFromPage(hhdm_offset: u64, page_phys: u64) []const u8 {
 pub fn freePageMessage(page_phys: u64) void {
     pmm.freePage(page_phys);
 }
+
+test "cluster tags reject altered payload and source identity" {
+    const previous_key = cluster_key;
+    const previous_set = cluster_key_set;
+    defer {
+        cluster_key = previous_key;
+        cluster_key_set = previous_set;
+    }
+
+    var page: [pmm.PAGE_SIZE]u8 align(@alignOf(PageHeader)) = @splat(0);
+    const header: *PageHeader = @ptrCast(@alignCast(&page));
+    var remote = Ipv6Addr.loopback();
+    remote.bytes[0] = 0xFE;
+    remote.bytes[1] = 0x80;
+    header.* = .{
+        .magic = WireMagic,
+        .version = WireVersion,
+        .header_len = @intCast(HEADER_SIZE),
+        .payload_len = 4,
+        .auth_tag = 0,
+        .src = .{ .node = remote, .endpoint = 7 },
+        .dst = .{ .node = Ipv6Addr.loopback(), .endpoint = 10 },
+    };
+    @memcpy(page[HEADER_SIZE..][0..4], "test");
+    cluster_key_set = false;
+    try std.testing.expect(!verifyClusterTag(0, @intFromPtr(&page)));
+    setClusterSecret("cluster-test-key");
+    header.auth_tag = computeClusterTag(header.src, header.dst.endpoint, page[HEADER_SIZE..][0..4]);
+    try std.testing.expect(verifyClusterTag(0, @intFromPtr(&page)));
+    page[HEADER_SIZE] ^= 1;
+    try std.testing.expect(!verifyClusterTag(0, @intFromPtr(&page)));
+    page[HEADER_SIZE] ^= 1;
+    header.src.endpoint = 8;
+    try std.testing.expect(!verifyClusterTag(0, @intFromPtr(&page)));
+}

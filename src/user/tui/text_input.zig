@@ -6,7 +6,7 @@ const inputd_proto = @import("../protocols/inputd_protocol.zig");
 const InputEvent = inputd_proto.InputEvent;
 const KeyCode = inputd_proto.KeyCode;
 
-pub const MAX_TEXT_INPUT_LEN: usize = 64;
+pub const MAX_TEXT_INPUT_LEN: usize = 96;
 
 pub const TextInput = struct {
     rect: Rect = .{},

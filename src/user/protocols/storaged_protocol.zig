@@ -2,15 +2,16 @@
 ///
 /// Endpoint: ReservedEndpoint.storaged (4)
 ///
-/// storaged is the block-device owner.  It accepts read/write/flush requests
-/// from any authorized service (containerd, clusterd, the kernel VMM bridge)
-/// and replies with a completion status.
+/// storaged is the block-device owner. The current implementation authorizes
+/// only containerd's host-local metadata workflow. VM block requests remain
+/// denied until the host assigns and enforces per-VM disk extents.
 ///
 /// Message format:
 ///   PageHeader   (lib.DIPC_HEADER_SIZE bytes)
 ///   BlkRequest   (request) or BlkResponse (reply)
 pub const MAGIC: u32 = 0x53544F52; // 'STOR'
 pub const VERSION: u16 = 1;
+pub const HOST_METADATA_VMID: u32 = 0xC0DE_0001;
 
 // ---------------------------------------------------------------------------
 // Request (sent TO storaged)
@@ -36,7 +37,7 @@ pub const BlkRequest = extern struct {
     _reserved: u32 = 0,
     /// Starting logical block address (512-byte sectors).
     sector: u64,
-    /// MicroVM instance ID (0 = host / Ring-3 requester).
+    /// Host metadata workflow ID, or a MicroVM ID with an assigned disk extent.
     vmid: u32,
     /// Virtqueue chain head index (used for VMM completions; set 0 for host).
     chain_head: u16,

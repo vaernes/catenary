@@ -5,6 +5,7 @@ const microvm_registry = @import("microvm_registry.zig");
 const pmm = @import("../kernel/pmm.zig");
 const router = @import("../ipc/router.zig");
 const endpoint_table = @import("../ipc/endpoint_table.zig");
+const netd_protocol = @import("../user/protocols/netd_protocol.zig");
 
 /// Virtio-net MMIO device registers (minimal set for bring-up)
 pub const VirtioReg = enum(u16) {
@@ -75,7 +76,7 @@ pub const DeviceInstance = struct {
     driver_features: u32 = 0,
     selected_queue: u32 = 0,
     queues: [2]QueueState = undefined, // 0: RX, 1: TX
-    mac: [6]u8 = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 }, // Default MAC
+    mac: [6]u8 = @splat(0),
     interrupt_status: u32 = 0,
     config: Config = undefined,
 
@@ -110,6 +111,7 @@ pub fn getInstance(vmid: u32) ?*DeviceInstance {
         if (inst.vmid == vmid) return inst;
         if (inst.vmid == 0) {
             inst.vmid = vmid;
+            inst.mac = netd_protocol.hostAssignedMac(vmid);
             for (&inst.queues) |*q| {
                 q.* = .{};
             }
