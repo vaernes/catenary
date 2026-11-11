@@ -121,6 +121,15 @@ pub fn getInstance(vmid: u32) ?*DeviceInstance {
     return null;
 }
 
+pub fn resetInstance(vmid: u32) void {
+    if (!initialized) return;
+    for (&instances) |*inst| {
+        if (inst.vmid == vmid) {
+            inst.* = .{ .vmid = 0 };
+        }
+    }
+}
+
 /// Link back to VMX/Registry to translate GPA->HPA for descriptors.
 pub var gpa_to_hpa_fn: ?*const fn (vmid: u32, gpa: u64) ?u64 = null;
 pub var hhdm_offset: u64 = 0;
@@ -221,11 +230,12 @@ pub fn handleRead(vmid: u32, offset: u64) u32 {
 
     // Config space access (starting at 0x100)
     if (reg_int >= 0x100 and reg_int < 0x200) {
-        const config_offset = reg_int - 0x100;
+        const config_offset = @as(usize, reg_int - 0x100);
         const config_ptr = @as([*]const u8, @ptrCast(&inst.mac));
-        if (config_offset + 4 <= @sizeOf([6]u8)) {
+        if (config_offset < @sizeOf([6]u8)) {
             var val: u32 = 0;
-            @memcpy(@as(*[4]u8, @ptrCast(&val)), config_ptr[config_offset .. config_offset + 4]);
+            const copy_len = @min(@as(usize, 4), @sizeOf([6]u8) - config_offset);
+            @memcpy(@as([*]u8, @ptrCast(&val))[0..copy_len], config_ptr[config_offset .. config_offset + copy_len]);
             return val;
         }
         return 0;

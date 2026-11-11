@@ -33,6 +33,7 @@ const IA32_VMX_TRUE_EXIT_CTLS: u32 = 0x48F;
 const IA32_VMX_TRUE_ENTRY_CTLS: u32 = 0x490;
 const IA32_VMX_PROCBASED_CTLS2: u32 = 0x48B;
 const IA32_VMX_TRUE_PROCBASED_CTLS2: u32 = 0x48B;
+const IA32_VMX_EPT_VPID_CAP: u32 = 0x48C;
 const IA32_APIC_BASE: u32 = 0x1B;
 const IA32_BIOS_SIGN_ID: u32 = 0x8B;
 const IA32_MTRRCAP: u32 = 0xFE;
@@ -249,7 +250,7 @@ const LINUX_DEBUG_EXCEPTION_BITMAP: u32 =
     (@as(u32, 1) << 13) | // #GP
     0; // #PF
 
-const DEFAULT_CMDLINE = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 ignore_loglevel nokaslr noapictimer rdinit=/init";
+const DEFAULT_CMDLINE = "console=ttyS0,115200 earlycon=uart8250,io,0x3f8,115200 ignore_loglevel nokaslr noapictimer iomem=relaxed rdinit=/init";
 const GUEST_BOOT_GDT_GPA: u64 = 0x0000_6000;
 const GUEST_EBDA_SEGMENT: u16 = 0x9FC0;
 const GUEST_BASE_MEMORY_KB: u16 = 639;
@@ -911,6 +912,38 @@ fn vmptrld(region_phys: u64) bool {
         : [ptr] "r" (&operand),
         : .{ .memory = true, .cc = true });
     return vmxInstructionSucceeded(failed);
+}
+
+const InveptDescriptor = extern struct {
+    eptp: u64,
+    reserved: u64 = 0,
+};
+
+fn invept(invept_type: u64, eptp: u64) bool {
+    var desc = InveptDescriptor{ .eptp = eptp };
+    var failed: u8 = 0;
+    asm volatile (
+        \\invept (%[desc]), %[kind]
+        \\setna %[failed]
+        : [failed] "=r" (failed),
+        : [desc] "r" (&desc),
+          [kind] "r" (invept_type),
+        : .{ .memory = true, .cc = true });
+    return vmxInstructionSucceeded(failed);
+}
+
+fn invalidateEptRoot(root_phys: u64) bool {
+    if (@import("builtin").is_test) return true;
+    const core_id = smp.getCurrentCpuId();
+    if (core_id < smp.MAX_CPUS and per_cpu_vmxon[core_id] == null) return true;
+
+    const eptp = (root_phys & 0x000F_FFFF_FFFF_F000) | EPT_MEMTYPE_WB | ((@as(u64, 4) - 1) << 3);
+    const cap = cpu.rdmsr(IA32_VMX_EPT_VPID_CAP);
+    const supports_single = (cap & (@as(u64, 1) << 25)) != 0;
+    const supports_all = (cap & (@as(u64, 1) << 26)) != 0;
+    if (supports_single and invept(1, eptp)) return true;
+    if (supports_all and invept(2, 0)) return true;
+    return !supports_single and !supports_all;
 }
 
 fn vmxoff() bool {
@@ -2167,7 +2200,7 @@ fn handleEptViolation(regs: *GuestRegs) bool {
     const qualification = vmread(VMCS_EXIT_QUALIFICATION) orelse 0;
     const is_write = (qualification & 2) != 0;
 
-    var val: u32 = 0;
+    var val: u32 = @as(u32, @truncate(regs.rax));
     if (is_write) {
         if (translateGlaToGpa(rip)) |rip_gpa| {
             if (guestPagePtr(rip_gpa & 0x000F_FFFF_FFFF_F000)) |page| {
@@ -2187,6 +2220,20 @@ fn handleEptViolation(regs: *GuestRegs) bool {
             regs.rax = virtio_net.handleRead(vmid, offset);
         }
         advanceGuestRip();
+        if (build_options.services_active and ((is_write and offset == 0x050) or (!is_write and offset == 0x060))) {
+            const scheduler = @import("../../kernel/scheduler.zig");
+            const core_id = smp.getCurrentCpuId();
+            asm volatile ("sti");
+            scheduler.schedule();
+            asm volatile ("cli");
+            if (microvm_registry.findMutable(vmid)) |inst| {
+                if (inst.vmcs_phys) |vmcs| {
+                    if (vmptrld(vmcs)) {
+                        inst.vmcs_active_cpu = @intCast(core_id);
+                    }
+                }
+            }
+        }
         return true;
     }
     if (gpa >= VIRTIO_BLK_MMIO_BASE and gpa < VIRTIO_BLK_MMIO_BASE + VIRTIO_BLK_MMIO_SIZE) {
@@ -2198,6 +2245,20 @@ fn handleEptViolation(regs: *GuestRegs) bool {
             regs.rax = virtio_blk.handleRead(vmid, offset);
         }
         advanceGuestRip();
+        if (build_options.services_active and ((is_write and offset == 0x050) or (!is_write and offset == 0x060))) {
+            const scheduler = @import("../../kernel/scheduler.zig");
+            const core_id = smp.getCurrentCpuId();
+            asm volatile ("sti");
+            scheduler.schedule();
+            asm volatile ("cli");
+            if (microvm_registry.findMutable(vmid)) |inst| {
+                if (inst.vmcs_phys) |vmcs| {
+                    if (vmptrld(vmcs)) {
+                        inst.vmcs_active_cpu = @intCast(core_id);
+                    }
+                }
+            }
+        }
         return true;
     }
     if (gpa >= LAPIC_MMIO_BASE and gpa < LAPIC_MMIO_BASE + LAPIC_MMIO_SIZE) {
@@ -2948,7 +3009,9 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
                 asm volatile ("cli");
                 if (maybe_inst) |inst| {
                     if (inst.vmcs_phys) |vmcs| {
-                        _ = vmptrld(vmcs);
+                        if (vmptrld(vmcs)) {
+                            inst.vmcs_active_cpu = @intCast(core_id);
+                        }
                     }
                 }
             }
@@ -2982,8 +3045,9 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
     }
 }
 
-fn drainMicrovmIngress() void {
-    while (microvm_bridge.dequeue()) |entry| {
+fn drainMicrovmIngress(active_vmid: ?u32) void {
+    const vmid = active_vmid orelse return;
+    while (microvm_bridge.dequeueForVm(vmid)) |entry| {
         virtio_net.injectPacket(entry.microvm_id, dipc.payloadSliceFromPage(vmx_hhdm_offset, entry.page_phys));
         dipc.freePageMessage(entry.page_phys);
     }
@@ -3015,13 +3079,28 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
     }
     if (!should_resume) {
         if (active_vmid) |id| {
+            if (microvm_registry.findMutable(id)) |inst| {
+                if (inst.vmcs_phys) |vmcs| {
+                    if (vmclear(vmcs)) {
+                        inst.vmcs_active_cpu = null;
+                    }
+                }
+            }
             if (!microvm_registry.completeStop(id)) {
                 _ = microvm_registry.fail(id);
             }
         }
+        if (core_id < smp.MAX_CPUS) {
+            current_instance_per_cpu[core_id] = null;
+        }
+        if (current_instance_id == active_vmid) {
+            current_instance_id = null;
+        }
     }
 
-    drainMicrovmIngress();
+    if (should_resume) {
+        drainMicrovmIngress(active_vmid);
+    }
 
     // Broadcast telemetry immediately on early exits or final exit (for single-exit test guests),
     // and throttle during continuous Linux execution so dashd's receive queue is not flooded.
@@ -3033,7 +3112,9 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
         if (active_vmid) |id| {
             if (microvm_registry.findMutable(id)) |inst| {
                 if (inst.vmcs_phys) |vmcs| {
-                    _ = vmptrld(vmcs);
+                    if (vmptrld(vmcs)) {
+                        inst.vmcs_active_cpu = @intCast(core_id);
+                    }
                 }
             }
         }
@@ -3108,8 +3189,26 @@ fn vmexitStub() callconv(.naked) noreturn {
     );
 }
 
-pub fn injectGuestInterrupt(vmid: u32, vector: u8) void {
-    _ = vmid; // Multi-VM support would require mapping vmid to VMCS
+pub fn injectGuestInterrupt(vmid: u32, irq_or_vector: u8) void {
+    const active = getCurrentInstanceId() orelse return;
+    if (active != vmid) return;
+    const maybe_inst = microvm_registry.findMutable(vmid);
+    const vector: u8 = if (irq_or_vector < 8) blk: {
+        const imr = if (maybe_inst) |inst| inst.devices.pic.master_imr else pic_master_imr;
+        if ((imr & (@as(u8, 1) << @intCast(irq_or_vector))) != 0) return;
+        const base = if (maybe_inst) |inst| inst.devices.pic.master_vector_base else pic_master_vector_base;
+        break :blk base +% irq_or_vector;
+    } else if (irq_or_vector < 16) blk: {
+        const slave_line: u3 = @intCast(irq_or_vector - 8);
+        const s_imr = if (maybe_inst) |inst| inst.devices.pic.slave_imr else pic_slave_imr;
+        if ((s_imr & (@as(u8, 1) << slave_line)) != 0) return;
+        const base = if (maybe_inst) |inst| inst.devices.pic.slave_vector_base else pic_slave_vector_base;
+        break :blk base +% (irq_or_vector - 8);
+    } else irq_or_vector;
+    if (vector < 32) return;
+    const interruptibility = vmread(VMCS_GUEST_INTERRUPTIBILITY) orelse return;
+    const rflags = vmread(VMCS_GUEST_RFLAGS) orelse return;
+    if ((rflags & (1 << 9)) == 0 or (interruptibility & 0x3) != 0) return;
     const entry_info: u64 = @as(u64, vector) | (VM_ENTRY_INTR_TYPE_EXTERNAL << 8) | (1 << 31);
     _ = vmwrite(VMCS_VM_ENTRY_INTR_INFO, entry_info);
 }
@@ -3299,7 +3398,9 @@ pub fn setupVmcs(instance: *microvm_registry.Instance, core_id: usize) !void {
     _ = try ensureRegion(&instance.vmcs_phys, vmx_hhdm_offset, revision_id);
 
     if (!vmclear(instance.vmcs_phys.?)) return error.VmclearFailed;
+    instance.vmcs_active_cpu = null;
     if (!vmptrld(instance.vmcs_phys.?)) return error.VmptrldFailed;
+    instance.vmcs_active_cpu = @intCast(smp.getCurrentCpuId());
 
     current_instance_per_cpu[core_id] = instance.instance_id;
     if (core_id == smp.getCurrentCpuId()) {
@@ -3315,13 +3416,17 @@ pub fn setupVmcs(instance: *microvm_registry.Instance, core_id: usize) !void {
     try loadGuestState(launch_state);
 
     if (core_id != smp.getCurrentCpuId()) {
-        _ = vmclear(instance.vmcs_phys.?);
+        if (vmclear(instance.vmcs_phys.?)) {
+            instance.vmcs_active_cpu = null;
+        }
         const caller_core = smp.getCurrentCpuId();
         if (caller_core < smp.MAX_CPUS) {
             if (current_instance_per_cpu[caller_core]) |prev_id| {
                 if (microvm_registry.findMutable(prev_id)) |prev_inst| {
                     if (prev_inst.vmcs_phys) |prev_vmcs| {
-                        _ = vmptrld(prev_vmcs);
+                        if (vmptrld(prev_vmcs)) {
+                            prev_inst.vmcs_active_cpu = @intCast(caller_core);
+                        }
                     }
                 }
             }
@@ -3347,6 +3452,7 @@ pub fn resumeInstance(instance: *microvm_registry.Instance) !void {
             try setupVmcs(instance, core_id);
         } else {
             if (!vmptrld(instance.vmcs_phys.?)) return error.VmptrldFailed;
+            instance.vmcs_active_cpu = @intCast(core_id);
         }
 
         smp.serialAcquire();
@@ -3370,6 +3476,9 @@ pub fn resumeInstance(instance: *microvm_registry.Instance) !void {
             serialWrite("VMX: vmlaunch failed err=0x");
             printHex(vmread(VMCS_VM_INSTRUCTION_ERROR) orelse 0);
             serialWrite("\n");
+            if (instance.vmcs_phys) |vmcs| {
+                if (vmclear(vmcs)) instance.vmcs_active_cpu = null;
+            }
             return error.VmlaunchFailed;
         }
         return;
@@ -3379,6 +3488,7 @@ pub fn resumeInstance(instance: *microvm_registry.Instance) !void {
 
     // Switch to this instance's VMCS
     if (!vmptrld(instance.vmcs_phys.?)) return error.VmptrldFailed;
+    instance.vmcs_active_cpu = @intCast(core_id);
 
     smp.serialAcquire();
     serialWrite("[SMP core ");
@@ -3396,6 +3506,9 @@ pub fn resumeInstance(instance: *microvm_registry.Instance) !void {
         serialWrite("VMX: vmresume failed err=0x");
         printHex(vmread(VMCS_VM_INSTRUCTION_ERROR) orelse 0);
         serialWrite("\n");
+        if (instance.vmcs_phys) |vmcs| {
+            if (vmclear(vmcs)) instance.vmcs_active_cpu = null;
+        }
         return error.VmresumeFailed;
     }
 
@@ -3405,4 +3518,177 @@ pub fn resumeInstance(instance: *microvm_registry.Instance) !void {
 
     // Handle the VM-exit (ASM bridge logic if we return here)
     try handleVmExit(instance);
+}
+
+fn freeInstancePoolPage(instance: *microvm_registry.Instance, phys: u64) void {
+    clearPage(phys);
+    pmm.freePage(phys);
+    if (instance.pool_used > 0) {
+        instance.pool_used -= 1;
+    }
+}
+
+fn freeEptHierarchy(instance: *microvm_registry.Instance, root_phys: u64) void {
+    const pml4 = eptTablePtr(root_phys);
+    for (0..512) |idx4| {
+        const pml4e = pml4[idx4];
+        if ((pml4e & 0x7) == 0) continue;
+        const pdpt_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+        const pdpt = eptTablePtr(pdpt_phys);
+        for (0..512) |idx3| {
+            const pdpte = pdpt[idx3];
+            if ((pdpte & 0x7) == 0) continue;
+            if ((pdpte & (1 << 7)) != 0) {
+                freeInstancePoolPage(instance, pdpte & 0x000F_FFFF_C000_0000);
+                continue;
+            }
+            const pd_phys = pdpte & 0x000F_FFFF_FFFF_F000;
+            const pd = eptTablePtr(pd_phys);
+            for (0..512) |idx2| {
+                const pde = pd[idx2];
+                if ((pde & 0x7) == 0) continue;
+                if ((pde & (1 << 7)) != 0) {
+                    freeInstancePoolPage(instance, pde & 0x000F_FFFF_FFE0_0000);
+                    continue;
+                }
+                const pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+                const pt = eptTablePtr(pt_phys);
+                for (0..512) |idx1| {
+                    const pte = pt[idx1];
+                    if ((pte & 0x7) == 0) continue;
+                    freeInstancePoolPage(instance, pte & 0x000F_FFFF_FFFF_F000);
+                }
+                freeInstancePoolPage(instance, pt_phys);
+            }
+            freeInstancePoolPage(instance, pd_phys);
+        }
+        freeInstancePoolPage(instance, pdpt_phys);
+    }
+    clearPage(root_phys);
+    pmm.freePage(root_phys);
+}
+
+pub fn reclaimInstanceResources(instance: *microvm_registry.Instance) bool {
+    if (instance.state == .running or instance.state == .stopping) return false;
+    if (!@import("builtin").is_test) {
+        const scheduler = @import("../../kernel/scheduler.zig");
+        if (scheduler.hasActiveVmxThread(instance.instance_id)) return false;
+    }
+
+    if (instance.vmcs_phys) |vmcs| {
+        if (instance.vmcs_active_cpu) |active_cpu| {
+            if (@import("builtin").is_test) {
+                instance.vmcs_active_cpu = null;
+            } else {
+                const current_cpu = smp.getCurrentCpuId();
+                if (active_cpu != @as(u8, @intCast(current_cpu))) return false;
+                if (!vmclear(vmcs)) return false;
+                instance.vmcs_active_cpu = null;
+            }
+        }
+    }
+
+    if (instance.ept_pml4_phys) |root_phys| {
+        if (!invalidateEptRoot(root_phys)) return false;
+        freeEptHierarchy(instance, root_phys);
+        instance.ept_pml4_phys = null;
+    }
+
+    if (instance.vmcs_phys) |vmcs| {
+        clearPage(vmcs);
+        pmm.freePage(vmcs);
+        instance.vmcs_phys = null;
+    }
+
+    if (instance.pool_phys) |pool| {
+        clearPage(pool);
+        pmm.freePage(pool);
+        instance.pool_phys = null;
+    }
+
+    if (instance.pool_used != 0) return false;
+
+    if (!@import("builtin").is_test) {
+        const scheduler = @import("../../kernel/scheduler.zig");
+        if (!scheduler.reclaimVmxThreadForVm(instance.instance_id)) return false;
+    }
+
+    microvm_bridge.dropForVm(instance.instance_id);
+    virtio_net.resetInstance(instance.instance_id);
+    virtio_blk.resetInstance(instance.instance_id);
+    if (instance.instance_id < per_instance_launch_state.len) {
+        per_instance_launch_state[instance.instance_id] = .{};
+    }
+    if (instance.instance_id < vm_serial_line_len.len) {
+        vm_serial_line_len[instance.instance_id] = 0;
+    }
+    return true;
+}
+
+pub fn reclaimInstanceById(instance_id: u32) bool {
+    const inst = microvm_registry.findMutable(instance_id) orelse return false;
+    return reclaimInstanceResources(inst);
+}
+
+var vmx_reclaim_test_backing: [32][4096]u8 align(4096) = undefined;
+
+test "VM resource reclamation zeroes and frees EPT tables, guest leaves, and VMCS" {
+    @memset(std.mem.asBytes(&vmx_reclaim_test_backing), 0);
+    const hhdm = @intFromPtr(&vmx_reclaim_test_backing);
+    var entry = limine.MemmapEntry{
+        .base = 0,
+        .length = @sizeOf(@TypeOf(vmx_reclaim_test_backing)),
+        .kind = limine.MEMMAP_USABLE,
+    };
+    var entries = [_]*limine.MemmapEntry{&entry};
+    var memmap = limine.MemmapResponse{
+        .revision = 0,
+        .entry_count = 1,
+        .entries = @ptrCast(&entries),
+    };
+    pmm.init(&memmap, hhdm);
+    setHhdmOffset(hhdm);
+    defer setHhdmOffset(0);
+
+    microvm_registry.init();
+    virtio_net.init();
+    virtio_blk.init();
+    microvm_bridge.init();
+
+    const free_before = pmm.getFreePages();
+    const vm_name: [32]u8 = @splat(0);
+    const vm_container: [32]u8 = @splat(0);
+    const vmid = microvm_registry.create(vm_name, vm_container, 16, 1, 0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    const inst = microvm_registry.findMutable(vmid) orelse return error.TestUnexpectedResult;
+
+    const gpa0_hpa = try ensureGuestPageForInstance(inst, 0x0000);
+    const gpa1_hpa = try ensureGuestPageForInstance(inst, 0x1000);
+    const vmcs_page = pmm.allocPage() orelse return error.TestUnexpectedResult;
+    inst.vmcs_phys = vmcs_page;
+    inst.state = .running;
+
+    try copyIntoGuestForInstance(inst, 0x0000, "secret-guest-ram");
+    try std.testing.expect(inst.ept_pml4_phys != null);
+    try std.testing.expect(inst.pool_used > 0);
+    try std.testing.expect(pmm.getFreePages() < free_before);
+
+    // Running VM cannot be reclaimed or deleted.
+    try std.testing.expect(!reclaimInstanceById(vmid));
+    try std.testing.expect(!microvm_registry.delete(vmid));
+
+    // Stop and complete VM exit, then reclaim and delete.
+    try std.testing.expect(microvm_registry.stop(vmid));
+    try std.testing.expect(microvm_registry.completeStop(vmid));
+    try std.testing.expect(reclaimInstanceById(vmid));
+    try std.testing.expectEqual(@as(?u64, null), inst.ept_pml4_phys);
+    try std.testing.expectEqual(@as(?u64, null), inst.vmcs_phys);
+    try std.testing.expectEqual(@as(u64, 0), inst.pool_used);
+    try std.testing.expectEqual(free_before, pmm.getFreePages());
+
+    const zero_page: [4096]u8 = @splat(0);
+    const page0_slice = @as([*]const u8, @ptrFromInt(gpa0_hpa + hhdm))[0..4096];
+    const page1_slice = @as([*]const u8, @ptrFromInt(gpa1_hpa + hhdm))[0..4096];
+    try std.testing.expectEqualSlices(u8, &zero_page, page0_slice);
+    try std.testing.expectEqualSlices(u8, &zero_page, page1_slice);
+    try std.testing.expect(microvm_registry.delete(vmid));
 }

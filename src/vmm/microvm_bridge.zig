@@ -94,6 +94,41 @@ pub fn dequeue() ?Entry {
     return entry;
 }
 
+pub fn dequeueForVm(microvm_id: identity.MicrovmId) ?Entry {
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    if (count == 0) return null;
+
+    var found: ?Entry = null;
+    var i: u8 = 0;
+    var write_idx: u8 = head;
+    var read_idx: u8 = head;
+    var new_count: u8 = 0;
+    while (i < count) : (i += 1) {
+        const entry = buf[@as(usize, read_idx)];
+        read_idx +%= 1;
+        if (read_idx >= capU8()) read_idx = 0;
+
+        if (found == null and entry.microvm_id == microvm_id) {
+            found = entry;
+        } else {
+            buf[@as(usize, write_idx)] = entry;
+            write_idx +%= 1;
+            if (write_idx >= capU8()) write_idx = 0;
+            new_count += 1;
+        }
+    }
+    tail = write_idx;
+    count = new_count;
+    return found;
+}
+
+pub fn dropForVm(microvm_id: identity.MicrovmId) void {
+    while (dequeueForVm(microvm_id)) |entry| {
+        dipc.freePageMessage(entry.page_phys);
+    }
+}
+
 pub fn descriptorForEntry(
     hhdm_offset: u64,
     entry: Entry,
@@ -235,6 +270,7 @@ fn validateQueueMemory(vmid: u32, q: *const virtio_blk.QueueState, event_idx: bo
 /// calls this routine to package the read/write request into a DIPC page targeted at `storaged`.
 pub fn routeVirtioBlkNotify(vmid: u32, queue_idx: u16) void {
     if (queue_idx != 0) return;
+    if (!microvm_registry.isRunning(vmid)) return;
 
     const inst = virtio_blk.getInstance(vmid) orelse return;
     const q = &inst.queues[0];
@@ -341,6 +377,7 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
     if ((d2.flags & virtio_blk.VIRTQ_DESC_F_INDIRECT) != 0) return error.InvalidDescriptor;
 
     if ((d2.flags & virtio_blk.VIRTQ_DESC_F_NEXT) != 0) {
+        if (operation == virtio_blk.VIRTIO_BLK_T_FLUSH) return error.InvalidDescriptor;
         if (d2.len == 0 or d2.len > std.math.maxInt(u16) or d2.len % 512 != 0) return error.InvalidDescriptor;
         if (operation == virtio_blk.VIRTIO_BLK_T_IN and (d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0) {
             return error.InvalidDescriptor;
@@ -358,6 +395,7 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
         if (!validateGuestSpan(vmid, d3.addr, 1)) return error.InvalidGpa;
         info.status_addr = d3.addr;
     } else {
+        if (operation != virtio_blk.VIRTIO_BLK_T_FLUSH) return error.InvalidDescriptor;
         if ((d2.flags & virtio_blk.VIRTQ_DESC_F_WRITE) == 0 or d2.len < 1) return error.InvalidDescriptor;
         if (!validateGuestSpan(vmid, d2.addr, 1)) return error.InvalidGpa;
         info.status_addr = d2.addr;
@@ -517,6 +555,7 @@ pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable)
 
 /// Receives block I/O completions from `storaged`.
 pub fn handleVirtioBlkResponse(vmid: u32, head_idx: u16, io_status: u8) void {
+    if (!microvm_registry.isRunning(vmid)) return;
     const hhdm = bridge_hhdm_offset;
 
     const inst = virtio_blk.getInstance(vmid) orelse return;
@@ -594,6 +633,13 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     setBridgeContext(hhdm, &table);
 
     const vmid: u32 = 1;
+    microvm_registry.init();
+    const vm_name: [32]u8 = @splat(0);
+    const vm_container: [32]u8 = @splat(0);
+    const created_vmid = microvm_registry.create(vm_name, vm_container, 1, 1, 0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(vmid, created_vmid);
+    try std.testing.expect(microvm_registry.start(vmid));
+
     const inst = virtio_blk.getInstance(vmid).?;
     inst.driver_features = virtio_blk.VIRTIO_F_EVENT_IDX;
     const q = &inst.queues[0];
@@ -659,6 +705,66 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     try std.testing.expectEqual(@as(u16, 2), readGuestInt(u16, hhdm, vmid, q.device_addr + 2).?);
     try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 4 + 8 + 4).?);
     try std.testing.expectEqual(@as(usize, 1), test_irq_count);
+
+    // Verify 2-descriptor chain validation: valid for FLUSH, invalid for IN/OUT
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1100, virtio_blk.VIRTIO_BLK_T_FLUSH);
+    _ = writeGuestInt(u64, hhdm, vmid, 0x1FE0 + 0, 0x1100);
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1FE0 + 8, 16);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FE0 + 12, virtio_blk.VIRTQ_DESC_F_NEXT);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FE0 + 14, 2); // -> status descriptor directly
+    const flush_info = try decodeDescriptorChain(hhdm, vmid, q, 0);
+    try std.testing.expectEqual(@as(u32, @backingInt(storaged_protocol.ReqType.flush)), flush_info.storaged_req_type);
+    try std.testing.expectEqual(@as(u32, 0), flush_info.data_len);
+
+    // 2-descriptor chain with VIRTIO_BLK_T_IN must fail with InvalidDescriptor
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1100, virtio_blk.VIRTIO_BLK_T_IN);
+    try std.testing.expectError(error.InvalidDescriptor, decodeDescriptorChain(hhdm, vmid, q, 0));
+
+    // 3-descriptor chain with VIRTIO_BLK_T_FLUSH must fail with InvalidDescriptor
+    _ = writeGuestInt(u32, hhdm, vmid, 0x1100, virtio_blk.VIRTIO_BLK_T_FLUSH);
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FE0 + 14, 1); // -> data descriptor -> status descriptor
+    try std.testing.expectError(error.InvalidDescriptor, decodeDescriptorChain(hhdm, vmid, q, 0));
+
+    // Verify control_handler.handleKernelControlPage accepts .virtio_blk_response from storaged
+    // and rejects non-storaged senders
+    const control_handler = @import("../control/control_handler.zig");
+    const node_config = @import("../ipc/node_config.zig");
+    var resp_buf: [@sizeOf(control_protocol.ControlHeader) + @sizeOf(control_protocol.VirtioBlkResponsePayload)]u8 = undefined;
+    const ch = control_protocol.ControlHeader{
+        .op = .virtio_blk_response,
+        .payload_len = @sizeOf(control_protocol.VirtioBlkResponsePayload),
+    };
+    const resp_payload = control_protocol.VirtioBlkResponsePayload{
+        .vmid = vmid,
+        .head_idx = 0,
+        .status = virtio_blk.VIRTIO_BLK_S_OK,
+    };
+    @memcpy(resp_buf[0..@sizeOf(control_protocol.ControlHeader)], std.mem.asBytes(&ch));
+    @memcpy(resp_buf[@sizeOf(control_protocol.ControlHeader)..], std.mem.asBytes(&resp_payload));
+
+    const local_node = node_config.getLocalNode();
+    const unauthorized_src = dipc.Address{
+        .node = local_node,
+        .endpoint = @backingInt(identity.ReservedEndpoint.netd),
+    };
+    const dst_addr = dipc.Address{
+        .node = local_node,
+        .endpoint = @backingInt(identity.ReservedEndpoint.kernel_control),
+    };
+    const bad_page = try dipc.allocPageMessage(hhdm, unauthorized_src, dst_addr, &resp_buf);
+    defer dipc.freePageMessage(bad_page);
+    try std.testing.expectError(error.Unauthorized, control_handler.handleKernelControlPage(hhdm, &table, bad_page));
+
+    const storaged_src = dipc.Address{
+        .node = local_node,
+        .endpoint = @backingInt(identity.ReservedEndpoint.storaged),
+    };
+    _ = writeGuestInt(u16, hhdm, vmid, 0x1FE0 + 14, 2); // restore valid 2-descriptor FLUSH chain
+    _ = writeGuestInt(u8, hhdm, vmid, 0x1400, 0xFF);
+    const ok_page = try dipc.allocPageMessage(hhdm, storaged_src, dst_addr, &resp_buf);
+    defer dipc.freePageMessage(ok_page);
+    try control_handler.handleKernelControlPage(hhdm, &table, ok_page);
+    try std.testing.expectEqual(@as(u8, virtio_blk.VIRTIO_BLK_S_OK), readGuestInt(u8, hhdm, vmid, 0x1400).?);
 }
 
 test "virtio-blk request metadata matches storaged wire layout" {

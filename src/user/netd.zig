@@ -625,6 +625,51 @@ fn applySwitchBindings(
     return ack;
 }
 
+fn applySwitchRuleUpdate(
+    switcher: *virtual_switch.Switch,
+    request: *align(1) const netd_proto.SwitchRuleUpdatePayload,
+) netd_proto.SwitchBindingsAckPayload {
+    var ack = netd_proto.SwitchBindingsAckPayload{
+        .request_id = request.request_id,
+        .status = .ok,
+        .vmid = request.vmid,
+        .generation = request.generation,
+        .policy_revision = 0,
+    };
+    const result: virtual_switch.RuleError!u64 = blk: {
+        if (request._pad != 0 or request._reserved != 0) break :blk error.Invalid;
+        if (request.action == netd_proto.SWITCH_RULE_CLEAR) {
+            break :blk switcher.clearRules(request.vmid, request.generation, request.expected_revision);
+        }
+        const direction: virtual_switch.Direction = switch (request.action) {
+            netd_proto.SWITCH_RULE_ADD_INGRESS => .ingress,
+            netd_proto.SWITCH_RULE_ADD_EGRESS => .egress,
+            else => break :blk error.Invalid,
+        };
+        const ip_version: virtual_switch.IpVersion = switch (request.ip_version) {
+            4 => .ipv4,
+            6 => .ipv6,
+            else => break :blk error.Invalid,
+        };
+        break :blk switcher.addRule(request.vmid, request.generation, request.expected_revision, direction, .{
+            .ip_version = ip_version,
+            .protocol = request.protocol,
+            .destination = request.destination,
+            .destination_port_first = request.destination_port_first,
+            .destination_port_last = request.destination_port_last,
+        });
+    };
+    ack.policy_revision = result catch |err| {
+        ack.status = switch (err) {
+            error.Invalid, error.Duplicate => .invalid,
+            error.Stale => .stale,
+            error.Full, error.RevisionExhausted => .no_capacity,
+        };
+        return ack;
+    };
+    return ack;
+}
+
 fn handleSwitchConfig(
     page_hdr: *align(1) const lib.PageHeader,
     op: netd_proto.Op,
@@ -679,6 +724,16 @@ fn handleSwitchConfig(
             const request: *align(1) const netd_proto.SwitchBindingsReplacePayload = @ptrFromInt(payload_va);
             const ack = applySwitchBindings(&g_virtual_switch, request);
             _ = sendLocalSwitchMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .switch_bindings_ack, std.mem.asBytes(&ack));
+        },
+        .switch_rule_update => {
+            if (payload_len != @sizeOf(netd_proto.SwitchRuleUpdatePayload)) {
+                sendSwitchConfigAck(page_hdr, op, .invalid, 0, 0, 0);
+                return;
+            }
+            const request: *align(1) const netd_proto.SwitchRuleUpdatePayload = @ptrFromInt(payload_va);
+            const ack = applySwitchRuleUpdate(&g_virtual_switch, request);
+            _ = sendLocalSwitchMessage(&page_hdr.src.node.bytes, page_hdr.src.endpoint, .switch_rule_ack, std.mem.asBytes(&ack));
+            lib.serialWrite(if (ack.status == .ok) "netd: vswitch rule updated\n" else "netd: vswitch rule rejected\n");
         },
         .switch_policy_replace => {
             if (payload_len != @sizeOf(netd_proto.SwitchPolicyReplacePayload)) {
@@ -748,11 +803,41 @@ fn handleSwitchConfig(
     }
 }
 
+var g_vswitch_log_counts: [virtual_switch.DROP_REASON_COUNT + 2]u32 = @splat(0);
+
+/// Bounded switch audit trail: the first 16 events of each kind, then only
+/// power-of-two occurrences, so a noisy guest cannot flood the console.
+fn vswitchShouldLog(slot: usize) bool {
+    const count = g_vswitch_log_counts[slot] +| 1;
+    g_vswitch_log_counts[slot] = count;
+    return count <= 16 or std.math.isPowerOfTwo(count);
+}
+
 fn handleGuestFrame(page_hdr: *align(1) const lib.PageHeader, frame: []const u8) void {
     const vmid = microvmIdFromTxEndpoint(page_hdr.src.endpoint) orelse return;
     const generation = g_virtual_switch.currentGeneration(vmid) orelse return;
-    const decision = g_virtual_switch.decide(vmid, generation, frame);
+    const decision = g_virtual_switch.decideCounted(vmid, generation, frame);
+    var line: [112]u8 = undefined;
+    if (decision.count == 0) {
+        const reason = @intFromEnum(decision.drop_reason);
+        if (vswitchShouldLog(reason)) {
+            const text = std.fmt.bufPrint(&line, "netd: vswitch drop vm{d} {s} total={d}\n", .{
+                vmid, @tagName(decision.drop_reason), g_virtual_switch.counters.drops[reason],
+            }) catch return;
+            lib.serialWrite(text);
+        }
+        return;
+    }
+    const bootstrap = frame.len >= 14 and (std.mem.readInt(u16, frame[12..14], .big) == 0x0806 or
+        (std.mem.readInt(u16, frame[12..14], .big) == 0x86DD and frame.len > 54 and frame[20] == 58 and frame[54] >= 135 and frame[54] <= 136));
+    const slot = virtual_switch.DROP_REASON_COUNT + @as(usize, if (bootstrap) 1 else 0);
     for (decision.deliveries[0..decision.count]) |delivery| {
+        if (vswitchShouldLog(slot)) {
+            const text = std.fmt.bufPrint(&line, "netd: vswitch {s} vm{d} -> vm{d} len={d}\n", .{
+                if (bootstrap) "bootstrap" else "forward", vmid, delivery.port_id, frame.len,
+            }) catch return;
+            lib.serialWrite(text);
+        }
         sendGuestFrameToMicrovm(delivery.port_id, frame);
     }
 }
@@ -931,7 +1016,8 @@ fn handleLocalNetdMessage(page_hdr: *align(1) const lib.PageHeader, recv_va: u64
         .switch_port_attach, .switch_port_detach, .switch_policy_replace, .switch_bindings_replace => {
             handleSwitchConfig(page_hdr, msg_hdr.op, msg_payload_va, msg_payload_len);
         },
-        .switch_config_ack, .switch_bindings_ack => {},
+        .switch_rule_update => handleSwitchConfig(page_hdr, msg_hdr.op, msg_payload_va, msg_payload_len),
+        .switch_config_ack, .switch_bindings_ack, .switch_rule_ack => {},
     }
 }
 
@@ -2307,4 +2393,46 @@ test "wire DIPC source cannot impersonate a local or unspecified node" {
     try std.testing.expect(!isRemoteDipcClaim(&remote, &local, &local));
     try std.testing.expect(!isRemoteDipcClaim(&remote, &loopback.bytes, &local));
     try std.testing.expect(!isRemoteDipcClaim(&loopback.bytes, &loopback.bytes, &local));
+}
+
+test "netd rule updates are revision-checked and fail closed" {
+    var switcher: virtual_switch.Switch = .{};
+    const attach = netd_proto.SwitchPortAttachPayload{
+        .vmid = 5,
+        .segment = 1,
+        .mac = netd_proto.hostAssignedMac(5),
+        .ipv4_count = 0,
+        .ipv6_count = 0,
+    };
+    const initial = applySwitchPortAttach(&switcher, &attach);
+    var request = netd_proto.SwitchRuleUpdatePayload{
+        .vmid = 5,
+        .action = netd_proto.SWITCH_RULE_ADD_EGRESS,
+        .ip_version = 4,
+        .protocol = 17,
+        .generation = initial.generation,
+        .expected_revision = initial.policy_revision,
+        .request_id = 9,
+        .destination_port_first = 53,
+        .destination_port_last = 53,
+    };
+    request.destination[0..4].* = .{ 10, 77, 0, 2 };
+
+    const added = applySwitchRuleUpdate(&switcher, &request);
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, added.status);
+    try std.testing.expectEqual(@as(u64, 2), added.policy_revision);
+    try std.testing.expectEqual(@as(u64, 9), added.request_id);
+
+    // Replaying the same request is stale (revision moved) and does not change policy.
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, applySwitchRuleUpdate(&switcher, &request).status);
+    try std.testing.expectEqual(@as(?u64, 2), switcher.policyRevision(5, initial.generation));
+
+    request.expected_revision = 2;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.invalid, applySwitchRuleUpdate(&switcher, &request).status);
+    request.action = 7;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.invalid, applySwitchRuleUpdate(&switcher, &request).status);
+    request.action = netd_proto.SWITCH_RULE_CLEAR;
+    const cleared = applySwitchRuleUpdate(&switcher, &request);
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, cleared.status);
+    try std.testing.expectEqual(@as(u64, 3), cleared.policy_revision);
 }

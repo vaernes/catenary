@@ -76,6 +76,8 @@ pub const Op = enum(u16) {
     local_port_status_reply = 8,
     local_bindings_replace = 9,
     local_bindings_reply = 10,
+    local_rule_update = 11,
+    local_rule_reply = 12,
 };
 
 pub const ConfigdHeader = extern struct {
@@ -103,6 +105,8 @@ pub const LocalPortStatusReply = extern struct {
 
 pub const LocalBindingsRequest = netd_proto.SwitchBindingsReplacePayload;
 pub const LocalBindingsReply = netd_proto.SwitchBindingsAckPayload;
+pub const LocalRuleRequest = netd_proto.SwitchRuleUpdatePayload;
+pub const LocalRuleReply = netd_proto.SwitchBindingsAckPayload;
 
 /// Op.node_joined — a new node has been discovered.
 pub const NodeJoinPayload = extern struct {

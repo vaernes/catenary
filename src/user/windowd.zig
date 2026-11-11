@@ -169,10 +169,23 @@ const NetworkBindCommand = struct {
     ipv6: ?[16]u8 = null,
 };
 
+/// Operator firewall change for one vNIC: add an ingress/egress allow rule or
+/// clear all rules (restoring default-deny).
+const NetworkRuleCommand = struct {
+    vmid: u32,
+    action: u8,
+    ip_version: u8 = 0,
+    protocol: u8 = 0,
+    destination: [16]u8 = @splat(0),
+    port_first: u16 = 0,
+    port_last: u16 = 0,
+};
+
 const NetworkBindParse = union(enum) {
     unrelated,
     invalid,
     binding: NetworkBindCommand,
+    rule: NetworkRuleCommand,
 };
 
 const NetworkBindPhase = enum { querying, updating };
@@ -182,6 +195,7 @@ const PendingNetworkBind = struct {
     phase: NetworkBindPhase = .querying,
     generation: u64 = 0,
     expected_revision: u64 = 0,
+    rule: ?NetworkRuleCommand = null,
 };
 
 const NETWORK_REQUEST_TIMEOUT_TICKS: u32 = 1_000_000;
@@ -192,9 +206,66 @@ var network_status_buf: [46]u8 = @splat(0);
 var network_status_len: usize = 0;
 var network_status_color: u32 = color.COLOR_WHITE;
 
+/// `vnic-allow <vm-id> <in|out> <tcp|udp|icmp> <ipv4-or-ipv6> [port|first-last]`
+/// `vnic-clear <vm-id>`
+fn parseNetworkRuleCommand(name: []const u8, tokens: *std.mem.TokenIterator(u8, .any)) NetworkBindParse {
+    const vmid_text = tokens.next() orelse return .invalid;
+    const vmid = std.fmt.parseInt(u32, vmid_text, 10) catch return .invalid;
+    if (vmid == 0) return .invalid;
+    if (std.mem.eql(u8, name, "vnic-clear")) {
+        if (tokens.next() != null) return .invalid;
+        return .{ .rule = .{ .vmid = vmid, .action = proto_netd.SWITCH_RULE_CLEAR } };
+    }
+    const direction_text = tokens.next() orelse return .invalid;
+    const protocol_text = tokens.next() orelse return .invalid;
+    const address_text = tokens.next() orelse return .invalid;
+    const port_text = tokens.next();
+    if (tokens.next() != null) return .invalid;
+
+    var rule = NetworkRuleCommand{ .vmid = vmid, .action = 0 };
+    if (std.mem.eql(u8, direction_text, "in")) {
+        rule.action = proto_netd.SWITCH_RULE_ADD_INGRESS;
+    } else if (std.mem.eql(u8, direction_text, "out")) {
+        rule.action = proto_netd.SWITCH_RULE_ADD_EGRESS;
+    } else return .invalid;
+
+    if (std.Io.net.Ip4Address.parse(address_text, 0)) |address| {
+        rule.ip_version = 4;
+        @memcpy(rule.destination[0..4], &address.bytes);
+    } else |_| {
+        const address = std.Io.net.Ip6Address.parse(address_text, 0) catch return .invalid;
+        rule.ip_version = 6;
+        rule.destination = address.bytes;
+    }
+
+    if (std.mem.eql(u8, protocol_text, "icmp")) {
+        if (port_text != null) return .invalid;
+        rule.protocol = if (rule.ip_version == 4) 1 else 58;
+    } else {
+        if (std.mem.eql(u8, protocol_text, "tcp")) {
+            rule.protocol = 6;
+        } else if (std.mem.eql(u8, protocol_text, "udp")) {
+            rule.protocol = 17;
+        } else return .invalid;
+        const text = port_text orelse return .invalid;
+        if (std.mem.indexOfScalar(u8, text, '-')) |dash| {
+            rule.port_first = std.fmt.parseInt(u16, text[0..dash], 10) catch return .invalid;
+            rule.port_last = std.fmt.parseInt(u16, text[dash + 1 ..], 10) catch return .invalid;
+        } else {
+            rule.port_first = std.fmt.parseInt(u16, text, 10) catch return .invalid;
+            rule.port_last = rule.port_first;
+        }
+        if (rule.port_first == 0 or rule.port_first > rule.port_last) return .invalid;
+    }
+    return .{ .rule = rule };
+}
+
 fn parseNetworkBindCommand(command: []const u8) NetworkBindParse {
     var tokens = std.mem.tokenizeAny(u8, command, " \t");
     const name = tokens.next() orelse return .unrelated;
+    if (std.mem.eql(u8, name, "vnic-allow") or std.mem.eql(u8, name, "vnic-clear")) {
+        return parseNetworkRuleCommand(name, &tokens);
+    }
     if (!std.mem.eql(u8, name, "vnic-bind")) return .unrelated;
     const vmid_text = tokens.next() orelse return .invalid;
     const ipv4_text = tokens.next() orelse return .invalid;
@@ -267,6 +338,26 @@ fn startNetworkBind(command: NetworkBindCommand, dma_phys: u64, token: u64) void
     setNetworkStatus("Querying vNIC...", color.COLOR_HIGHLIGHT);
 }
 
+fn startNetworkRule(rule: NetworkRuleCommand, dma_phys: u64, token: u64) void {
+    if (pending_network_bind != null) {
+        setNetworkStatus("vNIC request already pending", color.COLOR_RED);
+        return;
+    }
+    const request_id = std.math.add(u64, network_request_id, 1) catch {
+        setNetworkStatus("vNIC request IDs exhausted", color.COLOR_RED);
+        return;
+    };
+    network_request_id = request_id;
+    const request = proto_configd.LocalPortStatusRequest{ .request_id = request_id, .vmid = rule.vmid };
+    if (!sendConfigdMessage(dma_phys, token, .local_port_status, std.mem.asBytes(&request))) {
+        setNetworkStatus("Could not query vNIC", color.COLOR_RED);
+        return;
+    }
+    pending_network_bind = .{ .request_id = request_id, .command = .{ .vmid = rule.vmid }, .rule = rule };
+    network_request_wait = 0;
+    setNetworkStatus("Querying vNIC...", color.COLOR_HIGHLIGHT);
+}
+
 fn isLocalConfigdReply(page: *const lib.PageHeader) bool {
     const loopback = lib.Ipv6Addr.loopback();
     return page.magic == lib.WireMagic and page.version == lib.WireVersion and
@@ -302,6 +393,31 @@ fn handleNetworkBindReply(page: *const lib.PageHeader, payload_va: u64, dma_phys
             return;
         }
         if (reply.generation == 0 or reply.policy_revision == 0) return;
+        if (pending.rule) |rule| {
+            const rule_request = proto_configd.LocalRuleRequest{
+                .vmid = rule.vmid,
+                .action = rule.action,
+                .ip_version = rule.ip_version,
+                .protocol = rule.protocol,
+                .generation = reply.generation,
+                .expected_revision = reply.policy_revision,
+                .request_id = pending.request_id,
+                .destination = rule.destination,
+                .destination_port_first = rule.port_first,
+                .destination_port_last = rule.port_last,
+            };
+            if (!sendConfigdMessage(dma_phys, token, .local_rule_update, std.mem.asBytes(&rule_request))) {
+                finishNetworkBind("Could not send vNIC rule", color.COLOR_RED);
+                return;
+            }
+            pending.phase = .updating;
+            pending.generation = reply.generation;
+            pending.expected_revision = reply.policy_revision;
+            pending_network_bind = pending;
+            network_request_wait = 0;
+            setNetworkStatus("Updating vNIC rules...", color.COLOR_HIGHLIGHT);
+            return;
+        }
         var request = proto_configd.LocalBindingsRequest{
             .vmid = pending.command.vmid,
             .generation = reply.generation,
@@ -322,7 +438,29 @@ fn handleNetworkBindReply(page: *const lib.PageHeader, payload_va: u64, dma_phys
         pending_network_bind = pending;
         network_request_wait = 0;
         setNetworkStatus("Updating vNIC...", color.COLOR_HIGHLIGHT);
-    } else if (op == @backingInt(proto_configd.Op.local_bindings_reply) and pending.phase == .updating) {
+    } else if (op == @backingInt(proto_configd.Op.local_rule_reply) and pending.phase == .updating and pending.rule != null) {
+        if (header.payload_len != @sizeOf(proto_configd.LocalRuleReply)) return;
+        const reply: *align(1) const proto_configd.LocalRuleReply = @ptrFromInt(body_va);
+        if (reply.request_id != pending.request_id or reply.vmid != pending.command.vmid or
+            reply.generation != pending.generation or reply._reserved != 0) return;
+        const status = @as(*align(1) const u16, @ptrCast(&reply.status)).*;
+        if (status > @backingInt(proto_netd.SwitchConfigStatus.no_capacity)) return;
+        if (status == @backingInt(proto_netd.SwitchConfigStatus.ok)) {
+            const next_revision = std.math.add(u64, pending.expected_revision, 1) catch return;
+            if (reply.policy_revision != next_revision) return;
+            if (pending.rule.?.action == proto_netd.SWITCH_RULE_CLEAR) {
+                finishNetworkBind("vNIC rules cleared; default-deny", color.COLOR_GREEN);
+                lib.serialWrite("[UI] vNIC rules cleared (default-deny)\n");
+            } else {
+                finishNetworkBind("vNIC rule added", color.COLOR_GREEN);
+                lib.serialWrite("[UI] vNIC rule added\n");
+            }
+        } else {
+            if (reply.policy_revision != 0) return;
+            finishNetworkBind("vNIC rule rejected; check syntax/state", color.COLOR_RED);
+            lib.serialWrite("[UI] vNIC rule rejected\n");
+        }
+    } else if (op == @backingInt(proto_configd.Op.local_bindings_reply) and pending.phase == .updating and pending.rule == null) {
         if (header.payload_len != @sizeOf(proto_configd.LocalBindingsReply)) return;
         const reply: *align(1) const proto_configd.LocalBindingsReply = @ptrFromInt(body_va);
         if (reply.request_id != pending.request_id or reply.vmid != pending.command.vmid or
@@ -1248,8 +1386,9 @@ fn handleInputEvent(evt: InputEventPayload, bs: *const lib.BootstrapDescriptor, 
                     }
                     _ = lib.syscall(SYS_VARDE_INJECT, '\n', 0, token);
                 },
-                .invalid => setNetworkStatus("Invalid vNIC binding command", color.COLOR_RED),
+                .invalid => setNetworkStatus("Invalid vNIC command (see help)", color.COLOR_RED),
                 .binding => |binding| startNetworkBind(binding, dma_phys, token),
+                .rule => |rule| startNetworkRule(rule, dma_phys, token),
             }
             shell_input.clear();
             shell_scroll_offset = 0;
@@ -2068,4 +2207,46 @@ test "vNIC configuration replies require the local configd endpoint" {
     page.src.node = lib.Ipv6Addr.loopback();
     page.dst.node.bytes[0] = 0xFE;
     try std.testing.expect(!isLocalConfigdReply(&page));
+}
+
+test "vNIC firewall commands parse allow rules and clear" {
+    const allow = parseNetworkBindCommand("vnic-allow 1 out udp 10.77.0.2 5001");
+    try std.testing.expect(allow == .rule);
+    try std.testing.expectEqual(@as(u32, 1), allow.rule.vmid);
+    try std.testing.expectEqual(proto_netd.SWITCH_RULE_ADD_EGRESS, allow.rule.action);
+    try std.testing.expectEqual(@as(u8, 4), allow.rule.ip_version);
+    try std.testing.expectEqual(@as(u8, 17), allow.rule.protocol);
+    try std.testing.expectEqual([4]u8{ 10, 77, 0, 2 }, allow.rule.destination[0..4].*);
+    try std.testing.expectEqual(@as(u16, 5001), allow.rule.port_first);
+    try std.testing.expectEqual(@as(u16, 5001), allow.rule.port_last);
+
+    const range = parseNetworkBindCommand("vnic-allow 2 in tcp fd00::2 8000-8010");
+    try std.testing.expect(range == .rule);
+    try std.testing.expectEqual(proto_netd.SWITCH_RULE_ADD_INGRESS, range.rule.action);
+    try std.testing.expectEqual(@as(u8, 6), range.rule.ip_version);
+    try std.testing.expectEqual(@as(u8, 6), range.rule.protocol);
+    try std.testing.expectEqual(@as(u16, 8000), range.rule.port_first);
+    try std.testing.expectEqual(@as(u16, 8010), range.rule.port_last);
+
+    const ping6 = parseNetworkBindCommand("vnic-allow 2 in icmp fd00::2");
+    try std.testing.expect(ping6 == .rule);
+    try std.testing.expectEqual(@as(u8, 58), ping6.rule.protocol);
+    const ping4 = parseNetworkBindCommand("vnic-allow 2 out icmp 10.77.0.1");
+    try std.testing.expectEqual(@as(u8, 1), ping4.rule.protocol);
+
+    const clear = parseNetworkBindCommand("vnic-clear 3");
+    try std.testing.expect(clear == .rule);
+    try std.testing.expectEqual(proto_netd.SWITCH_RULE_CLEAR, clear.rule.action);
+
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 sideways udp 10.77.0.2 53") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 0 out udp 10.77.0.2 53") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out udp 10.77.0.2") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out udp 10.77.0.2 0") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out udp 10.77.0.2 90-80") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out icmp 10.77.0.2 7") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out gre 10.77.0.2 7") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out udp nonsense 53") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-allow 1 out udp 10.77.0.2 53 extra") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-clear 3 extra") == .invalid);
+    try std.testing.expect(parseNetworkBindCommand("vnic-clear") == .invalid);
 }

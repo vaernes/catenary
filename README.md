@@ -23,7 +23,7 @@ A **catenary** is the curve a cable forms under its own weight. **Catenary OS** 
 
 Catenary avoids a monolithic kernel and in-kernel POSIX compatibility. Linux MicroVMs are the intended environment for OCI workloads; full Linux distribution and Windows VMs, secure guest networking, clustered storage, and a common cluster UI are planned. The project is not yet a production platform or a claim of full OCI or guest-OS compatibility.
 
-**Current limits:** the repository contains experimental Linux direct-boot, VMX/EPT, virtio, DIPC, NVMe, cluster-discovery, and native TUI paths. General UEFI-based full VMs, Windows support, complete VM microsegmentation, replay-protected encrypted cluster transport, and quorum-backed storage are not established end to end. `storaged` currently authorizes only the host-local metadata workflow; guest block requests fail closed until explicit per-VM disk extents exist. Storage fails without NVMe and sends NVMe Flush when a volatile cache is reported; FUA requests use a write-then-flush fallback. QEMU smoke results do not prove physical power-loss durability or native NVMe FUA behavior. See the [architecture overview](docs/architecture.md) and [test evidence](TEST_READY.md).
+**Current limits:** the repository contains experimental Linux direct-boot, VMX/EPT, virtio, DIPC, NVMe, cluster-discovery, and native TUI paths. General UEFI-based full VMs, Windows support, replay-protected encrypted cluster transport, and quorum-backed storage are not established end to end. `storaged` authorizes the host-local `containerd` metadata workflow and per-VM disk extents attached by `configd` (`VM 1 -> LBA 16384..18431`, `VM 2 -> LBA 18432..20479`); unattached or out-of-bounds guest block requests fail closed. Storage fails without NVMe and sends NVMe Flush when a volatile cache is reported; FUA requests use a write-then-flush fallback. QEMU smoke results (`SMOKE_PROFILE=phase10`) verify per-VM disk isolation, guest FUA write+flush+readback, dual-stack vSwitch policy enforcement, and VM stop/delete resource reclamation in QEMU, but do not prove physical power-loss durability or native NVMe FUA behavior. See the [architecture overview](docs/architecture.md) and [test evidence](TEST_READY.md).
 
 ---
 
@@ -66,9 +66,9 @@ Catenary OS includes an unprivileged Ring-3 display server and TUI manager (**`w
 
 Processes use page-backed messages addressed by node and endpoint. Local routing and experimental cross-node forwarding exist, but remote delivery, authorization, failure, and ownership remain explicit concerns. The current cluster-wide shared HMAC has a known replay gap and does not provide per-node identity or confidentiality.
 
-### Virtual Networking — Partial
+### Virtual Networking — Local Dual-Stack vSwitch
 
-The host and cluster control plane are IPv6-first. An experimental local switch has host-assigned vNIC identities and default-deny IPv4/IPv6 policy checks. The native shell can replace host-side address bindings with `vnic-bind <vm-id> <ipv4-or-> <ipv6-or->`; this clears allow rules and does not configure the guest. Allowed guest traffic, an operator-facing policy editor, bootstrap protocols, and a protected cross-node overlay are not yet established. See the [virtual network plan](docs/VIRTUAL_NETWORK_PLAN.md).
+The host and cluster control plane are IPv6-first. The local Ring-3 virtual switch (`netd`) enforces host-assigned vNIC MAC identities, anti-spoofing (`spoofed_mac`, `unauthorized_source_address`), and default-deny IPv4/IPv6 microsegmentation. The native Varde shell configures volatile host-side address bindings (`vnic-bind <vm-id> <ipv4-or-> <ipv6-or->`) and firewall rules (`vnic-allow <vm-id> <in|out> <tcp|udp|icmp> <peer-ip-or-*> [port]`, `vnic-clear <vm-id>`). Live guest-to-guest ARP, IPv4 UDP, and IPv6 ICMPv6 flows, default-deny drops, and rule revocation are verified in QEMU (`SMOKE_PROFILE=phase10`); guest DHCP/SLAAC bootstrap and an encrypted cross-node overlay remain future work. See the [virtual network plan](docs/VIRTUAL_NETWORK_PLAN.md).
 
 ### VM Hosting and Storage — Planned
 
@@ -99,6 +99,8 @@ Standalone virtual disks and the experimental three-node **Span-Weave** distribu
 - [x] **Phase 6: Storage Bring-Up** — Historical NVMe and Virtio-Blk paths; durable guest flush and persistent-volume guarantees remain open.
 - [x] **Phase 7: Cluster Orchestration** — Dynamic workload placement, remote launching, user-space TCP/IPv6, and SMP scaling.
 - [x] **Phase 8: User Interface & OS Interaction** — Modular Ring-3 TUI widget toolkit (`src/user/tui/`), dirty-rect window manager (`windowd`), interactive MicroVM lifecycle forms, Varde shell line editor with history/scrollback, and automated keyboard smoke testing (`SMOKE_PROFILE=ui-phase8`).
+- [x] **Phase 9: Multi-MicroVM SMP & Live Guest Serial Console (QEMU scope)** — Per-instance 4-level EPT radix trees and dedicated VMCS, per-core VMXON/host stacks/TSS bases, thread core affinity, virtual 16550 UART TX/RX buffers, and live guest console switching (`SMOKE_PROFILE=phase9`).
+- [x] **Phase 10: Local Reliability & Virtual Networking (QEMU scope)** — Checksummed write-ahead metadata journaling, per-VM NVMe disk extent isolation with guest FUA+flush verification, Ring-3 dual-stack virtual switch with anti-spoofing and default-deny firewall rules (`vnic-bind`, `vnic-allow`, `vnic-clear`), live guest-to-guest ARP/UDP4/ICMPv6 flows, and full VM stop/delete resource reclamation (`SMOKE_PROFILE=phase10`).
 
 See [docs/PHASE_8_ROADMAP.md](docs/PHASE_8_ROADMAP.md) for detailed Phase 8 architecture and milestones.  
 See [docs/PHASE_7_ROADMAP.md](docs/PHASE_7_ROADMAP.md) for completed Phase 7 verification.
@@ -147,6 +149,12 @@ SMOKE_PROFILE=journal-commit-recovery ./test_qemu.sh
 
 # Automated Phase 8 UI, MicroVM form provisioning, and Varde shell verification
 SMOKE_PROFILE=ui-phase8 ./test_qemu.sh
+
+# Automated Phase 9 concurrent dual-MicroVM SMP and live guest serial console switching
+SMOKE_PROFILE=phase9 ./test_qemu.sh
+
+# Automated Phase 10 per-VM disk extents, FUA+flush, dual-stack vSwitch policy/traffic, and VM delete reclamation
+SMOKE_PROFILE=phase10 ./test_qemu.sh
 ```
 
 Additional build/run notes and bring-up options are documented in [docs/SETUP.md](docs/SETUP.md).

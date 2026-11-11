@@ -17,6 +17,8 @@ const lib = @import("lib.zig");
 ///   'q' — Shutdown request (idles)
 const configd_proto = @import("protocols/configd_protocol.zig");
 const netd_proto = @import("protocols/netd_protocol.zig");
+const partition_metadata = @import("protocols/partition_metadata.zig");
+const storaged_proto = @import("protocols/storaged_protocol.zig");
 
 // ---------------------------------------------------------------------------
 // Syscall shim
@@ -101,6 +103,39 @@ fn sendNetdConfig(
             payload,
         );
     }
+    return lib.syscall(SYS_SEND_PAGE, dma_phys, 0, token) == 0;
+}
+
+fn sendStoragedVmDiskConfig(
+    bs: *const BootstrapDescriptor,
+    token: u64,
+    dma_phys: u64,
+    req_type: storaged_proto.ReqType,
+    vmid: u32,
+) bool {
+    const start_lba = partition_metadata.vmDiskStartLba(vmid) orelse return false;
+    const scratch: [*]u8 = lib.ptrFrom([*]u8, DMA_DIPC_SLOT);
+    const local_node = lib.Ipv6Addr{ .bytes = bs.local_node };
+    const header: *align(1) lib.PageHeader = @ptrFromInt(@intFromPtr(scratch));
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @intCast(@sizeOf(storaged_proto.BlkRequest)),
+        .auth_tag = 0,
+        .src = .{ .node = local_node, .endpoint = EP_CONFIGD },
+        .dst = .{ .node = local_node, .endpoint = EP_STORAGED },
+    };
+    const req: *align(1) storaged_proto.BlkRequest =
+        @ptrFromInt(@intFromPtr(scratch) + lib.DIPC_HEADER_SIZE);
+    req.* = .{
+        .req_type = @backingInt(req_type),
+        .sector = if (req_type == .attach_vm_disk) start_lba else 0,
+        .vmid = vmid,
+        .chain_head = 0,
+        .data_len = if (req_type == .attach_vm_disk) @intCast(partition_metadata.VM_DISK_SECTORS) else 0,
+        .data_hpa = 0,
+    };
     return lib.syscall(SYS_SEND_PAGE, dma_phys, 0, token) == 0;
 }
 
@@ -200,32 +235,49 @@ fn reconcileNetworkPorts(
         if (!port.used) continue;
         const is_running = vmIsRunning(snapshot, port.vmid);
         if (is_running) {
+            if (!port.disk_attached) {
+                if (sendStoragedVmDiskConfig(bs, token, dma_phys, .attach_vm_disk, port.vmid)) {
+                    port.disk_attached = true;
+                    lib.serialWrite("configd: per-VM disk attached\n");
+                }
+            }
             if (port.state == .unused or port.state == .attach_pending) {
                 requestPortAttach(bs, token, dma_phys, port);
             } else if (port.state == .attached) {
                 progressPendingBindings(bs, token, dma_phys, port);
             }
-        } else if (port.state == .attached or port.state == .detach_pending) {
-            if (port.pending_bindings) |request| {
-                const reply = port.pending_binding_reply orelse configd_proto.LocalBindingsReply{
-                    .request_id = request.request_id,
-                    .vmid = request.vmid,
-                    .status = .stale,
-                    .generation = request.generation,
-                    .policy_revision = 0,
-                };
-                _ = sendLocalConfigReply(token, dma_phys, .local_bindings_reply, std.mem.asBytes(&reply));
-                port.pending_bindings = null;
-                port.pending_binding_reply = null;
+        } else {
+            if (port.disk_attached) {
+                if (sendStoragedVmDiskConfig(bs, token, dma_phys, .detach_vm_disk, port.vmid)) {
+                    port.disk_attached = false;
+                    lib.serialWrite("configd: per-VM disk detached\n");
+                }
             }
-            const request = netd_proto.SwitchPortDetachPayload{
-                .vmid = port.vmid,
-                .generation = port.generation,
-            };
-            if (sendNetdConfig(bs, token, dma_phys, .switch_port_detach, std.mem.asBytes(&request))) {
-                port.state = .detach_pending;
-            } else {
-                lib.serialWrite("configd: vNIC detach request send failed\n");
+            if (port.state == .attached or port.state == .detach_pending) {
+                if (port.pending_bindings) |request| {
+                    const reply = port.pending_binding_reply orelse configd_proto.LocalBindingsReply{
+                        .request_id = request.request_id,
+                        .vmid = request.vmid,
+                        .status = .stale,
+                        .generation = request.generation,
+                        .policy_revision = 0,
+                    };
+                    _ = sendLocalConfigReply(token, dma_phys, .local_bindings_reply, std.mem.asBytes(&reply));
+                    port.pending_bindings = null;
+                    port.pending_binding_reply = null;
+                }
+                port.pending_rule = null;
+                const request = netd_proto.SwitchPortDetachPayload{
+                    .vmid = port.vmid,
+                    .generation = port.generation,
+                };
+                if (sendNetdConfig(bs, token, dma_phys, .switch_port_detach, std.mem.asBytes(&request))) {
+                    port.state = .detach_pending;
+                } else {
+                    lib.serialWrite("configd: vNIC detach request send failed\n");
+                }
+            } else if (!port.disk_attached) {
+                port.* = .{};
             }
         }
     }
@@ -263,10 +315,57 @@ fn handleNetdConfigAck(bs: *const BootstrapDescriptor, recv_va: u64, payload_len
     }
 }
 
+fn beginSwitchRule(port: *NetworkPort, request: *align(1) const netd_proto.SwitchRuleUpdatePayload) netd_proto.SwitchConfigStatus {
+    if (request.request_id == 0 or request.vmid == 0 or request._pad != 0 or request._reserved != 0 or
+        request.action > netd_proto.SWITCH_RULE_CLEAR)
+    {
+        return .invalid;
+    }
+    if (!port.used or port.state != .attached or request.vmid != port.vmid or
+        request.generation != port.generation)
+    {
+        return .stale;
+    }
+    if (port.pending_rule != null or port.pending_bindings != null) return .no_capacity;
+    if (request.expected_revision != port.policy_revision) return .stale;
+    port.pending_rule = request.*;
+    return .ok;
+}
+
+fn applySwitchRuleAck(port: *NetworkPort, ack: *align(1) const netd_proto.SwitchBindingsAckPayload) bool {
+    const pending = port.pending_rule orelse return false;
+    if (!port.used or port.state != .attached or ack.vmid != port.vmid or
+        ack.request_id != pending.request_id or ack.generation != pending.generation or
+        ack._reserved != 0)
+    {
+        return false;
+    }
+    const status = @as(*align(1) const u16, @ptrCast(&ack.status)).*;
+    if (status > @backingInt(netd_proto.SwitchConfigStatus.no_capacity)) return false;
+    if (status == @backingInt(netd_proto.SwitchConfigStatus.ok)) {
+        const next_revision = std.math.add(u64, pending.expected_revision, 1) catch return false;
+        if (ack.policy_revision != next_revision) return false;
+        port.policy_revision = ack.policy_revision;
+    } else if (ack.policy_revision != 0) {
+        return false;
+    }
+    port.pending_rule = null;
+    return true;
+}
+
 fn handleNetdBindingsAck(bs: *const BootstrapDescriptor, token: u64, dma_phys: u64, recv_va: u64, payload_len: usize) void {
     const page_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
     const netd_header: *align(1) const netd_proto.NetdHeader =
         @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+    if (isNetdAckEnvelope(page_header, netd_header, payload_len, &bs.local_node, .switch_rule_ack, @sizeOf(netd_proto.SwitchBindingsAckPayload))) {
+        const rule_ack: *align(1) const netd_proto.SwitchBindingsAckPayload =
+            @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(netd_proto.NetdHeader));
+        const rule_port = findNetworkPort(rule_ack.vmid) orelse return;
+        if (!applySwitchRuleAck(rule_port, rule_ack)) return;
+        _ = sendLocalConfigReply(token, dma_phys, .local_rule_reply, std.mem.asBytes(rule_ack));
+        if (rule_ack.status == .ok) lib.serialWrite("configd: vNIC firewall rule applied (default-deny)\n");
+        return;
+    }
     if (!isNetdAckEnvelope(page_header, netd_header, payload_len, &bs.local_node, .switch_bindings_ack, @sizeOf(netd_proto.SwitchBindingsAckPayload))) return;
     const ack: *align(1) const netd_proto.SwitchBindingsAckPayload =
         @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(netd_proto.NetdHeader));
@@ -348,6 +447,26 @@ fn handleLocalSwitchAdmin(bs: *const BootstrapDescriptor, token: u64, dma_phys: 
             };
             _ = sendLocalConfigReply(token, dma_phys, .local_bindings_reply, std.mem.asBytes(&reply));
         }
+    } else if (op == @backingInt(configd_proto.Op.local_rule_update)) {
+        if (header.payload_len != @sizeOf(configd_proto.LocalRuleRequest)) return;
+        const request: *align(1) const configd_proto.LocalRuleRequest = @ptrFromInt(body_va);
+        const port = findNetworkPort(request.vmid);
+        const status = if (port) |found| beginSwitchRule(found, request) else netd_proto.SwitchConfigStatus.stale;
+        if (status == .ok) {
+            if (!sendNetdConfig(bs, token, dma_phys, .switch_rule_update, std.mem.asBytes(request))) {
+                port.?.pending_rule = null;
+                lib.serialWrite("configd: vNIC rule request send failed\n");
+            }
+        } else {
+            const reply = configd_proto.LocalRuleReply{
+                .request_id = request.request_id,
+                .vmid = request.vmid,
+                .status = status,
+                .generation = request.generation,
+                .policy_revision = 0,
+            };
+            _ = sendLocalConfigReply(token, dma_phys, .local_rule_reply, std.mem.asBytes(&reply));
+        }
     }
 }
 
@@ -359,6 +478,7 @@ const EP_CLUSTERD: u64 = 7;
 const EP_WINDOWD: u64 = 9;
 const EP_CONFIGD: u64 = 10;
 const EP_NETD: u64 = @backingInt(lib.ReservedEndpoint.netd);
+const EP_STORAGED: u64 = @backingInt(lib.ReservedEndpoint.storaged);
 const VM_STATE_RUNNING: u8 = 2;
 const DEFAULT_LOCAL_SEGMENT: u64 = 1;
 const SNAPSHOT_INTERVAL_TICKS: u32 = 20_000;
@@ -397,11 +517,16 @@ const NetworkPortState = enum {
 const NetworkPort = struct {
     used: bool = false,
     vmid: u32 = 0,
+    disk_attached: bool = false,
     generation: u64 = 0,
     policy_revision: u64 = 0,
     state: NetworkPortState = .unused,
     pending_bindings: ?netd_proto.SwitchBindingsReplacePayload = null,
     pending_binding_reply: ?netd_proto.SwitchBindingsAckPayload = null,
+    /// Operator firewall change forwarded to netd and awaiting its ack. It is
+    /// sent once (rule updates are not idempotent); a lost ack surfaces in
+    /// windowd as an indeterminate timeout rather than a blind retry.
+    pending_rule: ?netd_proto.SwitchRuleUpdatePayload = null,
 };
 
 var network_ports: [MAX_VMS]NetworkPort = @splat(.{});
@@ -457,7 +582,7 @@ fn makeLocalPortStatus(port: ?*const NetworkPort, request: *align(1) const confi
         reply.status = .invalid;
     } else if (port) |found| {
         if (found.used and found.state == .attached) {
-            reply.status = if (found.pending_bindings == null) .ok else .no_capacity;
+            reply.status = if (found.pending_bindings == null and found.pending_rule == null) .ok else .no_capacity;
             reply.generation = found.generation;
             reply.policy_revision = found.policy_revision;
         }
@@ -1186,4 +1311,46 @@ test "binding updates reject invalid requests and stale port generations" {
     port.state = .detach_pending;
     try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, beginSwitchBindings(&port, &request));
     try std.testing.expect(port.pending_bindings == null);
+}
+
+test "configd forwards one rule update at a time and applies only matching acks" {
+    var port = NetworkPort{ .used = true, .vmid = 4, .generation = 11, .policy_revision = 3, .state = .attached };
+    var request = netd_proto.SwitchRuleUpdatePayload{
+        .vmid = 4,
+        .action = netd_proto.SWITCH_RULE_ADD_INGRESS,
+        .ip_version = 6,
+        .protocol = 17,
+        .generation = 11,
+        .expected_revision = 3,
+        .request_id = 21,
+        .destination_port_first = 5001,
+        .destination_port_last = 5001,
+    };
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.ok, beginSwitchRule(&port, &request));
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.no_capacity, beginSwitchRule(&port, &request));
+
+    var ack = netd_proto.SwitchBindingsAckPayload{
+        .request_id = 22,
+        .vmid = 4,
+        .status = .ok,
+        .generation = 11,
+        .policy_revision = 4,
+    };
+    try std.testing.expect(!applySwitchRuleAck(&port, &ack));
+    ack.request_id = 21;
+    ack.policy_revision = 9;
+    try std.testing.expect(!applySwitchRuleAck(&port, &ack));
+    ack.policy_revision = 4;
+    try std.testing.expect(applySwitchRuleAck(&port, &ack));
+    try std.testing.expectEqual(@as(u64, 4), port.policy_revision);
+    try std.testing.expect(port.pending_rule == null);
+
+    request.expected_revision = 3;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, beginSwitchRule(&port, &request));
+    request.expected_revision = 4;
+    request.action = 9;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.invalid, beginSwitchRule(&port, &request));
+    request.action = netd_proto.SWITCH_RULE_CLEAR;
+    request.generation = 12;
+    try std.testing.expectEqual(netd_proto.SwitchConfigStatus.stale, beginSwitchRule(&port, &request));
 }

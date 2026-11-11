@@ -155,8 +155,7 @@ fn nodeFlagsFor(table: *const endpoint_table.EndpointTable) u32 {
 }
 
 fn isAuthorizedControlSource(hdr: *const dipc.PageHeader, op: control_protocol.ControlOp) bool {
-    const dipc_local = node_config.getLocalNode();
-    if (op != .set_node_addr and !dipc.Ipv6Addr.eql(hdr.src.node, dipc_local)) {
+    if (op != .set_node_addr and !node_config.isLocalAddress(hdr.src.node)) {
         serialWrite("Control: reject: src_node mismatch\n");
         return false;
     }
@@ -326,9 +325,11 @@ pub fn handleKernelControlPage(
             }
         },
         .virtio_blk_response => {
-            const sr = @import("../services/service_registry.zig");
-            const sid = sr.serviceIdForCapability(hdr.auth_tag) orelse return error.Unauthorized;
-            if (sid != table.reserved_storaged_service) return error.Unauthorized;
+            if (!node_config.isLocalAddress(hdr.src.node) or
+                hdr.src.endpoint != @backingInt(identity.ReservedEndpoint.storaged))
+            {
+                return error.Unauthorized;
+            }
 
             if (remaining != @sizeOf(control_protocol.VirtioBlkResponsePayload)) return error.BadPayload;
             const p: *const control_protocol.VirtioBlkResponsePayload = @ptrCast(@alignCast(payload_ptr));
@@ -560,6 +561,10 @@ pub fn handleKernelControlPage(
             if (remaining != @sizeOf(control_protocol.DeleteMicrovmPayload)) return error.BadPayload;
             const p: *const control_protocol.DeleteMicrovmPayload = @ptrCast(@alignCast(payload_ptr));
             const microvm_registry = @import("../vmm/microvm_registry.zig");
+            if (build_options.vmm_active) {
+                const vmx = @import("../arch/x86_64/vmx.zig");
+                if (!vmx.reclaimInstanceById(p.instance_id)) return error.BadPayload;
+            }
             if (!microvm_registry.delete(p.instance_id)) return error.BadPayload;
         },
         .list_microvms => {

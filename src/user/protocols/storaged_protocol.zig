@@ -2,9 +2,9 @@
 ///
 /// Endpoint: ReservedEndpoint.storaged (4)
 ///
-/// storaged is the block-device owner. The current implementation authorizes
-/// only containerd's host-local metadata workflow. VM block requests remain
-/// denied until the host assigns and enforces per-VM disk extents.
+/// storaged is the block-device owner. It authorizes containerd's host-local
+/// metadata workflow and enforces host-assigned per-VM disk extents attached
+/// by local configd.
 ///
 /// Message format:
 ///   PageHeader   (lib.DIPC_HEADER_SIZE bytes)
@@ -26,6 +26,10 @@ pub const ReqType = enum(u32) {
     flush = 4,
     /// Write sectors and do not complete until the write is flushed.
     write_fua = 17,
+    /// Host control: attach a per-VM disk extent (sector = start_lba, data_len = sector_count).
+    attach_vm_disk = 32,
+    /// Host control: detach a per-VM disk extent.
+    detach_vm_disk = 33,
 };
 
 /// Block I/O request.  The physical address of the data buffer (for reads:

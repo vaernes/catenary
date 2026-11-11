@@ -4,6 +4,9 @@ pub const PART_BASE_LBA: u64 = 8192;
 pub const PART_SECTORS: u64 = 2048;
 pub const MAX_PARTS: usize = 16;
 pub const JOURNAL_LBA: u64 = PART_BASE_LBA - 1;
+pub const VM_DISK_BASE_LBA: u64 = PART_BASE_LBA + @as(u64, MAX_PARTS) * PART_SECTORS;
+pub const VM_DISK_SECTORS: u64 = PART_SECTORS;
+pub const MAX_VM_DISKS: u32 = 8;
 pub const PART_MAGIC: u64 = 0x5452_4150_524E_524E;
 pub const PART_VERSION: u32 = 2;
 pub const PART_MAGIC_V2: u64 = 0x3252_4150_524E_524E;
@@ -46,6 +49,19 @@ const LegacyHeader = extern struct {
 
 pub fn startLba(slot: u32) u64 {
     return PART_BASE_LBA + @as(u64, slot) * PART_SECTORS;
+}
+
+pub fn vmDiskStartLba(vmid: u32) ?u64 {
+    if (vmid == 0 or vmid > MAX_VM_DISKS) return null;
+    return VM_DISK_BASE_LBA + @as(u64, vmid - 1) * VM_DISK_SECTORS;
+}
+
+pub fn translateVmDiskRange(vmid: u32, guest_sector: u64, nlb: u32) ?u64 {
+    if (nlb == 0) return null;
+    const base_lba = vmDiskStartLba(vmid) orelse return null;
+    const end_sector = std.math.add(u64, guest_sector, nlb) catch return null;
+    if (end_sector > VM_DISK_SECTORS) return null;
+    return std.math.add(u64, base_lba, guest_sector) catch null;
 }
 
 fn headerChecksum(header: *const Header) u32 {
@@ -223,4 +239,23 @@ test "journal rejects torn, corrupted, invalid, and mismatched records" {
     record.checksum = journalChecksum(&record);
     @memcpy(invalid_slot[0..@sizeOf(JournalRecord)], std.mem.asBytes(&record));
     try std.testing.expect(readJournalRecord(&invalid_slot) == null);
+}
+
+test "per-VM disk extents stay disjoint from host partitions and bounded per VM" {
+    const last_part_end = startLba(@intCast(MAX_PARTS - 1)) + PART_SECTORS;
+    const vm1_base = vmDiskStartLba(1) orelse return error.TestUnexpectedResult;
+    const vm2_base = vmDiskStartLba(2) orelse return error.TestUnexpectedResult;
+    const vm8_base = vmDiskStartLba(MAX_VM_DISKS) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(vmDiskStartLba(0) == null);
+    try std.testing.expect(vmDiskStartLba(MAX_VM_DISKS + 1) == null);
+    try std.testing.expect(vm1_base >= last_part_end);
+    try std.testing.expectEqual(vm1_base + VM_DISK_SECTORS, vm2_base);
+    try std.testing.expectEqual(vm1_base + (@as(u64, MAX_VM_DISKS - 1) * VM_DISK_SECTORS), vm8_base);
+
+    try std.testing.expectEqual(@as(?u64, vm1_base), translateVmDiskRange(1, 0, 1));
+    try std.testing.expectEqual(@as(?u64, vm1_base + VM_DISK_SECTORS - 1), translateVmDiskRange(1, VM_DISK_SECTORS - 1, 1));
+    try std.testing.expectEqual(@as(?u64, null), translateVmDiskRange(1, VM_DISK_SECTORS, 1));
+    try std.testing.expectEqual(@as(?u64, null), translateVmDiskRange(1, VM_DISK_SECTORS - 1, 2));
+    try std.testing.expectEqual(@as(?u64, null), translateVmDiskRange(1, 0, 0));
 }

@@ -129,11 +129,29 @@ comptime {
 // DIPC block request mirror of virtio_blk.RequestHeader (from kernel microvm_bridge).
 const BlkRequest = lib.BlkRequest;
 const BLK_WRITE_FUA = @backingInt(lib.BlkReqType.write_fua);
+const BLK_ATTACH_VM_DISK = @backingInt(lib.BlkReqType.attach_vm_disk);
+const BLK_DETACH_VM_DISK = @backingInt(lib.BlkReqType.detach_vm_disk);
 const HOST_METADATA_VMID = storage_protocol.HOST_METADATA_VMID;
 const CONTAINERD_ENDPOINT = @backingInt(lib.ReservedEndpoint.containerd);
+const CONFIGD_ENDPOINT = @backingInt(lib.ReservedEndpoint.configd);
+const KERNEL_CONTROL_ENDPOINT = @backingInt(lib.ReservedEndpoint.kernel_control);
 
 // Lba size (LBA = logical block address, a 512-byte sector).
 const SECTOR_SIZE: u32 = 512;
+
+const VmDiskExtent = struct {
+    attached: bool = false,
+    start_lba: u64 = 0,
+    sectors: u64 = 0,
+};
+
+var g_vm_disks: [partition_metadata.MAX_VM_DISKS]VmDiskExtent = @splat(.{});
+
+fn isLoopbackOrLinkLocal(node: *const [16]u8) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    if (std.mem.eql(u8, node, &loopback.bytes)) return true;
+    return node[0] == 0xFE and node[1] == 0x80;
+}
 
 fn isAuthorizedBlockClient(
     src_endpoint: u64,
@@ -144,6 +162,64 @@ fn isAuthorizedBlockClient(
     return src_endpoint == CONTAINERD_ENDPOINT and
         vmid == HOST_METADATA_VMID and
         std.mem.eql(u8, src_node, &loopback.bytes);
+}
+
+fn isAuthorizedVmDiskAdmin(
+    src_endpoint: u64,
+    src_node: *const [16]u8,
+) bool {
+    return src_endpoint == CONFIGD_ENDPOINT and isLoopbackOrLinkLocal(src_node);
+}
+
+fn isAuthorizedVmIoClient(
+    table: *const [partition_metadata.MAX_VM_DISKS]VmDiskExtent,
+    src_endpoint: u64,
+    vmid: u32,
+    src_node: *const [16]u8,
+) bool {
+    const loopback = lib.Ipv6Addr.loopback();
+    if (src_endpoint != KERNEL_CONTROL_ENDPOINT or !std.mem.eql(u8, src_node, &loopback.bytes)) return false;
+    if (vmid == 0 or vmid > partition_metadata.MAX_VM_DISKS) return false;
+    return table[vmid - 1].attached;
+}
+
+fn attachVmDisk(
+    table: *[partition_metadata.MAX_VM_DISKS]VmDiskExtent,
+    vmid: u32,
+    start_lba: u64,
+    sectors: u64,
+) bool {
+    const expected_start = partition_metadata.vmDiskStartLba(vmid) orelse return false;
+    if (start_lba != expected_start or sectors != partition_metadata.VM_DISK_SECTORS) return false;
+    table[vmid - 1] = .{
+        .attached = true,
+        .start_lba = start_lba,
+        .sectors = sectors,
+    };
+    return true;
+}
+
+fn detachVmDisk(
+    table: *[partition_metadata.MAX_VM_DISKS]VmDiskExtent,
+    vmid: u32,
+) bool {
+    if (vmid == 0 or vmid > partition_metadata.MAX_VM_DISKS) return false;
+    table[vmid - 1] = .{};
+    return true;
+}
+
+fn translateAttachedVmSector(
+    table: *const [partition_metadata.MAX_VM_DISKS]VmDiskExtent,
+    vmid: u32,
+    guest_sector: u64,
+    nlb: u32,
+) ?u64 {
+    if (vmid == 0 or vmid > partition_metadata.MAX_VM_DISKS or nlb == 0) return null;
+    const extent = table[vmid - 1];
+    if (!extent.attached) return null;
+    const end_sector = std.math.add(u64, guest_sector, nlb) catch return null;
+    if (end_sector > extent.sectors) return null;
+    return std.math.add(u64, extent.start_lba, guest_sector) catch null;
 }
 
 fn isHostMetadataRange(sector: u64, nlb: u32) bool {
@@ -164,6 +240,7 @@ test "unassigned VM block requests cannot access the host NVMe namespace" {
     remote_node[0] = 0xFE;
     remote_node[1] = 0x80;
     remote_node[15] = 1;
+    var table: [partition_metadata.MAX_VM_DISKS]VmDiskExtent = @splat(.{});
     try std.testing.expect(isAuthorizedBlockClient(
         CONTAINERD_ENDPOINT,
         HOST_METADATA_VMID,
@@ -171,6 +248,12 @@ test "unassigned VM block requests cannot access the host NVMe namespace" {
     ));
     try std.testing.expect(!isAuthorizedBlockClient(
         @backingInt(lib.ReservedEndpoint.kernel_control),
+        1,
+        &local_node,
+    ));
+    try std.testing.expect(!isAuthorizedVmIoClient(
+        &table,
+        KERNEL_CONTROL_ENDPOINT,
         1,
         &local_node,
     ));
@@ -189,6 +272,30 @@ test "unassigned VM block requests cannot access the host NVMe namespace" {
         HOST_METADATA_VMID,
         &remote_node,
     ));
+}
+
+test "attached per-VM disk extents translate and isolate guest sector I/O" {
+    const local_node = lib.Ipv6Addr.loopback().bytes;
+    var table: [partition_metadata.MAX_VM_DISKS]VmDiskExtent = @splat(.{});
+    const vm1_start = partition_metadata.vmDiskStartLba(1).?;
+    const vm2_start = partition_metadata.vmDiskStartLba(2).?;
+
+    try std.testing.expect(isAuthorizedVmDiskAdmin(CONFIGD_ENDPOINT, &local_node));
+    try std.testing.expect(!isAuthorizedVmDiskAdmin(CONTAINERD_ENDPOINT, &local_node));
+    try std.testing.expect(!attachVmDisk(&table, 1, vm1_start + 1, partition_metadata.VM_DISK_SECTORS));
+    try std.testing.expect(attachVmDisk(&table, 1, vm1_start, partition_metadata.VM_DISK_SECTORS));
+    try std.testing.expect(attachVmDisk(&table, 2, vm2_start, partition_metadata.VM_DISK_SECTORS));
+
+    try std.testing.expect(isAuthorizedVmIoClient(&table, KERNEL_CONTROL_ENDPOINT, 1, &local_node));
+    try std.testing.expect(!isAuthorizedVmIoClient(&table, CONTAINERD_ENDPOINT, 1, &local_node));
+    try std.testing.expectEqual(@as(?u64, vm1_start + 7), translateAttachedVmSector(&table, 1, 7, 1));
+    try std.testing.expectEqual(@as(?u64, vm2_start + 7), translateAttachedVmSector(&table, 2, 7, 1));
+    try std.testing.expectEqual(@as(?u64, null), translateAttachedVmSector(&table, 1, partition_metadata.VM_DISK_SECTORS, 1));
+    try std.testing.expectEqual(@as(?u64, null), translateAttachedVmSector(&table, 3, 0, 1));
+
+    try std.testing.expect(detachVmDisk(&table, 1));
+    try std.testing.expect(!isAuthorizedVmIoClient(&table, KERNEL_CONTROL_ENDPOINT, 1, &local_node));
+    try std.testing.expectEqual(@as(?u64, null), translateAttachedVmSector(&table, 1, 0, 1));
 }
 
 test "host metadata client is confined to its smoke data and metadata sectors" {
@@ -607,12 +714,18 @@ pub export fn umain() noreturn {
                 continue;
             }
             const incoming_hdr: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
+            var req_type2: u32 = std.math.maxInt(u32);
             var vmid2: u32 = 0;
             var chain_head2: u16 = 0;
             if (incoming_hdr.payload_len == @sizeOf(BlkRequest)) {
                 const request: *align(1) const BlkRequest = @ptrFromInt(recv_va + lib.DIPC_HEADER_SIZE);
+                req_type2 = request.req_type;
                 vmid2 = request.vmid;
                 chain_head2 = request.chain_head;
+            }
+            if (req_type2 == BLK_ATTACH_VM_DISK or req_type2 == BLK_DETACH_VM_DISK) {
+                _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
+                continue;
             }
             const reply_dst = incoming_hdr.src;
             const local_node2 = lib.Ipv6Addr.loopback();
@@ -804,16 +917,47 @@ pub export fn umain() noreturn {
             data_hpa = request.data_hpa;
         }
         const loopback = lib.Ipv6Addr.loopback();
-        const request_valid = request_envelope_valid and
+        const dst_node_valid = isLoopbackOrLinkLocal(&incoming_hdr.dst.node.bytes);
+        if (request_envelope_valid and dst_node_valid and
+            (req_type == BLK_ATTACH_VM_DISK or req_type == BLK_DETACH_VM_DISK))
+        {
+            if (isAuthorizedVmDiskAdmin(incoming_hdr.src.endpoint, &incoming_hdr.src.node.bytes)) {
+                if (req_type == BLK_ATTACH_VM_DISK) {
+                    if (attachVmDisk(&g_vm_disks, vmid, sector, @as(u64, data_len))) {
+                        lib.serialWrite("storaged: per-VM disk attached\n");
+                    } else {
+                        lib.serialWrite("storaged: per-VM disk attach rejected\n");
+                    }
+                } else {
+                    if (detachVmDisk(&g_vm_disks, vmid)) {
+                        lib.serialWrite("storaged: per-VM disk detached\n");
+                    }
+                }
+            } else {
+                lib.serialWrite("storaged: unauthorized VM disk control request\n");
+            }
+            _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, g_token);
+            continue;
+        }
+
+        const is_host_metadata = request_envelope_valid and
             std.mem.eql(u8, &incoming_hdr.dst.node.bytes, &loopback.bytes) and
             isAuthorizedBlockClient(
                 incoming_hdr.src.endpoint,
                 vmid,
                 &incoming_hdr.src.node.bytes,
             );
+        const is_vm_io = request_envelope_valid and
+            std.mem.eql(u8, &incoming_hdr.dst.node.bytes, &loopback.bytes) and
+            isAuthorizedVmIoClient(
+                &g_vm_disks,
+                incoming_hdr.src.endpoint,
+                vmid,
+                &incoming_hdr.src.node.bytes,
+            );
 
         var io_status: u8 = 1;
-        if (request_valid) {
+        if (is_host_metadata or is_vm_io) {
             if (req_type == 4) {
                 if (data_len == 0 and data_hpa == 0 and doFlush() == 0) io_status = 0;
             } else if ((req_type == 0 or req_type == 1 or req_type == BLK_WRITE_FUA) and data_len > 0 and
@@ -821,22 +965,26 @@ pub export fn umain() noreturn {
                 @as(u64, data_len) <= PAGE_SIZE - (data_hpa & (PAGE_SIZE - 1)))
             {
                 const nlb = @as(u32, data_len) / SECTOR_SIZE;
-                if (isHostMetadataRange(sector, nlb) and
-                    sector < g_ns_lba_count and nlb <= g_ns_lba_count - sector)
-                {
-                    if (req_type == 0) {
-                        const read_status = doRead(sector, nlb, data_hpa);
-                        if (read_status == 0) {
-                            io_status = 0;
-                        } else {
-                            lib.serialWrite("storaged: NVMe read completion status=");
-                            printHex(read_status);
-                            lib.serialWrite("\n");
-                        }
-                    } else if (doWrite(sector, nlb, data_hpa) == 0) {
-                        if (req_type != BLK_WRITE_FUA or doFlush() == 0) {
-                            io_status = 0;
-                            if (req_type == BLK_WRITE_FUA) lib.serialWrite("storaged: FUA write+flush completed\n");
+                const target_lba: ?u64 = if (is_host_metadata)
+                    (if (isHostMetadataRange(sector, nlb)) sector else null)
+                else
+                    translateAttachedVmSector(&g_vm_disks, vmid, sector, nlb);
+                if (target_lba) |resolved_lba| {
+                    if (resolved_lba < g_ns_lba_count and nlb <= g_ns_lba_count - resolved_lba) {
+                        if (req_type == 0) {
+                            const read_status = doRead(resolved_lba, nlb, data_hpa);
+                            if (read_status == 0) {
+                                io_status = 0;
+                            } else {
+                                lib.serialWrite("storaged: NVMe read completion status=");
+                                printHex(read_status);
+                                lib.serialWrite("\n");
+                            }
+                        } else if (doWrite(resolved_lba, nlb, data_hpa) == 0) {
+                            if (req_type != BLK_WRITE_FUA or doFlush() == 0) {
+                                io_status = 0;
+                                if (req_type == BLK_WRITE_FUA) lib.serialWrite("storaged: FUA write+flush completed\n");
+                            }
                         }
                     }
                 }

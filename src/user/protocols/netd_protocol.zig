@@ -105,6 +105,14 @@ pub const Op = enum(u16) {
 
     switch_bindings_replace = 23,
     switch_bindings_ack = 24,
+
+    /// Host-configd adds one firewall rule to, or clears, a vNIC's policy at an
+    /// expected revision. Payload: SwitchRuleUpdatePayload. Reply: switch_rule_ack.
+    switch_rule_update = 25,
+
+    /// Result for switch_rule_update. Payload: SwitchBindingsAckPayload
+    /// (request_id, vmid, status, generation, resulting policy revision).
+    switch_rule_ack = 26,
 };
 
 /// Header prepended to every netd DIPC message (after the PageHeader).
@@ -357,6 +365,28 @@ pub const SwitchPolicyReplacePayload = extern struct {
     }),
 };
 
+pub const SWITCH_RULE_ADD_INGRESS: u8 = 0;
+pub const SWITCH_RULE_ADD_EGRESS: u8 = 1;
+pub const SWITCH_RULE_CLEAR: u8 = 2;
+
+/// Incremental operator firewall change. Ports are default-deny; `action`
+/// is one of SWITCH_RULE_*. `ip_version` is 4 or 6 and `protocol` is 6 (TCP),
+/// 17 (UDP), 1 (ICMPv4 echo) or 58 (ICMPv6 echo); both are ignored for clear.
+pub const SwitchRuleUpdatePayload = extern struct {
+    vmid: u32,
+    action: u8,
+    ip_version: u8,
+    protocol: u8,
+    _pad: u8 = 0,
+    generation: u64,
+    expected_revision: u64,
+    request_id: u64,
+    destination: [16]u8 = @splat(0),
+    destination_port_first: u16 = 0,
+    destination_port_last: u16 = 0,
+    _reserved: u32 = 0,
+};
+
 pub const SwitchConfigStatus = enum(u16) {
     ok = 0,
     unauthorized = 1,
@@ -400,4 +430,11 @@ test "switch binding request has a bounded stable wire layout" {
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SwitchBindingsReplacePayload, "ipv4_addresses"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(SwitchBindingsReplacePayload, "ipv6_addresses"));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(SwitchBindingsAckPayload));
+}
+
+test "switch rule update request has a bounded stable wire layout" {
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(SwitchRuleUpdatePayload));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SwitchRuleUpdatePayload, "generation"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(SwitchRuleUpdatePayload, "request_id"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(SwitchRuleUpdatePayload, "destination"));
 }

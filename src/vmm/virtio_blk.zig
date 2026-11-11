@@ -83,7 +83,7 @@ pub const DeviceInstance = struct {
     selected_queue: u32 = 0,
     queues: [1]QueueState = undefined, // Blk usually has 1 request queue
     interrupt_status: u32 = 0,
-    capacity_sectors: u64 = 0x40000, // 128 MiB default
+    capacity_sectors: u64 = 2048, // 1 MiB per-VM disk extent (matches partition_metadata.VM_DISK_SECTORS)
 
     pub fn hasEventIdx(self: *const DeviceInstance) bool {
         return (self.driver_features & VIRTIO_F_EVENT_IDX) != 0;
@@ -123,6 +123,15 @@ pub fn getInstance(vmid: u32) ?*DeviceInstance {
         }
     }
     return null;
+}
+
+pub fn resetInstance(vmid: u32) void {
+    if (!initialized) return;
+    for (&instances) |*inst| {
+        if (inst.vmid == vmid) {
+            inst.* = .{ .vmid = 0 };
+        }
+    }
 }
 
 pub fn handleRead(vmid: u32, offset: u64) u32 {

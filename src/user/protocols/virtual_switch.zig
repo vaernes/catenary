@@ -5,6 +5,7 @@ pub const MAX_RULES_PER_DIRECTION: usize = 16;
 pub const MAX_FRAME_SIZE: usize = 1514;
 pub const MAX_DELIVERIES: usize = MAX_PORTS;
 const ZERO_MAC: [6]u8 = @splat(0);
+const BROADCAST_MAC: [6]u8 = @splat(0xFF);
 
 pub const SegmentId = u64;
 pub const PortId = u32;
@@ -65,7 +66,25 @@ pub const DropReason = enum {
     unsupported_packet,
     egress_denied,
     no_eligible_destination,
+    arp_spoof,
+    neighbor_spoof,
+    router_message_denied,
 };
+
+pub const DROP_REASON_COUNT: usize = std.enums.values(DropReason).len;
+
+/// Bounded per-switch observability counters. `drops[@intFromEnum(reason)]`
+/// counts frames rejected for that reason; `bootstrap_forwarded` counts
+/// validated ARP/NDP frames; `forwarded` counts policy-approved data frames.
+pub const Counters = struct {
+    forwarded: u64 = 0,
+    bootstrap_forwarded: u64 = 0,
+    drops: [DROP_REASON_COUNT]u64 = @splat(0),
+};
+
+pub const Direction = enum(u8) { ingress = 0, egress = 1 };
+
+pub const RuleError = error{ Stale, Invalid, Duplicate, Full, RevisionExhausted };
 
 pub const Decision = struct {
     deliveries: [MAX_DELIVERIES]Delivery = undefined,
@@ -81,6 +100,8 @@ const Port = struct {
     config: PortConfig = undefined,
 };
 
+const FrameKind = enum { transport, arp_request, arp_reply, ndp_solicit, ndp_advert, router_discovery };
+
 const ParsedFrame = struct {
     destination_mac: [6]u8,
     ip_version: IpVersion,
@@ -88,11 +109,78 @@ const ParsedFrame = struct {
     destination_ip: [16]u8,
     protocol: u8,
     destination_port: u16,
+    kind: FrameKind = .transport,
+    /// ARP target protocol address or NDP target address (IPv4 uses the first 4 bytes).
+    target_ip: [16]u8 = @splat(0),
+    /// ARP target hardware address.
+    target_mac: [6]u8 = @splat(0),
+    /// ARP sender hardware address.
+    sender_mac: [6]u8 = @splat(0),
+    /// NDP link-layer address option (source LLA for NS, target LLA for NA), if present.
+    nd_option_mac: ?[6]u8 = null,
 };
 
 pub const Switch = struct {
     ports: [MAX_PORTS]Port = @splat(.{}),
     next_generation: AttachmentGeneration = 0,
+    counters: Counters = .{},
+
+    /// Like `decide`, but also records the outcome in `counters`.
+    pub fn decideCounted(
+        self: *Switch,
+        source_id: PortId,
+        source_generation: AttachmentGeneration,
+        frame: []const u8,
+    ) Decision {
+        const decision = self.decide(source_id, source_generation, frame);
+        if (decision.count == 0) {
+            self.counters.drops[@intFromEnum(decision.drop_reason)] +|= 1;
+        } else if (isBootstrapFrame(frame)) {
+            self.counters.bootstrap_forwarded +|= 1;
+        } else {
+            self.counters.forwarded +|= 1;
+        }
+        return decision;
+    }
+
+    pub fn addRule(
+        self: *Switch,
+        id: PortId,
+        generation: AttachmentGeneration,
+        expected_revision: u64,
+        direction: Direction,
+        rule: Rule,
+    ) RuleError!u64 {
+        if (!validRule(rule)) return error.Invalid;
+        const port = self.findPort(id) orelse return error.Stale;
+        if (port.generation != generation or port.policy_revision != expected_revision) return error.Stale;
+        const next_revision = std.math.add(u64, port.policy_revision, 1) catch return error.RevisionExhausted;
+        const policy = &port.config.policy;
+        const rules: []Rule = if (direction == .ingress) policy.ingress[0..] else policy.egress[0..];
+        const count: *u8 = if (direction == .ingress) &policy.ingress_count else &policy.egress_count;
+        for (rules[0..count.*]) |existing| {
+            if (sameRule(existing, rule)) return error.Duplicate;
+        }
+        if (count.* >= MAX_RULES_PER_DIRECTION) return error.Full;
+        rules[count.*] = rule;
+        count.* += 1;
+        port.policy_revision = next_revision;
+        return next_revision;
+    }
+
+    pub fn clearRules(
+        self: *Switch,
+        id: PortId,
+        generation: AttachmentGeneration,
+        expected_revision: u64,
+    ) RuleError!u64 {
+        const port = self.findPort(id) orelse return error.Stale;
+        if (port.generation != generation or port.policy_revision != expected_revision) return error.Stale;
+        const next_revision = std.math.add(u64, port.policy_revision, 1) catch return error.RevisionExhausted;
+        port.config.policy = .{};
+        port.policy_revision = next_revision;
+        return next_revision;
+    }
 
     pub fn attach(self: *Switch, config: PortConfig) ?AttachmentGeneration {
         if (config.id == 0 or config.segment == 0) return null;
@@ -233,6 +321,7 @@ pub const Switch = struct {
         if (source.generation != source_generation) return .{ .drop_reason = .stale_generation };
         const parsed = parseFrame(frame) orelse return .{ .drop_reason = .malformed_frame };
         if (!std.mem.eql(u8, frame[6..12], &source.config.mac)) return .{ .drop_reason = .spoofed_mac };
+        if (parsed.kind != .transport) return self.decideBootstrap(source, parsed);
         if (!sourceOwnsAddress(&source.config, parsed.ip_version, &parsed.source_ip)) {
             return .{ .drop_reason = .unauthorized_source_address };
         }
@@ -255,6 +344,90 @@ pub const Switch = struct {
             }
             if (!destinationOwnsAddress(&candidate.config, parsed.ip_version, &parsed.destination_ip)) continue;
             if (!matchesRules(candidate.config.policy.ingress[0..candidate.config.policy.ingress_count], parsed)) continue;
+            if (result.count == result.deliveries.len) break;
+            result.deliveries[result.count] = .{
+                .port_id = candidate.config.id,
+                .generation = candidate.generation,
+            };
+            result.count += 1;
+        }
+        if (result.count == 0) result.drop_reason = .no_eligible_destination;
+        return result;
+    }
+
+    /// Address-resolution bootstrap (ARP, NDP). These frames carry no
+    /// application payload; they are validated against the host-authorised
+    /// bindings of the sending port and delivered only to the ports that own
+    /// the resolved address (or, for unsolicited advertisements, the segment).
+    /// Router advertisements/solicitations are never accepted from guests.
+    fn decideBootstrap(self: *const Switch, source: *const Port, parsed: ParsedFrame) Decision {
+        const config = &source.config;
+        switch (parsed.kind) {
+            .transport => unreachable,
+            .router_discovery => return .{ .drop_reason = .router_message_denied },
+            .arp_request, .arp_reply => {
+                if (!std.mem.eql(u8, &parsed.sender_mac, &config.mac)) return .{ .drop_reason = .arp_spoof };
+                const zero4: [4]u8 = @splat(0);
+                const sender_zero = std.mem.eql(u8, parsed.source_ip[0..4], &zero4);
+                if (parsed.kind == .arp_request) {
+                    if (!std.mem.eql(u8, &parsed.destination_mac, &BROADCAST_MAC)) return .{ .drop_reason = .arp_spoof };
+                    if (!sender_zero and !sourceOwnsAddress(config, .ipv4, &parsed.source_ip)) {
+                        return .{ .drop_reason = .arp_spoof };
+                    }
+                    if (sender_zero and config.ipv4_count == 0) return .{ .drop_reason = .arp_spoof };
+                } else {
+                    if (sender_zero or !sourceOwnsAddress(config, .ipv4, &parsed.source_ip)) {
+                        return .{ .drop_reason = .arp_spoof };
+                    }
+                    if (!std.mem.eql(u8, &parsed.target_mac, &parsed.destination_mac)) {
+                        return .{ .drop_reason = .arp_spoof };
+                    }
+                }
+            },
+            .ndp_solicit => {
+                if (parsed.nd_option_mac) |option| {
+                    if (!std.mem.eql(u8, &option, &config.mac)) return .{ .drop_reason = .neighbor_spoof };
+                }
+                const unspecified = std.mem.allEqual(u8, &parsed.source_ip, 0);
+                if (unspecified) {
+                    // Duplicate address detection: only for a bound target address.
+                    if (!sourceOwnsAddress(config, .ipv6, &parsed.target_ip)) return .{ .drop_reason = .neighbor_spoof };
+                } else if (!sourceOwnsAddress(config, .ipv6, &parsed.source_ip)) {
+                    return .{ .drop_reason = .neighbor_spoof };
+                }
+            },
+            .ndp_advert => {
+                if (parsed.nd_option_mac) |option| {
+                    if (!std.mem.eql(u8, &option, &config.mac)) return .{ .drop_reason = .neighbor_spoof };
+                }
+                if (!sourceOwnsAddress(config, .ipv6, &parsed.source_ip) or
+                    !sourceOwnsAddress(config, .ipv6, &parsed.target_ip))
+                {
+                    return .{ .drop_reason = .neighbor_spoof };
+                }
+            },
+        }
+
+        var result: Decision = .{};
+        for (&self.ports) |*candidate| {
+            if (!candidate.active or candidate.config.id == config.id or
+                candidate.config.segment != config.segment)
+            {
+                continue;
+            }
+            const eligible = switch (parsed.kind) {
+                .arp_request => sourceOwnsAddress(&candidate.config, .ipv4, &parsed.target_ip),
+                .arp_reply => std.mem.eql(u8, &parsed.destination_mac, &candidate.config.mac) and
+                    sourceOwnsAddress(&candidate.config, .ipv4, &parsed.target_ip),
+                .ndp_solicit => sourceOwnsAddress(&candidate.config, .ipv6, &parsed.target_ip),
+                .ndp_advert => if (isMulticastMac(&parsed.destination_mac))
+                    true
+                else
+                    std.mem.eql(u8, &parsed.destination_mac, &candidate.config.mac) and
+                        sourceOwnsAddress(&candidate.config, .ipv6, &parsed.destination_ip),
+                else => false,
+            };
+            if (!eligible) continue;
             if (result.count == result.deliveries.len) break;
             result.deliveries[result.count] = .{
                 .port_id = candidate.config.id,
@@ -350,11 +523,29 @@ fn validPolicy(policy: Policy) bool {
     return true;
 }
 
+const PROTO_ICMP: u8 = 1;
+const PROTO_ICMPV6: u8 = 58;
+
+fn sameRule(a: Rule, b: Rule) bool {
+    return a.ip_version == b.ip_version and a.protocol == b.protocol and
+        std.mem.eql(u8, &a.destination, &b.destination) and
+        a.destination_port_first == b.destination_port_first and
+        a.destination_port_last == b.destination_port_last;
+}
+
+fn isBootstrapFrame(frame: []const u8) bool {
+    const parsed = parseFrame(frame) orelse return false;
+    return parsed.kind != .transport;
+}
+
 fn validRule(rule: Rule) bool {
-    if ((rule.protocol != 6 and rule.protocol != 17) or
-        rule.destination_port_first > rule.destination_port_last)
-    {
-        return false;
+    if (rule.destination_port_first > rule.destination_port_last) return false;
+    switch (rule.protocol) {
+        6, 17 => {},
+        // ICMP / ICMPv6 echo: matched on destination address only (port range must be 0-0).
+        PROTO_ICMP => if (rule.ip_version != .ipv4 or rule.destination_port_last != 0) return false,
+        PROTO_ICMPV6 => if (rule.ip_version != .ipv6 or rule.destination_port_last != 0) return false,
+        else => return false,
     }
     if (rule.ip_version == .ipv4 and !std.mem.allEqual(u8, rule.destination[4..], 0)) return false;
     return true;
@@ -382,8 +573,36 @@ fn parseFrame(frame: []const u8) ?ParsedFrame {
     return switch (ether_type) {
         0x0800 => parseIpv4(frame[0..6], payload),
         0x86DD => parseIpv6(frame[0..6], payload),
+        0x0806 => parseArp(frame[0..6], payload),
         else => null,
     };
+}
+
+/// Ethernet/IPv4 ARP (RFC 826): fixed 28-byte body, request or reply only.
+fn parseArp(destination_mac: []const u8, packet: []const u8) ?ParsedFrame {
+    if (packet.len < 28) return null;
+    if (std.mem.readInt(u16, packet[0..2], .big) != 1 or
+        std.mem.readInt(u16, packet[2..4], .big) != 0x0800 or
+        packet[4] != 6 or packet[5] != 4)
+    {
+        return null;
+    }
+    const op = std.mem.readInt(u16, packet[6..8], .big);
+    if (op != 1 and op != 2) return null;
+    var result = ParsedFrame{
+        .destination_mac = destination_mac[0..6].*,
+        .ip_version = .ipv4,
+        .source_ip = @splat(0),
+        .destination_ip = @splat(0),
+        .protocol = 0,
+        .destination_port = 0,
+        .kind = if (op == 1) .arp_request else .arp_reply,
+    };
+    @memcpy(result.source_ip[0..4], packet[14..18]);
+    @memcpy(&result.target_mac, packet[18..24]);
+    @memcpy(result.target_ip[0..4], packet[24..28]);
+    result.sender_mac = packet[8..14].*;
+    return result;
 }
 
 fn parseIpv4(destination_mac: []const u8, packet: []const u8) ?ParsedFrame {
@@ -416,21 +635,66 @@ fn parseIpv6(destination_mac: []const u8, packet: []const u8) ?ParsedFrame {
     const payload_len = std.mem.readInt(u16, packet[4..6], .big);
     if (@as(usize, payload_len) + 40 > packet.len) return null;
     const protocol = packet[6];
-    if (protocol != 6 and protocol != 17) return null;
     const transport = packet[40 .. 40 + payload_len];
-    const destination_port = parseTransportDestinationPort(protocol, transport) orelse return null;
     var source_ip: [16]u8 = undefined;
     var destination_ip: [16]u8 = undefined;
     @memcpy(&source_ip, packet[8..24]);
     @memcpy(&destination_ip, packet[24..40]);
-    return .{
+    var result = ParsedFrame{
         .destination_mac = destination_mac[0..6].*,
         .ip_version = .ipv6,
         .source_ip = source_ip,
         .destination_ip = destination_ip,
         .protocol = protocol,
-        .destination_port = destination_port,
+        .destination_port = 0,
     };
+    if (protocol == PROTO_ICMPV6) {
+        if (transport.len < 4) return null;
+        const icmp_type = transport[0];
+        switch (icmp_type) {
+            // Echo request / reply: matched on destination address only.
+            128, 129 => {
+                if (transport.len < 8 or transport[1] != 0) return null;
+            },
+            // Router solicitation / advertisement: never accepted from a guest port.
+            133, 134 => {
+                result.kind = .router_discovery;
+            },
+            // Neighbor solicitation / advertisement (RFC 4861): hop limit 255, code 0.
+            135, 136 => {
+                if (packet[7] != 255 or transport[1] != 0 or transport.len < 24) return null;
+                @memcpy(&result.target_ip, transport[8..24]);
+                if (result.target_ip[0] == 0xFF) return null;
+                if (!parseNdOptions(transport[24..], if (icmp_type == 135) 1 else 2, &result.nd_option_mac)) return null;
+                result.kind = if (icmp_type == 135) .ndp_solicit else .ndp_advert;
+            },
+            else => return null,
+        }
+        return result;
+    }
+    if (protocol != 6 and protocol != 17) return null;
+    result.destination_port = parseTransportDestinationPort(protocol, transport) orelse return null;
+    return result;
+}
+
+/// NDP options are bounded TLVs in units of 8 bytes; zero-length options are
+/// malformed. Returns false for malformed options; `mac` receives the first
+/// link-layer address option of `wanted_type` (1 = source, 2 = target).
+fn parseNdOptions(options: []const u8, wanted_type: u8, mac: *?[6]u8) bool {
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (offset < options.len) {
+        if (options.len - offset < 2 or count >= 8) return false;
+        const units = @as(usize, options[offset + 1]);
+        if (units == 0 or offset + units * 8 > options.len) return false;
+        if (options[offset] == wanted_type and mac.* == null) {
+            if (units != 1) return false;
+            mac.* = options[offset + 2 ..][0..6].*;
+        }
+        offset += units * 8;
+        count += 1;
+    }
+    return true;
 }
 
 fn parseTransportDestinationPort(protocol: u8, transport: []const u8) ?u16 {
@@ -442,6 +706,10 @@ fn parseTransportDestinationPort(protocol: u8, transport: []const u8) ?u16 {
         if (transport.len < 8) return null;
         const udp_len = std.mem.readInt(u16, transport[4..6], .big);
         if (udp_len < 8 or udp_len > transport.len) return null;
+    } else if (protocol == PROTO_ICMP) {
+        // Echo request (8) / reply (0) only.
+        if (transport.len < 8 or transport[1] != 0 or (transport[0] != 8 and transport[0] != 0)) return null;
+        return 0;
     } else {
         return null;
     }
@@ -974,4 +1242,249 @@ fn buildUdpFrame(
         std.mem.writeInt(u16, frame[58..60], 8, .big);
     }
     return frame;
+}
+
+fn buildArpFrame(
+    op: u16,
+    eth_dst: [6]u8,
+    eth_src: [6]u8,
+    sender_mac: [6]u8,
+    sender_ip: [4]u8,
+    target_mac: [6]u8,
+    target_ip: [4]u8,
+) [42]u8 {
+    var frame: [42]u8 = @splat(0);
+    @memcpy(frame[0..6], &eth_dst);
+    @memcpy(frame[6..12], &eth_src);
+    std.mem.writeInt(u16, frame[12..14], 0x0806, .big);
+    std.mem.writeInt(u16, frame[14..16], 1, .big);
+    std.mem.writeInt(u16, frame[16..18], 0x0800, .big);
+    frame[18] = 6;
+    frame[19] = 4;
+    std.mem.writeInt(u16, frame[20..22], op, .big);
+    @memcpy(frame[22..28], &sender_mac);
+    @memcpy(frame[28..32], &sender_ip);
+    @memcpy(frame[32..38], &target_mac);
+    @memcpy(frame[38..42], &target_ip);
+    return frame;
+}
+
+/// Neighbor solicitation (type 135) or advertisement (type 136) with an
+/// optional 8-byte link-layer address option; returns the frame length.
+fn buildNdFrame(
+    buf: *[96]u8,
+    icmp_type: u8,
+    eth_dst: [6]u8,
+    eth_src: [6]u8,
+    source_ip: [16]u8,
+    destination_ip: [16]u8,
+    target: [16]u8,
+    option_mac: ?[6]u8,
+) usize {
+    @memset(buf, 0);
+    @memcpy(buf[0..6], &eth_dst);
+    @memcpy(buf[6..12], &eth_src);
+    std.mem.writeInt(u16, buf[12..14], 0x86DD, .big);
+    buf[14] = 0x60;
+    const icmp_len: usize = 24 + if (option_mac != null) @as(usize, 8) else 0;
+    std.mem.writeInt(u16, buf[18..20], @intCast(icmp_len), .big);
+    buf[20] = 58;
+    buf[21] = 255;
+    @memcpy(buf[22..38], &source_ip);
+    @memcpy(buf[38..54], &destination_ip);
+    buf[54] = icmp_type;
+    @memcpy(buf[62..78], &target);
+    if (option_mac) |mac| {
+        buf[78] = if (icmp_type == 135) 1 else 2;
+        buf[79] = 1;
+        @memcpy(buf[80..86], &mac);
+    }
+    return 54 + icmp_len;
+}
+
+const test_mac_a = [_]u8{ 0x02, 0xCA, 0, 0, 0, 1 };
+const test_mac_b = [_]u8{ 0x02, 0xCA, 0, 0, 0, 2 };
+const test_ip4_a = [_]u8{ 10, 77, 0, 1 };
+const test_ip4_b = [_]u8{ 10, 77, 0, 2 };
+const test_ip6_a = [_]u8{ 0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+const test_ip6_b = [_]u8{ 0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+
+fn attachDualStackPair(switcher: *Switch) !struct { a: AttachmentGeneration, b: AttachmentGeneration } {
+    const a = switcher.attach(.{
+        .id = 1,
+        .segment = 1,
+        .mac = test_mac_a,
+        .ipv4_addresses = @as([4][4]u8, .{ test_ip4_a, @splat(0), @splat(0), @splat(0) }),
+        .ipv4_count = 1,
+        .ipv6_addresses = @as([4][16]u8, .{ test_ip6_a, @splat(0), @splat(0), @splat(0) }),
+        .ipv6_count = 1,
+    }) orelse return error.TestUnexpectedResult;
+    const b = switcher.attach(.{
+        .id = 2,
+        .segment = 1,
+        .mac = test_mac_b,
+        .ipv4_addresses = @as([4][4]u8, .{ test_ip4_b, @splat(0), @splat(0), @splat(0) }),
+        .ipv4_count = 1,
+        .ipv6_addresses = @as([4][16]u8, .{ test_ip6_b, @splat(0), @splat(0), @splat(0) }),
+        .ipv6_count = 1,
+    }) orelse return error.TestUnexpectedResult;
+    return .{ .a = a, .b = b };
+}
+
+test "ARP resolves only between bound addresses and rejects forged claims" {
+    var switcher: Switch = .{};
+    const gen = try attachDualStackPair(&switcher);
+    const broadcast: [6]u8 = @splat(0xFF);
+    const zero_mac: [6]u8 = @splat(0);
+
+    // Request for B's address from A is delivered only to B.
+    const request = buildArpFrame(1, broadcast, test_mac_a, test_mac_a, test_ip4_a, zero_mac, test_ip4_b);
+    const decision = switcher.decideCounted(1, gen.a, &request);
+    try std.testing.expectEqual(@as(usize, 1), decision.count);
+    try std.testing.expectEqual(@as(PortId, 2), decision.deliveries[0].port_id);
+    try std.testing.expectEqual(@as(u64, 1), switcher.counters.bootstrap_forwarded);
+
+    // B's reply goes back unicast to A.
+    const reply = buildArpFrame(2, test_mac_a, test_mac_b, test_mac_b, test_ip4_b, test_mac_a, test_ip4_a);
+    const reply_decision = switcher.decideCounted(2, gen.b, &reply);
+    try std.testing.expectEqual(@as(usize, 1), reply_decision.count);
+    try std.testing.expectEqual(@as(PortId, 1), reply_decision.deliveries[0].port_id);
+
+    // Address-conflict probe (zero sender) is allowed for a port with a binding.
+    const probe = buildArpFrame(1, broadcast, test_mac_a, test_mac_a, .{ 0, 0, 0, 0 }, zero_mac, test_ip4_b);
+    try std.testing.expectEqual(@as(usize, 1), switcher.decide(1, gen.a, &probe).count);
+
+    // A claims B's IP, or forges the ARP sender MAC: dropped and counted.
+    const claim = buildArpFrame(2, test_mac_b, test_mac_a, test_mac_a, test_ip4_b, test_mac_b, test_ip4_b);
+    try std.testing.expectEqual(DropReason.arp_spoof, switcher.decideCounted(1, gen.a, &claim).drop_reason);
+    const forged_sender = buildArpFrame(1, broadcast, test_mac_a, test_mac_b, test_ip4_a, zero_mac, test_ip4_b);
+    try std.testing.expectEqual(DropReason.arp_spoof, switcher.decideCounted(1, gen.a, &forged_sender).drop_reason);
+    try std.testing.expectEqual(@as(u64, 2), switcher.counters.drops[@intFromEnum(DropReason.arp_spoof)]);
+
+    // An unbound port cannot use ARP at all (default-deny).
+    var fresh: Switch = .{};
+    const lonely = fresh.attach(.{ .id = 3, .segment = 1, .mac = test_mac_a }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(DropReason.arp_spoof, fresh.decide(3, lonely, &request).drop_reason);
+}
+
+test "NDP validates solicited and advertised addresses and denies router messages" {
+    var switcher: Switch = .{};
+    const gen = try attachDualStackPair(&switcher);
+    var buf: [96]u8 = undefined;
+    const multicast_mac = [_]u8{ 0x33, 0x33, 0xFF, 0, 0, 2 };
+    var solicited_node: [16]u8 = .{ 0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0, 0, 2 };
+
+    const ns_len = buildNdFrame(&buf, 135, multicast_mac, test_mac_a, test_ip6_a, solicited_node, test_ip6_b, test_mac_a);
+    const ns = switcher.decideCounted(1, gen.a, buf[0..ns_len]);
+    try std.testing.expectEqual(@as(usize, 1), ns.count);
+    try std.testing.expectEqual(@as(PortId, 2), ns.deliveries[0].port_id);
+
+    // Solicited advertisement: unicast back to the asker.
+    const na_len = buildNdFrame(&buf, 136, test_mac_a, test_mac_b, test_ip6_b, test_ip6_a, test_ip6_b, test_mac_b);
+    const na = switcher.decideCounted(2, gen.b, buf[0..na_len]);
+    try std.testing.expectEqual(@as(usize, 1), na.count);
+    try std.testing.expectEqual(@as(PortId, 1), na.deliveries[0].port_id);
+
+    // DAD for the sender's own bound address is allowed; for someone else's it is not.
+    var dad_dst = solicited_node;
+    dad_dst[15] = 1;
+    dad_dst[13] = 0;
+    const dad_len = buildNdFrame(&buf, 135, multicast_mac, test_mac_a, @splat(0), dad_dst, test_ip6_a, null);
+    try std.testing.expectEqual(DropReason.no_eligible_destination, switcher.decide(1, gen.a, buf[0..dad_len]).drop_reason);
+    const bad_dad_len = buildNdFrame(&buf, 135, multicast_mac, test_mac_a, @splat(0), solicited_node, test_ip6_b, null);
+    try std.testing.expectEqual(DropReason.neighbor_spoof, switcher.decide(1, gen.a, buf[0..bad_dad_len]).drop_reason);
+
+    // A advertises B's address, forges the link-layer option, or solicits from a foreign source.
+    const claim_len = buildNdFrame(&buf, 136, multicast_mac, test_mac_a, test_ip6_a, test_ip6_b, test_ip6_b, test_mac_a);
+    try std.testing.expectEqual(DropReason.neighbor_spoof, switcher.decideCounted(1, gen.a, buf[0..claim_len]).drop_reason);
+    const forged_lla_len = buildNdFrame(&buf, 135, multicast_mac, test_mac_a, test_ip6_a, solicited_node, test_ip6_b, test_mac_b);
+    try std.testing.expectEqual(DropReason.neighbor_spoof, switcher.decideCounted(1, gen.a, buf[0..forged_lla_len]).drop_reason);
+    const foreign_src_len = buildNdFrame(&buf, 135, multicast_mac, test_mac_a, test_ip6_b, solicited_node, test_ip6_b, null);
+    try std.testing.expectEqual(DropReason.neighbor_spoof, switcher.decide(1, gen.a, buf[0..foreign_src_len]).drop_reason);
+    try std.testing.expectEqual(@as(u64, 2), switcher.counters.drops[@intFromEnum(DropReason.neighbor_spoof)]);
+
+    // Hop limit other than 255 is malformed; router advertisements are denied.
+    const bad_hop_len = buildNdFrame(&buf, 135, multicast_mac, test_mac_a, test_ip6_a, solicited_node, test_ip6_b, null);
+    buf[21] = 64;
+    try std.testing.expectEqual(DropReason.malformed_frame, switcher.decide(1, gen.a, buf[0..bad_hop_len]).drop_reason);
+    solicited_node = .{ 0xFF, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const ra_len = buildNdFrame(&buf, 134, test_mac_b, test_mac_a, test_ip6_a, solicited_node, @splat(0), null);
+    try std.testing.expectEqual(DropReason.router_message_denied, switcher.decideCounted(1, gen.a, buf[0..ra_len]).drop_reason);
+}
+
+test "operator rules are bounded, revisioned, and default-deny until added" {
+    var switcher: Switch = .{};
+    const gen = try attachDualStackPair(&switcher);
+    const src = ip4Wide(test_ip4_a);
+    const dst = ip4Wide(test_ip4_b);
+    const frame = buildUdpFrame(test_mac_a, test_mac_b, 0x0800, &src, &dst, 17);
+    try std.testing.expectEqual(DropReason.egress_denied, switcher.decideCounted(1, gen.a, &frame).drop_reason);
+
+    const rule: Rule = .{ .ip_version = .ipv4, .protocol = 17, .destination = dst, .destination_port_first = 53, .destination_port_last = 53 };
+    try std.testing.expectEqual(@as(u64, 2), try switcher.addRule(1, gen.a, 1, .egress, rule));
+    // Egress alone is not enough: the destination also needs an ingress rule.
+    try std.testing.expectEqual(DropReason.no_eligible_destination, switcher.decide(1, gen.a, &frame).drop_reason);
+    try std.testing.expectEqual(@as(u64, 2), try switcher.addRule(2, gen.b, 1, .ingress, rule));
+    try std.testing.expectEqual(@as(usize, 1), switcher.decideCounted(1, gen.a, &frame).count);
+    try std.testing.expectEqual(@as(u64, 1), switcher.counters.forwarded);
+
+    // Stale revision, duplicate, invalid rules are rejected without changes.
+    try std.testing.expectError(error.Stale, switcher.addRule(1, gen.a, 1, .egress, rule));
+    try std.testing.expectError(error.Duplicate, switcher.addRule(1, gen.a, 2, .egress, rule));
+    var bad = rule;
+    bad.protocol = 47;
+    try std.testing.expectError(error.Invalid, switcher.addRule(1, gen.a, 2, .egress, bad));
+    try std.testing.expectError(error.Stale, switcher.addRule(1, gen.a + 99, 2, .egress, rule));
+
+    // Rule capacity is bounded.
+    var port: u16 = 1000;
+    var revision: u64 = 2;
+    while (revision - 2 < MAX_RULES_PER_DIRECTION - 1) : (revision += 1) {
+        var extra = rule;
+        extra.destination_port_first = port;
+        extra.destination_port_last = port;
+        port += 1;
+        try std.testing.expectEqual(revision + 1, try switcher.addRule(1, gen.a, revision, .egress, extra));
+    }
+    var overflow = rule;
+    overflow.destination_port_first = 2000;
+    overflow.destination_port_last = 2000;
+    try std.testing.expectError(error.Full, switcher.addRule(1, gen.a, revision, .egress, overflow));
+
+    // Clearing restores default-deny in both directions at a new revision.
+    try std.testing.expectEqual(revision + 1, try switcher.clearRules(1, gen.a, revision));
+    try std.testing.expectEqual(DropReason.egress_denied, switcher.decide(1, gen.a, &frame).drop_reason);
+    try std.testing.expectError(error.Stale, switcher.clearRules(1, gen.a, revision));
+}
+
+test "ICMP echo is classified by destination address and spoofed sources are dropped" {
+    var switcher: Switch = .{};
+    const gen = try attachDualStackPair(&switcher);
+    var frame: [64]u8 = @splat(0);
+    @memcpy(frame[0..6], &test_mac_b);
+    @memcpy(frame[6..12], &test_mac_a);
+    std.mem.writeInt(u16, frame[12..14], 0x0800, .big);
+    frame[14] = 0x45;
+    std.mem.writeInt(u16, frame[16..18], 28, .big);
+    frame[23] = 1;
+    @memcpy(frame[26..30], &test_ip4_a);
+    @memcpy(frame[30..34], &test_ip4_b);
+    frame[34] = 8;
+
+    const dst = ip4Wide(test_ip4_b);
+    const rule: Rule = .{ .ip_version = .ipv4, .protocol = 1, .destination = dst, .destination_port_first = 0, .destination_port_last = 0 };
+    _ = try switcher.addRule(1, gen.a, 1, .egress, rule);
+    _ = try switcher.addRule(2, gen.b, 1, .ingress, rule);
+    try std.testing.expectEqual(@as(usize, 1), switcher.decide(1, gen.a, frame[0..42]).count);
+
+    // Forged IP source, forged MAC source, and a port-ranged ICMP rule are all rejected.
+    var forged_ip = frame;
+    forged_ip[29] = 9;
+    try std.testing.expectEqual(DropReason.unauthorized_source_address, switcher.decide(1, gen.a, forged_ip[0..42]).drop_reason);
+    var forged_mac = frame;
+    forged_mac[11] = 0x77;
+    try std.testing.expectEqual(DropReason.spoofed_mac, switcher.decide(1, gen.a, forged_mac[0..42]).drop_reason);
+    var ranged = rule;
+    ranged.destination_port_last = 5;
+    try std.testing.expectError(error.Invalid, switcher.addRule(1, gen.a, 2, .egress, ranged));
 }

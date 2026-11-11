@@ -269,6 +269,9 @@ fn cmdHelp() void {
     write("  vm-start <id>                 — start MicroVM by ID\r\n");
     write("  vm-kill <id> / vm-stop <id>   — stop MicroVM by ID\r\n");
     write("  vm-delete <id>                — delete MicroVM from registry\r\n");
+    write("  vnic-bind <vm> <ip4|-> <ip6|-> — set vNIC source addresses (clears rules)\r\n");
+    write("  vnic-allow <vm> <in|out> <tcp|udp|icmp> <ip> [port] — allow a flow\r\n");
+    write("  vnic-clear <vm>               — remove vNIC rules (default-deny)\r\n");
     write("  cluster                       — cluster node & topology summary\r\n");
     write("  net-stat                      — IPv6 & DIPC network status\r\n");
     write("  storage-stat                  — NVMe & Virtio-Blk status\r\n");
@@ -382,7 +385,16 @@ fn cmdVmAction(args: []const u8, action: enum { start, stop, delete }, cmd_name:
     const ok = switch (action) {
         .start => microvm_registry.start(id),
         .stop => microvm_registry.stop(id),
-        .delete => microvm_registry.delete(id),
+        .delete => blk: {
+            if (!builtin.is_test) {
+                const build_options = @import("build_options");
+                if (build_options.vmm_active) {
+                    const vmx = @import("../arch/x86_64/vmx.zig");
+                    if (!vmx.reclaimInstanceById(id)) break :blk false;
+                }
+            }
+            break :blk microvm_registry.delete(id);
+        },
     };
     if (ok) {
         write("\r\nMicroVM ");
@@ -390,7 +402,12 @@ fn cmdVmAction(args: []const u8, action: enum { start, stop, delete }, cmd_name:
         switch (action) {
             .start => write(" started.\r\n"),
             .stop => write(" stop requested.\r\n"),
-            .delete => write(" deleted.\r\n"),
+            .delete => {
+                write(" deleted.\r\n");
+                if (!builtin.is_test) {
+                    @import("../main.zig").serialWrite("varde_shell: MicroVM deleted\n");
+                }
+            },
         }
     } else {
         write("\r\nError: invalid MicroVM ID or state transition.\r\n");

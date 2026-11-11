@@ -201,6 +201,7 @@ pub const Instance = struct {
     initramfs_phys: u64 = 0,
     initramfs_size: u64 = 0,
     vmcs_phys: ?u64 = null,
+    vmcs_active_cpu: ?u8 = null,
     ept_pml4_phys: ?u64 = null,
     /// Host-physical address of the guest-specific page pool.
     pool_phys: ?u64 = null,
@@ -228,6 +229,7 @@ pub const Instance = struct {
         self.initramfs_phys = 0;
         self.initramfs_size = 0;
         self.vmcs_phys = null;
+        self.vmcs_active_cpu = null;
         self.ept_pml4_phys = null;
         self.pool_phys = null;
         self.pool_used = 0;
@@ -431,6 +433,7 @@ fn canDeleteState(state: MicrovmState) bool {
 fn canDeleteInstance(instance: *const Instance) bool {
     return canDeleteState(instance.state) and
         instance.vmcs_phys == null and
+        instance.vmcs_active_cpu == null and
         instance.ept_pml4_phys == null and
         instance.pool_phys == null and
         instance.pool_used == 0;

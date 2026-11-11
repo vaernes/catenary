@@ -40,6 +40,8 @@ fakeroot sh -c '
 set -e
 mknod -m 600 "$1/dev/console" c 5 1
 mknod -m 666 "$1/dev/null" c 1 3
+mknod -m 600 "$1/dev/mem" c 1 1
+mknod -m 600 "$1/mnt/container/dev/mem" c 1 1
 cd "$1"
 find . | cpio -o -H newc --quiet | gzip -9 > "$2"
 ' sh "$tmpdir" "$repo_root/assets/guest/initramfs.cpio.gz"

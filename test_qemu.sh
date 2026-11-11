@@ -13,7 +13,7 @@ fi
 
 # Catenary OS smoke test; the selected profile defines the required milestones.
 
-TIMEOUT_SECS=${TIMEOUT_SECS:-120}
+DEFAULT_TIMEOUT_SECS=120
 REQUIRE_KVM=${REQUIRE_KVM:-1}
 SMOKE_PROFILE=${SMOKE_PROFILE:-default}
 NVME_DISK_IMAGE=${NVME_DISK_IMAGE:-}
@@ -53,7 +53,7 @@ case "${SMOKE_PROFILE}" in
         ;;
     vnic-bind)
         DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false"
-        DEFAULT_CORE_PATTERNS="booting...;inputd: registered at endpoint 8;windowd: registered at endpoint 9;[UI] MicroVM provisioned: alpine-node-01;configd: host-assigned vNIC attached (default-deny);[UI] vNIC binding rejected;configd: vNIC address bindings updated (default-deny);[UI] vNIC bindings updated (default-deny);configd: vNIC detached"
+        DEFAULT_CORE_PATTERNS="booting...;inputd: registered at endpoint 8;windowd: registered at endpoint 9;[UI] MicroVM provisioned: alpine-node-01;configd: host-assigned vNIC attached (default-deny);[UI] vNIC binding rejected;configd: vNIC address bindings updated (default-deny);[UI] vNIC bindings updated (default-deny);[UI] vNIC rule added;[UI] vNIC rule rejected;[UI] vNIC rules cleared (default-deny);configd: vNIC firewall rule applied (default-deny);netd: vswitch rule updated;configd: vNIC detached"
         ;;
     phase9)
         if [ "${SMP:-2}" -lt 2 ]; then
@@ -63,6 +63,16 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;[UI] MicroVM provisioned: alpine-node-01;[UI] Switched console to MicroVM #2"
         DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
         DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1;[vm1] Catenary OS Guest Init: SUCCESS;[vm1] guest_rootfs: init started;[vm1] guest_rootfs: shell ready;[vm2] Catenary OS Guest Init: SUCCESS;[vm2] guest_rootfs: init started;[vm2] guest_rootfs: shell ready;[UI] Switched console to MicroVM #1;[vm1] help env os-release exit;[UI] Switched console to MicroVM #2;[vm2] help env os-release exit"
+        ;;
+    phase10)
+        if [ "${SMP:-2}" -lt 2 ]; then
+            SMP=2
+        fi
+        DEFAULT_TIMEOUT_SECS=180
+        DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=true"
+        DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;[UI] MicroVM provisioned: alpine-node-01;configd: per-VM disk attached;storaged: per-VM disk attached;configd: host-assigned vNIC attached (default-deny);configd: vNIC address bindings updated (default-deny);[UI] vNIC bindings updated (default-deny);netd: vswitch drop vm1 egress_denied total=1;netd: vswitch drop vm1 spoofed_mac total=1;netd: vswitch drop vm1 unauthorized_source_address total=1;[UI] vNIC rule added;configd: vNIC firewall rule applied (default-deny);netd: vswitch rule updated;netd: vswitch forward vm1 -> vm2 len=58;netd: vswitch forward vm1 -> vm2 len=79;[UI] vNIC rules cleared (default-deny);netd: vswitch drop vm1 egress_denied total=2;configd: per-VM disk detached;storaged: per-VM disk detached;configd: vNIC detached;varde_shell: MicroVM deleted"
+        DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
+        DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1;[vm1] Catenary OS Guest Init: SUCCESS;[vm1] guest_rootfs: shell ready;[vm2] Catenary OS Guest Init: SUCCESS;[vm2] guest_rootfs: shell ready;[vm2] guest_blk: out-of-bounds sector rejected;[vm2] guest_blk: extent isolated;[vm2] guest_blk: FUA write+flush+readback OK tag=CATENARY-VM2-DISK;[vm1] guest_blk: out-of-bounds sector rejected;[vm1] guest_blk: extent isolated;[vm1] guest_blk: FUA write+flush+readback OK tag=CATENARY-VM1-DISK;[vm1] guest_net: ready mac=02:ca:00:00:00:01 vmid=1;[vm2] guest_net: ready mac=02:ca:00:00:00:02 vmid=2;[vm1] guest_net: spoof probes sent;[vm2] guest_net: rx arp from 10.77.0.1;[vm2] guest_net: rx udp4 payload=CATENARY-UDP4-OK;[vm2] guest_net: rx icmp6 payload=CATENARY-ICMP6-OK;[vm2] guest_net: rx total=0"
         ;;
     no-nvme)
         NVME_DEVICE_ARGS=()
@@ -93,7 +103,7 @@ case "${SMOKE_PROFILE}" in
         ;;
     *)
         echo "[!] Unknown SMOKE_PROFILE: ${SMOKE_PROFILE}" >&2
-        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8, vnic-bind, phase9, no-nvme, corrupt-metadata, corrupt-journal, journal-recovery, journal-commit-recovery" >&2
+        echo "[!] Expected one of: default, vmx-linux, vmx-linux-services, ui-phase8, vnic-bind, phase9, phase10, no-nvme, corrupt-metadata, corrupt-journal, journal-recovery, journal-commit-recovery" >&2
         exit 2
         ;;
 esac
@@ -113,6 +123,7 @@ cleanup_temporary_disk() {
 }
 trap cleanup_temporary_disk EXIT
 
+TIMEOUT_SECS=${TIMEOUT_SECS:-${DEFAULT_TIMEOUT_SECS}}
 ZIG_BUILD_ARGS=${ZIG_BUILD_ARGS:-${DEFAULT_ZIG_BUILD_ARGS}}
 CORE_PATTERNS=${CORE_PATTERNS:-${DEFAULT_CORE_PATTERNS}}
 VMX_EPT_PATTERNS=${VMX_EPT_PATTERNS:-${DEFAULT_VMX_EPT_PATTERNS}}
@@ -259,11 +270,11 @@ if sys.argv[1] == "vnic-bind":
         special = {" ": "spc", "-": "minus", ".": "dot", ":": "shift-semicolon"}
         send_keys([special.get(ch, ch) for ch in command] + ["ret"], 0.08)
 
-    def wait_for(marker):
+    def wait_for(marker, count=1):
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             with open("qemu_serial.log", "r", errors="replace") as log:
-                if marker in log.read():
+                if log.read().count(marker) >= count:
                     return
             time.sleep(0.25)
         raise SystemExit("Missing vNIC milestone: " + marker)
@@ -273,6 +284,15 @@ if sys.argv[1] == "vnic-bind":
     wait_for("[UI] vNIC binding rejected")
     send_command("vnic-bind 2 10.77.0.2 fd00::2")
     wait_for("[UI] vNIC bindings updated (default-deny)")
+    # Operator firewall controls: add rules, reject a duplicate, then clear (default-deny).
+    send_command("vnic-allow 2 out udp 10.77.0.1 5001")
+    wait_for("[UI] vNIC rule added")
+    send_command("vnic-allow 2 out udp 10.77.0.1 5001")
+    wait_for("[UI] vNIC rule rejected")
+    send_command("vnic-allow 2 in icmp fd00::2")
+    wait_for("[UI] vNIC rule added", 2)
+    send_command("vnic-clear 2")
+    wait_for("[UI] vNIC rules cleared (default-deny)")
 
 # The cluster service creates VM 1 in the background; the UI-created running
 # VM is therefore VM 2. Stop it and require configd to detach its vNIC.
@@ -338,6 +358,135 @@ s.close()
 '
 }
 
+inject_ui_phase10_keys() {
+    python3 -c '
+import socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect("/tmp/catenary_qemu_mon.sock")
+time.sleep(0.2)
+
+def send_keys(keys, delay=0.10):
+    for k in keys:
+        s.sendall(f"sendkey {k}\n".encode())
+        time.sleep(delay)
+
+def send_command(command, delay=0.07):
+    special = {" ": "spc", "-": "minus", ".": "dot", ":": "shift-semicolon"}
+    send_keys([special.get(ch, ch) for ch in command] + ["ret"], delay)
+
+def wait_for(marker, count=1, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with open("qemu_serial.log", "r", errors="replace") as log:
+            if log.read().count(marker) >= count:
+                return
+        time.sleep(0.25)
+    raise SystemExit(f"Missing Phase 10 milestone ({count}x): {marker}")
+
+# 1. Advance to memory, select 128 MB for the Linux guest, then create and launch MicroVM 2
+send_keys(["ret", "ret"], 0.15)
+send_keys(["right", "right"], 0.15)
+send_keys(["ret", "ret", "ret", "ret"], 0.15)
+time.sleep(0.4)
+
+# 2. Switch to Guest Console (F6), select MicroVM 2 (F8), and wait until both guest shells and device attachments are ready
+send_keys(["f6"], 0.2)
+send_keys(["f8"], 0.2)
+wait_for("[vm1] guest_rootfs: shell ready", 1, 60)
+wait_for("[vm2] guest_rootfs: shell ready", 1, 60)
+wait_for("storaged: per-VM disk attached", 2, 30)
+wait_for("configd: host-assigned vNIC attached (default-deny)", 2, 30)
+
+# 3. Exercise per-VM disk extent isolation, out-of-bounds rejection, and FUA write+flush+readback
+send_command("blk-test")
+wait_for("[vm2] guest_blk: FUA write+flush+readback OK tag=CATENARY-VM2-DISK")
+
+send_keys(["f7"], 0.2)
+wait_for("[UI] Switched console to MicroVM #1")
+send_command("blk-test")
+wait_for("[vm1] guest_blk: FUA write+flush+readback OK tag=CATENARY-VM1-DISK")
+
+# 4. Initialize virtio-net on both guests
+send_command("net-init")
+wait_for("[vm1] guest_net: ready mac=02:ca:00:00:00:01 vmid=1")
+
+send_keys(["f8"], 0.2)
+wait_for("[UI] Switched console to MicroVM #2")
+send_command("net-init")
+wait_for("[vm2] guest_net: ready mac=02:ca:00:00:00:02 vmid=2")
+
+# 5. Bind dual-stack addresses on both vNICs via Varde Shell (F4)
+send_keys(["f4"], 0.2)
+send_command("vnic-bind 1 10.77.0.1 fd00::1")
+wait_for("[UI] vNIC bindings updated (default-deny)", 1)
+send_command("vnic-bind 2 10.77.0.2 fd00::2")
+wait_for("[UI] vNIC bindings updated (default-deny)", 2)
+
+# 6. Verify default-deny blocking and anti-spoof rejection before any allow rules exist
+send_keys(["f6"], 0.2)
+send_keys(["f7"], 0.2)
+send_command("net-tx-v4")
+wait_for("[vm1] guest_net: udp4 sent", 1)
+send_command("net-spoof")
+wait_for("[vm1] guest_net: spoof probes sent", 1)
+
+send_keys(["f8"], 0.2)
+send_command("net-rx")
+wait_for("[vm2] guest_net: rx total=0", 1)
+
+# 7. Add explicit firewall rules for IPv4 UDP (port 5001) and IPv6 ICMPv6 between VM 1 and VM 2
+send_keys(["f4"], 0.2)
+send_command("vnic-allow 1 out udp 10.77.0.2 5001")
+wait_for("[UI] vNIC rule added", 1)
+send_command("vnic-allow 2 in udp 10.77.0.2 5001")
+wait_for("[UI] vNIC rule added", 2)
+send_command("vnic-allow 1 out icmp fd00::2")
+wait_for("[UI] vNIC rule added", 3)
+send_command("vnic-allow 2 in icmp fd00::2")
+wait_for("[UI] vNIC rule added", 4)
+
+# 8. Send ARP, IPv4 UDP, and IPv6 ICMPv6 from VM 1 and verify reception on VM 2
+send_keys(["f6"], 0.2)
+send_keys(["f7"], 0.2)
+send_command("net-arp")
+wait_for("[vm1] guest_net: arp sent", 1)
+send_command("net-tx-v4")
+wait_for("[vm1] guest_net: udp4 sent", 2)
+send_command("net-tx-v6")
+wait_for("[vm1] guest_net: icmp6 sent", 1)
+
+send_keys(["f8"], 0.2)
+send_command("net-rx")
+wait_for("[vm2] guest_net: rx arp from 10.77.0.1", 1)
+wait_for("[vm2] guest_net: rx udp4 payload=CATENARY-UDP4-OK", 1)
+wait_for("[vm2] guest_net: rx icmp6 payload=CATENARY-ICMP6-OK", 1)
+
+# 9. Revoke VM 1 rules (vnic-clear 1) and verify subsequent traffic is blocked again
+send_keys(["f4"], 0.2)
+send_command("vnic-clear 1")
+wait_for("[UI] vNIC rules cleared (default-deny)", 1)
+
+send_keys(["f6"], 0.2)
+send_keys(["f7"], 0.2)
+send_command("net-tx-v4")
+wait_for("[vm1] guest_net: udp4 sent", 3)
+
+send_keys(["f8"], 0.2)
+send_command("net-rx")
+wait_for("[vm2] guest_net: rx total=0", 2)
+
+# 10. Stop and delete MicroVM 2 via Varde Shell and require disk + vNIC detach and VM deletion
+send_keys(["f4"], 0.2)
+send_command("vm-stop 2")
+wait_for("configd: per-VM disk detached", 1)
+wait_for("configd: vNIC detached", 1)
+send_command("vm-delete 2")
+wait_for("varde_shell: MicroVM deleted", 1)
+s.close()
+'
+}
+
 echo "[+] Waiting for all milestones (timeout ${TIMEOUT_SECS}s)..."
 ok=0
 required_patterns=()
@@ -376,6 +525,13 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
             if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "kernel_control: staged MicroVM launched via DIPC"; then
                 echo "[+] Injecting Phase 9 Multi-VM & Guest Console keystrokes via QEMU monitor..."
                 inject_ui_phase9_keys
+                ui_keys_injected=1
+            fi
+        fi
+        if [ "${SMOKE_PROFILE}" = "phase10" ] && [ "${ui_keys_injected}" -eq 0 ]; then
+            if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "kernel_control: staged MicroVM launched via DIPC"; then
+                echo "[+] Injecting Phase 10 Storage, Networking & Lifecycle keystrokes via QEMU monitor..."
+                inject_ui_phase10_keys
                 ui_keys_injected=1
             fi
         fi

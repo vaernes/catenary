@@ -39,6 +39,8 @@ pub const Thread = struct {
     dipc_eligible: bool = true,
     /// Function pointer for kernel worker threads spawned via spawn().
     entry_fn: ?*const fn () void = null,
+    /// Physical address of this thread's kernel stack page (0 if not PMM-owned).
+    kernel_stack_phys: u64 = 0,
 
     pub const State = enum {
         Empty,
@@ -517,6 +519,7 @@ pub fn spawnWithVmx(entry: ?*const fn () void, is_vmx: bool, vmid: u32, vcpu_idx
                 .vcpu_idx = vcpu_idx,
                 .pinned_cpu = pinned_cpu,
                 .entry_fn = entry,
+                .kernel_stack_phys = stack_p,
             };
             if (is_vmx) {
                 threads[i].name = fmtVmxName(vmid);
@@ -539,6 +542,41 @@ pub fn setThreadAffinity(tid: u32, cpu_id: ?u8) bool {
         }
     }
     return false;
+}
+
+pub fn hasActiveVmxThread(vmid: u32) bool {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
+    const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    for (0..max_slots) |i| {
+        if (threads[i].state != .Empty and threads[i].is_vmx and threads[i].vmid == vmid) {
+            if (threads[i].state == .Running or threads[i].state == .Ready or thread_active[i]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+pub fn reclaimVmxThreadForVm(vmid: u32) bool {
+    acquireScheduleLock();
+    defer releaseScheduleLock();
+    const max_slots = THREAD_TARGET_COUNT - smp.MAX_CPUS;
+    for (0..max_slots) |i| {
+        if (threads[i].state != .Empty and threads[i].is_vmx and threads[i].vmid == vmid) {
+            if (threads[i].state != .Waiting or thread_active[i]) return false;
+            const stack_phys = threads[i].kernel_stack_phys;
+            threads[i] = Thread{
+                .rsp = 0,
+                .id = 0,
+                .state = .Empty,
+            };
+            if (stack_phys != 0) {
+                pmm.freePage(stack_phys);
+            }
+        }
+    }
+    return true;
 }
 
 fn vmx_thread_bridge() void {
