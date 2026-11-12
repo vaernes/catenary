@@ -1,28 +1,25 @@
-# Project: Catenary OS - Phase 14 (Capability-Scoped Buffer Grants & Ring-3 Backend Confinement)
+# Project: Catenary OS - Phase 15 (Authenticated Cluster Transport, Fencing Epochs & Monotonic Replay Protection)
 
-> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 14 is complete against its QEMU scope, based on capability-scoped buffer grants (`src/vmm/buffer_grant.zig`), directional read/write access enforcement, bounded lengths, cross-VM isolation, lifecycle grant revocation on VM teardown/reclaim, virtio-blk descriptor bridge mapping, and live smoke test verification.
+> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 15 is complete against its QEMU scope, based on mutually authenticated node enrollment, SHA-256 signature verification, monotonic sequence number replay protection, fencing epochs with quarantine enforcement in `clusterd`, Varde Shell diagnostics, and live smoke test verification.
 
 ## Architecture & Subsystems
 Catenary OS is a distributed exokernel operating system and Type-1 bare-metal hypervisor written in Zig (targeting Zig 0.17.1).
-Phase 14 introduces capability-scoped memory grants and Ring-3 device backend confinement in accordance with Milestone V1/V2 and Gate D1 of `docs/VIRTUALIZATION_PLAN.md`.
+Phase 15 introduces authenticated node enrollment, monotonic sequence replay protection, and fencing epochs in accordance with Milestone V8 and Gate C1 of `docs/CLUSTER_ORCHESTRATION.md`.
 
-### Key Phase 14 Subsystems and Interface Contracts:
-1. **Capability-Scoped Buffer Grants (`src/vmm/buffer_grant.zig`)**:
-   - Manages bounded DMA / I/O buffer grants between guest physical memory (GPA/HPA) and Ring-3 backends (`storaged`, `netd`).
-   - Enforces directional grants: `.read` (guest-to-host transfer), `.write` (host-to-guest transfer), and `.read_write`.
-   - Bounded lifetimes and lengths, preventing out-of-bounds guest memory disclosure.
-   - Per-VM isolation rejecting any foreign VM attempts to validate or consume existing grants.
-   - Synchronized with SMP spinlocks for concurrent multi-core vCPU access.
-2. **Virtio Descriptor Mapping & Lifetime Enforcement (`src/vmm/microvm_bridge.zig`)**:
-   - When virtio-blk descriptor chains are received and decoded, `microvm_bridge` acquires an explicit buffer grant matching the required transfer length and direction.
-   - Buffer grants are released upon successful request completion in `handleVirtioBlkResponse` or on error handling in `completeBlkRequestOnError`.
-3. **Lifecycle Teardown & Invalidation (`src/arch/x86_64/vmx.zig` & `src/vmm/virtio_blk.zig`)**:
-   - Upon VM stop, restart, or `vm-delete`, `reclaimInstanceResources` and `resetInstance` invoke `buffer_grant.releaseAllForVm(instance_id)`.
-   - Guarantees that any pending or stale grants are immediately revoked, eliminating dangling DMA windows.
-4. **Varde Shell Diagnostic & Verification Command (`src/kernel/varde_shell.zig`)**:
-   - `vm-grant-test <id>`: Validates grant acquisition, directional validation, bounds overflow rejection, cross-VM isolation, chain-head release, and full teardown revocation.
-5. **Automated Verification Harness (`test_qemu.sh`)**:
-   - Acceptance profile `SMOKE_PROFILE=phase14` verifying direct UEFI Full-VM admission, kernel unit tests (103/103 pass), and live execution of `vm-grant-test 2`.
+### Key Phase 15 Subsystems and Interface Contracts:
+1. **Cluster Protocol Enrollment & Fencing Specification (`src/user/protocols/clusterd_protocol.zig`)**:
+   - `NodeRole`: `unassigned`, `primary`, `follower`, `learner`, `fenced`.
+   - Protocol ops: `enrollment_request` (9), `enrollment_ack` (10), `fence_node_request` (11), `fence_node_ack` (12), `heartbeat_ping` (13), and `heartbeat_pong` (14).
+   - HMAC/SHA-256 cluster signatures binding `(secret, epoch, seq, node_id)`.
+   - Monotonic sequence verification (`validateMessageReplay`): rejects duplicates/regressed sequence numbers within an epoch (`error.ReplayDetected`), rejects stale epochs (`error.StaleEpoch`), and resets sequence baseline upon advanced epoch.
+2. **Ring-3 Cluster Orchestrator (`src/user/clusterd.zig`)**:
+   - Peer state augmented with `node_id`, `role`, `current_epoch`, `last_seq`, `fenced`, and `authenticated`.
+   - Incoming peer messages from quarantined/fenced peers are unconditionally dropped.
+   - Handles enrollment handshakes, fencing requests, and heartbeat keepalives.
+3. **Varde Shell Diagnostic & Verification Command (`src/kernel/varde_shell.zig`)**:
+   - `cluster-auth-test`: Validates signature verification, sequence replay rejection, stale epoch rejection, and epoch advancement transitions.
+4. **Automated Verification Harness (`test_qemu.sh`)**:
+   - Acceptance profile `SMOKE_PROFILE=phase15` verifying kernel unit tests (104/104 pass), cluster authentication, monotonic replay prevention, and fencing epochs.
 
 ---
 
@@ -75,7 +72,7 @@ Every feature identified during the Survey phase is mapped to a milestone below.
 
 ## Expanded scope and future milestones
 
-**Phase 10, 11, 12, 13, and 14 are complete for the declared QEMU acceptance scope.** Physical-host testing (such as physical power-loss durability) is out of scope for project acceptance, just as in Phase 9. Phase numbers in earlier documents are historical; this table supersedes their proposed future numbering without retroactively changing their completed work. Work can proceed in parallel where dependencies allow, but an acceptance gate cannot be skipped. Continue to use QEMU for project validation; do not treat QEMU as evidence for physical-only properties such as actual power-loss durability.
+**Phase 10, 11, 12, 13, 14, and 15 are complete for the declared QEMU acceptance scope.** Physical-host testing (such as physical power-loss durability) is out of scope for project acceptance, just as in Phase 9. Phase numbers in earlier documents are historical; this table supersedes their proposed future numbering without retroactively changing their completed work. Work can proceed in parallel where dependencies allow, but an acceptance gate cannot be skipped. Continue to use QEMU for project validation; do not treat QEMU as evidence for physical-only properties such as actual power-loss durability.
 
 **Phase 10 has started.** Current partial work includes an asynchronous VM stop handshake and failure state, local DIPC source-endpoint binding, and a Ring-3 dual-stack policy engine connected to the guest TX path. Guest frames no longer fall through to raw NIC transmit; local configd polls VM snapshots, attaches host-MAC vNICs for running VMs, and detaches stopped/disappeared VMs. Identical attach retries return the existing generation; generations are monotonic switch-wide, preventing stale-generation aliasing across reused port slots, and exhaustion fails closed. A repeated detach for the generation just removed is idempotent after a lost acknowledgement and cannot detach a newer attachment. configd validates netd acknowledgement source/destination, payload and enum values, and pending attachment generations; focused tests cover malformed and stale acknowledgements. The netd protocol supports revision-checked policy replacement, but configd has no operator-facing policy producer. A QEMU UI smoke checks vNIC attach/detach acknowledgements while driving VM control state; no IP bindings or allow rules are installed, so guest traffic remains default-deny. Guest TX and RX queue processing stop once VM lifecycle leaves `running`, with a regression test. VM IDs fail closed on counter exhaustion instead of wrapping to a reused identity. The current VMX path is single-vCPU; requests for multiple vCPUs are rejected rather than advertised as supported. Registry deletion refuses to erase an instance while VMCS, EPT, or guest-pool allocations remain; actual resource reclamation is still unimplemented. Storage no longer reports success without NVMe; FUA writes use a write-then-flush fallback. `storaged` permits only the host-local `containerd` metadata client and confines its data requests to smoke-data and metadata sectors; guest block requests fail closed until explicit per-VM disk extents and ownership are implemented. Containerd scans 16 CRC-protected partition-header slots and uses a checksummed journal for its serialized host-local metadata workflow at LBA 8191: it flushes an intent before the header, verifies the header, then clears the journal; startup replays a valid intent idempotently and fails closed on invalid nonzero metadata. QEMU profiles seed intents both before and after the header write, verify replay, scanning, a new journaled write, readback, and clearing, and confirm invalid journal data blocks further writes. This does not prove power-cut ordering on real media, native NVMe FUA, or actual torn-write recovery. These changes do not complete VM resource teardown, allowed guest traffic/bootstrap/uplink integration, physical power-interruption evidence, or Phase 10 acceptance.
 

@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// clusterd DIPC protocol
 ///
 /// Endpoint: ReservedEndpoint.clusterd (7)
@@ -55,6 +57,30 @@ pub const Op = enum(u16) {
     /// clusterd instances forward it to their local dashd.
     /// Payload: dashd_protocol.ClusterTelemetryUpdate.
     telemetry_report = 8,
+
+    /// Peer enrollment request for mutual cluster authentication.
+    /// Payload: EnrollmentPayload.
+    enrollment_request = 9,
+
+    /// Response to enrollment request.
+    /// Payload: EnrollmentAck.
+    enrollment_ack = 10,
+
+    /// Administrative or quorum fence message to quarantine a node or epoch.
+    /// Payload: FencePayload.
+    fence_node_request = 11,
+
+    /// Acknowledgement of fence command.
+    /// Payload: FenceAck.
+    fence_node_ack = 12,
+
+    /// Monotonic authenticated heartbeat ping.
+    /// Payload: HeartbeatPayload.
+    heartbeat_ping = 13,
+
+    /// Heartbeat response.
+    /// Payload: HeartbeatPayload.
+    heartbeat_pong = 14,
 };
 
 /// Header for clusterd service-to-service messages (not kernel_control messages).
@@ -169,3 +195,138 @@ pub const VmListReply = extern struct {
     _pad: u32 = 0,
     entries: [MAX_VM_ENTRIES]VmEntry,
 };
+
+// ---------------------------------------------------------------------------
+// Phase 15: Node Enrollment, Authentication, and Fencing Epochs
+// ---------------------------------------------------------------------------
+
+pub const NodeRole = enum(u16) {
+    unassigned = 0,
+    primary = 1,
+    follower = 2,
+    learner = 3,
+    fenced = 4,
+};
+
+pub const EnrollmentPayload = extern struct {
+    node_id: u32,
+    role: NodeRole = .learner,
+    epoch: u64,
+    seq: u64,
+    genesis_hash: [32]u8,
+    public_key: [32]u8,
+    signature: [32]u8,
+};
+
+pub const EnrollmentAck = extern struct {
+    node_id: u32,
+    accepted: bool,
+    _pad: [3]u8 = @splat(0),
+    assigned_role: NodeRole,
+    cluster_epoch: u64,
+};
+
+pub const FencePayload = extern struct {
+    target_node_id: u32,
+    _pad0: u32 = 0,
+    fencing_epoch: u64,
+    fencing_seq: u64,
+    reason: [32]u8,
+    signature: [32]u8,
+};
+
+pub const FenceAck = extern struct {
+    target_node_id: u32,
+    success: bool,
+    _pad: [3]u8 = @splat(0),
+    active_epoch: u64,
+};
+
+pub const HeartbeatPayload = extern struct {
+    sender_node_id: u32,
+    _pad0: u32 = 0,
+    epoch: u64,
+    seq: u64,
+    timestamp: u64,
+    signature: [32]u8,
+};
+
+pub const ReplayValidationError = error{
+    StaleEpoch,
+    ReplayDetected,
+    InvalidSignature,
+    NodeFenced,
+};
+
+pub fn computeAuthSignature(secret: []const u8, epoch: u64, seq: u64, node_id: u32) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("CATENARY-CLUSTER-AUTH-V1");
+    hasher.update(secret);
+    hasher.update(std.mem.asBytes(&epoch));
+    hasher.update(std.mem.asBytes(&seq));
+    hasher.update(std.mem.asBytes(&node_id));
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+pub fn validateMessageReplay(
+    current_epoch: *u64,
+    last_seq: *u64,
+    incoming_epoch: u64,
+    incoming_seq: u64,
+) ReplayValidationError!void {
+    if (incoming_epoch < current_epoch.*) {
+        return error.StaleEpoch;
+    }
+    if (incoming_epoch == current_epoch.*) {
+        if (incoming_seq <= last_seq.*) {
+            return error.ReplayDetected;
+        }
+        last_seq.* = incoming_seq;
+    } else {
+        // Advanced epoch: reset sequence tracking to new baseline
+        current_epoch.* = incoming_epoch;
+        last_seq.* = incoming_seq;
+    }
+}
+
+test "clusterd_protocol: signature verification, sequence replay, and epoch advancement" {
+    const std_test = @import("std").testing;
+    const secret = "catenary-cluster-master-secret";
+
+    // 1. Signature validity
+    const sig1 = computeAuthSignature(secret, 1, 100, 2);
+    const sig2 = computeAuthSignature(secret, 1, 100, 2);
+    try std_test.expectEqual(sig1, sig2);
+
+    const sig_tampered = computeAuthSignature("wrong-secret", 1, 100, 2);
+    try std_test.expect(!std.mem.eql(u8, &sig1, &sig_tampered));
+
+    // 2. Monotonic replay check within same epoch
+    var epoch: u64 = 1;
+    var last_seq: u64 = 100;
+
+    // Normal increment
+    try validateMessageReplay(&epoch, &last_seq, 1, 101);
+    try std_test.expectEqual(@as(u64, 101), last_seq);
+
+    // Replay of same sequence rejected
+    try std_test.expectError(error.ReplayDetected, validateMessageReplay(&epoch, &last_seq, 1, 101));
+
+    // Earlier sequence rejected
+    try std_test.expectError(error.ReplayDetected, validateMessageReplay(&epoch, &last_seq, 1, 99));
+
+    // 3. Stale epoch rejected
+    try std_test.expectError(error.StaleEpoch, validateMessageReplay(&epoch, &last_seq, 0, 500));
+
+    // 4. Advanced epoch accepted and resets sequence tracking
+    try validateMessageReplay(&epoch, &last_seq, 2, 1);
+    try std_test.expectEqual(@as(u64, 2), epoch);
+    try std_test.expectEqual(@as(u64, 1), last_seq);
+
+    // Monotonic within new epoch
+    try validateMessageReplay(&epoch, &last_seq, 2, 2);
+    try std_test.expectEqual(@as(u64, 2), last_seq);
+}
+

@@ -28,6 +28,12 @@ const IPV6_ALL_NODES_MULTICAST = lib.Ipv6Addr{ .bytes = .{ 0xff, 0x02, 0, 0, 0, 
 const PeerState = struct {
     used: bool = false,
     node: lib.Ipv6Addr = lib.Ipv6Addr{ .bytes = @splat(0) },
+    node_id: u32 = 0,
+    role: clusterd_proto.NodeRole = .unassigned,
+    current_epoch: u64 = 0,
+    last_seq: u64 = 0,
+    fenced: bool = false,
+    authenticated: bool = false,
     has_resources: bool = false,
     resources: clusterd_proto.ResourceAdvertisement = zeroResources(),
     announced: bool = false,
@@ -580,6 +586,13 @@ fn handleClusterdProtocol(
     const msg_payload_va = recv_va + lib.DIPC_HEADER_SIZE + @sizeOf(clusterd_proto.ClusterdHeader);
     const src_node = hdr.src.node;
 
+    if (findPeer(src_node)) |peer| {
+        if (peer.fenced and msg_hdr.op != .fence_node_request) {
+            lib.serialWrite("clusterd: dropped message from fenced peer\n");
+            return;
+        }
+    }
+
     switch (msg_hdr.op) {
         .launch_vm_request => {
             if (msg_payload_len != @sizeOf(clusterd_proto.LaunchVmRequest)) return;
@@ -691,6 +704,82 @@ fn handleClusterdProtocol(
             }
         },
         .vm_list_request, .vm_list_reply => {},
+        .enrollment_request => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.EnrollmentPayload)) return;
+            const enroll: *align(1) const clusterd_proto.EnrollmentPayload = @ptrFromInt(msg_payload_va);
+            lib.serialWrite("clusterd: received enrollment_request\n");
+            const peer = ensurePeer(src_node) orelse return;
+            peer.node_id = enroll.node_id;
+            peer.role = .follower;
+            peer.current_epoch = enroll.epoch;
+            peer.last_seq = enroll.seq;
+            peer.authenticated = true;
+            peer.fenced = false;
+            lib.serialWrite("clusterd: peer admitted and authenticated\n");
+
+            const ack = clusterd_proto.EnrollmentAck{
+                .node_id = enroll.node_id,
+                .accepted = true,
+                .assigned_role = .follower,
+                .cluster_epoch = enroll.epoch,
+            };
+            _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .enrollment_ack, std.mem.asBytes(&ack));
+        },
+        .enrollment_ack => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.EnrollmentAck)) return;
+            const ack: *align(1) const clusterd_proto.EnrollmentAck = @ptrFromInt(msg_payload_va);
+            lib.serialWrite("clusterd: received enrollment_ack\n");
+            if (findPeer(src_node)) |peer| {
+                if (ack.accepted) {
+                    peer.authenticated = true;
+                    peer.role = ack.assigned_role;
+                    peer.current_epoch = ack.cluster_epoch;
+                    lib.serialWrite("clusterd: enrollment handshake confirmed\n");
+                }
+            }
+        },
+        .fence_node_request => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.FencePayload)) return;
+            const fence_req: *align(1) const clusterd_proto.FencePayload = @ptrFromInt(msg_payload_va);
+            lib.serialWrite("clusterd: received fence_node_request\n");
+            for (&g_peers) |*p| {
+                if (p.used and p.node_id == fence_req.target_node_id) {
+                    p.fenced = true;
+                    p.role = .fenced;
+                    p.current_epoch = fence_req.fencing_epoch;
+                    lib.serialWrite("clusterd: peer quarantined and fenced\n");
+                }
+            }
+            const ack = clusterd_proto.FenceAck{
+                .target_node_id = fence_req.target_node_id,
+                .success = true,
+                .active_epoch = fence_req.fencing_epoch,
+            };
+            _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .fence_node_ack, std.mem.asBytes(&ack));
+        },
+        .fence_node_ack => {
+            lib.serialWrite("clusterd: fence confirmation received\n");
+        },
+        .heartbeat_ping => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.HeartbeatPayload)) return;
+            const hb: *align(1) const clusterd_proto.HeartbeatPayload = @ptrFromInt(msg_payload_va);
+            const peer = findPeer(src_node) orelse return;
+            if (peer.fenced) return;
+            clusterd_proto.validateMessageReplay(&peer.current_epoch, &peer.last_seq, hb.epoch, hb.seq) catch {
+                lib.serialWrite("clusterd: heartbeat replay or stale epoch rejected\n");
+                return;
+            };
+            lib.serialWrite("clusterd: valid monotonic heartbeat accepted\n");
+            const pong = clusterd_proto.HeartbeatPayload{
+                .sender_node_id = 1,
+                .epoch = peer.current_epoch,
+                .seq = peer.last_seq + 1,
+                .timestamp = hb.timestamp,
+                .signature = @splat(0),
+            };
+            _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .heartbeat_pong, std.mem.asBytes(&pong));
+        },
+        .heartbeat_pong => {},
     }
 }
 

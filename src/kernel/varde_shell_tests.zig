@@ -203,4 +203,9 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("vm-grant-test 2");
     try testing.expectEqualStrings("varde_shell: executed 'vm-grant-test'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Buffer grant capability validated for VM 2") != null);
+
+    // 19. Phase 15 Cluster authentication, replay prevention & fencing validation
+    varde_shell.dispatch("cluster-auth-test");
+    try testing.expectEqualStrings("varde_shell: executed 'cluster-auth-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Cluster authentication, monotonic replay prevention & fencing epochs validated.") != null);
 }

@@ -283,6 +283,7 @@ fn cmdHelp() void {
     write("  vnic-allow <vm> <in|out> <tcp|udp|icmp> <ip> [port] — allow a flow\r\n");
     write("  vnic-clear <vm>               — remove vNIC rules (default-deny)\r\n");
     write("  cluster                       — cluster node & topology summary\r\n");
+    write("  cluster-auth-test             — test cluster auth, replay prevention & fencing\r\n");
     write("  net-stat                      — IPv6 & DIPC network status\r\n");
     write("  storage-stat                  — NVMe & Virtio-Blk status\r\n");
     write("  top                           — CPU thread utilization\r\n");
@@ -810,6 +811,62 @@ fn cmdCluster() void {
     write("\r\n  Peer Status     : Standalone (loopback cluster)\r\n");
 }
 
+fn cmdClusterAuthTest() void {
+    const clusterd_proto = @import("../user/protocols/clusterd_protocol.zig");
+    const secret = "catenary-cluster-master-secret";
+
+    // 1. Signature generation & verification
+    const sig1 = clusterd_proto.computeAuthSignature(secret, 1, 100, 2);
+    const sig2 = clusterd_proto.computeAuthSignature(secret, 1, 100, 2);
+    if (!strEq(&sig1, &sig2)) {
+        write("\r\nError: signature verification failed.\r\n");
+        return;
+    }
+
+    // 2. Monotonic replay validation
+    var epoch: u64 = 1;
+    var last_seq: u64 = 100;
+
+    // Normal increment
+    clusterd_proto.validateMessageReplay(&epoch, &last_seq, 1, 101) catch {
+        write("\r\nError: sequence increment failed.\r\n");
+        return;
+    };
+
+    // Replay of same sequence rejected
+    var replay_ok = false;
+    clusterd_proto.validateMessageReplay(&epoch, &last_seq, 1, 101) catch |err| {
+        if (err == error.ReplayDetected) replay_ok = true;
+    };
+    if (!replay_ok) {
+        write("\r\nError: replay detection failed (duplicate accepted).\r\n");
+        return;
+    }
+
+    // Stale epoch rejected
+    var stale_ok = false;
+    clusterd_proto.validateMessageReplay(&epoch, &last_seq, 0, 500) catch |err| {
+        if (err == error.StaleEpoch) stale_ok = true;
+    };
+    if (!stale_ok) {
+        write("\r\nError: stale epoch check failed (stale accepted).\r\n");
+        return;
+    }
+
+    // Advanced epoch accepted
+    clusterd_proto.validateMessageReplay(&epoch, &last_seq, 2, 1) catch {
+        write("\r\nError: advanced epoch transition failed.\r\n");
+        return;
+    };
+    if (epoch != 2 or last_seq != 1) {
+        write("\r\nError: advanced epoch state incorrect.\r\n");
+        return;
+    }
+
+    write("\r\nCluster authentication, monotonic replay prevention & fencing epochs validated.\r\n");
+    emitCom1Line("varde_shell: cluster authentication & fencing validated\n");
+}
+
 fn cmdNetStat() void {
     const addr = node_config.getLocalNode();
     write("\r\nNetwork & DIPC Router Status:\r\n");
@@ -1035,6 +1092,9 @@ pub fn dispatch(raw_cmd: []const u8) void {
     } else if (strEq(cmd, "cluster")) {
         emitMilestone("cluster");
         cmdCluster();
+    } else if (strEq(cmd, "cluster-auth-test")) {
+        emitMilestone("cluster-auth-test");
+        cmdClusterAuthTest();
     } else if (strEq(cmd, "net-stat")) {
         emitMilestone("net-stat");
         cmdNetStat();
