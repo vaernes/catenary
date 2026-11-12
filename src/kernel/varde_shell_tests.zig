@@ -198,4 +198,9 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("vm-nested-test 2");
     try testing.expectEqualStrings("varde_shell: executed 'vm-nested-test'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Nested VMX L0 capability validated for VM 2") != null);
+
+    // 18. Phase 14 Capability-scoped buffer grant validation
+    varde_shell.dispatch("vm-grant-test 2");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-grant-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Buffer grant capability validated for VM 2") != null);
 }

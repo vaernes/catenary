@@ -14,6 +14,7 @@ const pc_platform = @import("../../vmm/pc_platform.zig");
 const efi_vars = @import("../../vmm/efi_vars.zig");
 const vtpm = @import("../../vmm/vtpm.zig");
 const uefi_firmware = @import("../../vmm/uefi_firmware.zig");
+const buffer_grant = @import("../../vmm/buffer_grant.zig");
 const dipc = @import("../../ipc/dipc.zig");
 const microvm_bridge = @import("../../vmm/microvm_bridge.zig");
 const guest_image_blob = @import("guest_image_blob");
@@ -3972,6 +3973,7 @@ pub fn reclaimInstanceResources(instance: *microvm_registry.Instance) bool {
     virtio_blk.resetInstance(instance.instance_id);
     efi_vars.resetInstance(instance.instance_id);
     vtpm.resetInstance(instance.instance_id);
+    buffer_grant.releaseAllForVm(instance.instance_id);
     if (instance.instance_id < per_instance_launch_state.len) {
         per_instance_launch_state[instance.instance_id] = .{};
     }

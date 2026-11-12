@@ -124,6 +124,8 @@ pub fn dequeueForVm(microvm_id: identity.MicrovmId) ?Entry {
 }
 
 pub fn dropForVm(microvm_id: identity.MicrovmId) void {
+    const buffer_grant = @import("buffer_grant.zig");
+    buffer_grant.releaseAllForVm(microvm_id);
     while (dequeueForVm(microvm_id)) |entry| {
         dipc.freePageMessage(entry.page_phys);
     }
@@ -331,6 +333,7 @@ fn readDescriptor(hhdm: u64, vmid: u32, q: *const virtio_blk.QueueState, idx: u1
 const DescriptorChainInfo = struct {
     request: virtio_blk.RequestHeader,
     storaged_req_type: u32,
+    data_gpa: u64 = 0,
     data_hpa: u64,
     data_len: u32,
     status_addr: u64,
@@ -368,6 +371,7 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
     var info = DescriptorChainInfo{
         .request = req,
         .storaged_req_type = storaged_req_type,
+        .data_gpa = 0,
         .data_hpa = 0,
         .data_len = 0,
         .status_addr = 0,
@@ -386,6 +390,7 @@ fn decodeDescriptorChain(hhdm: u64, vmid: u32, q: *virtio_blk.QueueState, chain_
             return error.InvalidDescriptor;
         }
         info.data_len = d2.len;
+        info.data_gpa = d2.addr;
         info.data_hpa = validateContiguousGuestSpanHpa(vmid, d2.addr, d2.len) orelse return error.InvalidGpa;
 
         const d3 = readDescriptor(hhdm, vmid, q, d2.next) orelse return error.InvalidDescriptor;
@@ -465,6 +470,9 @@ fn pushUsedAndNotify(hhdm: u64, vmid: u32, inst: *virtio_blk.DeviceInstance, q: 
 }
 
 fn completeBlkRequestOnError(hhdm: u64, vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virtio_blk.QueueState, head_idx: u16, err: anyerror) void {
+    const buffer_grant = @import("buffer_grant.zig");
+    _ = buffer_grant.releaseGrantForChain(vmid, head_idx);
+
     if (!isDescriptorIndexValid(q, head_idx)) return;
     const status_byte: u8 = if (err == error.UnsupportedOperation)
         virtio_blk.VIRTIO_BLK_S_UNSUPP
@@ -484,6 +492,15 @@ fn processDescriptorChain(vmid: u32, inst: *virtio_blk.DeviceInstance, q: *virti
     _ = inst;
     const hhdm = bridge_hhdm_offset;
     const info = try decodeDescriptorChain(hhdm, vmid, q, chain_head);
+
+    if (info.data_len > 0) {
+        const buffer_grant = @import("buffer_grant.zig");
+        const dir: buffer_grant.GrantDirection = if (info.storaged_req_type == @backingInt(storaged_protocol.ReqType.read))
+            .write
+        else
+            .read;
+        _ = buffer_grant.acquireGrant(vmid, chain_head, info.data_gpa, info.data_hpa, info.data_len, dir) orelse return error.GrantFailed;
+    }
 
     // Allocate DIPC page for storaged
     const table = bridge_endpoint_table orelse return error.NoRoute;
@@ -557,6 +574,9 @@ pub fn broadcastTelemetry(hhdm: u64, table: *const endpoint_table.EndpointTable)
 pub fn handleVirtioBlkResponse(vmid: u32, head_idx: u16, io_status: u8) void {
     if (!microvm_registry.isRunning(vmid)) return;
     const hhdm = bridge_hhdm_offset;
+
+    const buffer_grant = @import("buffer_grant.zig");
+    _ = buffer_grant.releaseGrantForChain(vmid, head_idx);
 
     const inst = virtio_blk.getInstance(vmid) orelse return;
     const q = &inst.queues[0];

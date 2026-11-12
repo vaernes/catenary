@@ -275,6 +275,7 @@ fn cmdHelp() void {
     write("  vm-snapshot <id> [label]      — capture crash-consistent VM snapshot\r\n");
     write("  vm-restore <id> <generation>  — restore VM to committed snapshot generation\r\n");
     write("  vm-nested-test <id>           — test L0 nested VMX execution for L1 VM\r\n");
+    write("  vm-grant-test <id>            — test capability-scoped buffer grants\r\n");
     write("  vm-send <id> <cmd>            — send command line to VM serial console\r\n");
     write("  vm-kill <id> / vm-stop <id>   — stop MicroVM by ID\r\n");
     write("  vm-delete <id>                — delete MicroVM from registry\r\n");
@@ -650,6 +651,73 @@ fn cmdVmNestedTest(args: []const u8) void {
     emitCom1Line("varde_shell: nested VMX L0 state machine validated\n");
 }
 
+fn cmdVmGrantTest(args: []const u8) void {
+    const trimmed = trimSpaces(args);
+    const id = parseU32(trimmed) orelse 1;
+    const buffer_grant = @import("../vmm/buffer_grant.zig");
+
+    // Clear any previous grants for this VM
+    buffer_grant.releaseAllForVm(id);
+
+    // 1. Acquire read grant
+    const gid = buffer_grant.acquireGrant(id, 1, 0x1000, 0x4000_1000, 512, .read) orelse {
+        write("\r\nError: failed to acquire buffer grant.\r\n");
+        return;
+    };
+
+    // 2. Validate valid read
+    if (buffer_grant.validateGrant(gid, id, 512, .read) == null) {
+        write("\r\nError: valid read grant validation failed.\r\n");
+        return;
+    }
+
+    // 3. Reject wrong direction (.write)
+    if (buffer_grant.validateGrant(gid, id, 512, .write) != null) {
+        write("\r\nError: direction check failed (write allowed on read grant).\r\n");
+        return;
+    }
+
+    // 4. Reject length overrun (1024 > 512)
+    if (buffer_grant.validateGrant(gid, id, 1024, .read) != null) {
+        write("\r\nError: bounds check failed (length overrun allowed).\r\n");
+        return;
+    }
+
+    // 5. Reject cross-VM access
+    if (buffer_grant.validateGrant(gid, id + 1, 512, .read) != null) {
+        write("\r\nError: cross-VM isolation failed.\r\n");
+        return;
+    }
+
+    // 6. Chain head validation
+    if (buffer_grant.validateGrantForChain(id, 1, 512, .read) == null) {
+        write("\r\nError: chain head grant validation failed.\r\n");
+        return;
+    }
+
+    // 7. Release for chain
+    if (!buffer_grant.releaseGrantForChain(id, 1)) {
+        write("\r\nError: releaseGrantForChain failed.\r\n");
+        return;
+    }
+
+    // 8. Re-acquire and test releaseAllForVm
+    _ = buffer_grant.acquireGrant(id, 2, 0x2000, 0x4000_2000, 1024, .write) orelse {
+        write("\r\nError: secondary grant acquisition failed.\r\n");
+        return;
+    };
+    buffer_grant.releaseAllForVm(id);
+    if (buffer_grant.getActiveCountForVm(id) != 0) {
+        write("\r\nError: releaseAllForVm did not revoke all grants.\r\n");
+        return;
+    }
+
+    write("\r\nBuffer grant capability validated for VM ");
+    writeDec(id);
+    write(" (scoped bounds, direction checking, cross-VM rejection, lifecycle revocation).\r\n");
+    emitCom1Line("varde_shell: buffer grant capability validated\n");
+}
+
 fn cmdVmSend(args: []const u8) void {
     const trimmed = trimSpaces(args);
     if (trimmed.len == 0) {
@@ -940,6 +1008,10 @@ pub fn dispatch(raw_cmd: []const u8) void {
         emitMilestone("vm-nested-test");
         const args = if (cmd.len > 14) trimSpaces(cmd[14..]) else "";
         cmdVmNestedTest(args);
+    } else if (strEq(cmd, "vm-grant-test") or startsWith(cmd, "vm-grant-test ")) {
+        emitMilestone("vm-grant-test");
+        const args = if (cmd.len > 13) trimSpaces(cmd[13..]) else "";
+        cmdVmGrantTest(args);
     } else if (strEq(cmd, "vm-send") or startsWith(cmd, "vm-send ")) {
         emitMilestone("vm-send");
         const args = if (cmd.len > 7) trimSpaces(cmd[7..]) else "";

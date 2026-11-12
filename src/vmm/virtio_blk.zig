@@ -126,6 +126,8 @@ pub fn getInstance(vmid: u32) ?*DeviceInstance {
 }
 
 pub fn resetInstance(vmid: u32) void {
+    const buffer_grant = @import("buffer_grant.zig");
+    buffer_grant.releaseAllForVm(vmid);
     if (!initialized) return;
     for (&instances) |*inst| {
         if (inst.vmid == vmid) {
