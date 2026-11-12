@@ -65,8 +65,42 @@ var g_local_node_id: u32 = 1;
 var g_consensus: clusterd_proto.ConsensusState = .{
     .cluster_size = 3,
 };
+var g_rsm: clusterd_proto.ReplicatedStateMachine = .{};
+var g_lease: clusterd_proto.LeaseState = .{ .lease_duration_ticks = 1200 };
+var g_fences: clusterd_proto.FenceTable = .{};
+var g_audit: clusterd_proto.AuditLog = .{};
+const CLUSTER_MGMT_SECRET = "catenary-cluster-master-secret";
 var g_election_initiated: bool = false;
 var g_consensus_ticks: u32 = 0;
+
+fn sendStorageFence(
+    scratch_phys: u64,
+    scratch_va: u64,
+    token: u64,
+    epoch: u64,
+) void {
+    const local_node = g_local_node;
+    const header: *align(1) lib.PageHeader = @ptrFromInt(scratch_va);
+    header.* = .{
+        .magic = lib.WireMagic,
+        .version = lib.WireVersion,
+        .header_len = @intCast(lib.DIPC_HEADER_SIZE),
+        .payload_len = @sizeOf(lib.BlkRequest),
+        .auth_tag = 0,
+        .src = .{ .node = local_node, .endpoint = EP_CLUSTERD },
+        .dst = .{ .node = lib.Ipv6Addr.loopback(), .endpoint = @backingInt(lib.ReservedEndpoint.storaged) },
+    };
+    const req: *align(1) lib.BlkRequest = @ptrFromInt(scratch_va + lib.DIPC_HEADER_SIZE);
+    req.* = .{
+        .req_type = @backingInt(lib.BlkReqType.fence_storage),
+        .sector = epoch,
+        .vmid = 0,
+        .chain_head = 0,
+        .data_len = 0,
+        .data_hpa = 0,
+    };
+    _ = lib.syscall(SYS_SEND_PAGE, scratch_phys, 0, token);
+}
 
 fn zeroResources() clusterd_proto.ResourceAdvertisement {
     return .{
@@ -811,6 +845,7 @@ fn handleClusterdProtocol(
             lib.serialWrite("clusterd: received consensus_request_vote_reply\n");
             if (g_consensus.handleVoteReply(reply)) {
                 lib.serialWrite("clusterd: consensus quorum reached; elected leader\n");
+                g_lease.onQuorumAck();
                 // Immediately broadcast initial leader heartbeat to synchronize epoch
                 const hb = clusterd_proto.ConsensusHeartbeatPayload{
                     .term = g_consensus.current_term,
@@ -825,12 +860,40 @@ fn handleClusterdProtocol(
                         _ = sendClusterdMessage(scratch_phys, scratch_va, token, p.node, .consensus_heartbeat, std.mem.asBytes(&hb));
                     }
                 }
+                // Propose initial cluster epoch log entry & replicate to peers
+                if (g_rsm.proposeMutation(
+                    g_consensus.current_term,
+                    g_consensus.fencing_epoch,
+                    .config_set,
+                    .{ .caller_id = g_local_node_id, .client_seq = g_consensus.current_term, .body_hash = g_consensus.fencing_epoch },
+                    g_local_node_id,
+                    0,
+                    @splat(0),
+                )) |prop| {
+                    const entry = g_rsm.entries[prop.index - 1];
+                    const ae = clusterd_proto.AppendEntriesPayload{
+                        .term = g_consensus.current_term,
+                        .leader_node_id = g_local_node_id,
+                        .prev_log_index = prop.index - 1,
+                        .prev_log_term = if (prop.index > 1) g_rsm.entries[prop.index - 2].term else 0,
+                        .leader_commit = g_rsm.commit_index,
+                        .entry_count = 1,
+                        .entry = entry,
+                        .signature = @splat(0),
+                    };
+                    for (&g_peers) |*p| {
+                        if (p.used) {
+                            _ = sendClusterdMessage(scratch_phys, scratch_va, token, p.node, .append_entries, std.mem.asBytes(&ae));
+                        }
+                    }
+                } else |_| {}
             }
         },
         .consensus_heartbeat => {
             if (msg_payload_len != @sizeOf(clusterd_proto.ConsensusHeartbeatPayload)) return;
             const hb: *align(1) const clusterd_proto.ConsensusHeartbeatPayload = @ptrFromInt(msg_payload_va);
             if (g_consensus.handleHeartbeat(hb)) {
+                g_lease.onHeartbeatReceived();
                 lib.serialWrite("clusterd: follower accepted leader heartbeat\n");
                 const ack = clusterd_proto.ConsensusHeartbeatReplyPayload{
                     .term = g_consensus.current_term,
@@ -844,8 +907,51 @@ fn handleClusterdProtocol(
         },
         .consensus_heartbeat_reply => {
             if (msg_payload_len != @sizeOf(clusterd_proto.ConsensusHeartbeatReplyPayload)) return;
+            g_lease.onQuorumAck();
             lib.serialWrite("clusterd: leader heartbeat acknowledged by peer\n");
         },
+        .append_entries => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.AppendEntriesPayload)) return;
+            const ae: *align(1) const clusterd_proto.AppendEntriesPayload = @ptrFromInt(msg_payload_va);
+            g_lease.onHeartbeatReceived();
+            const ok = g_rsm.handleAppendEntries(&g_consensus, ae);
+            const reply = clusterd_proto.AppendEntriesReplyPayload{
+                .term = g_consensus.current_term,
+                .follower_node_id = g_local_node_id,
+                .success = ok,
+                .match_index = g_rsm.log_len,
+                .signature = @splat(0),
+            };
+            _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .append_entries_reply, std.mem.asBytes(&reply));
+        },
+        .append_entries_reply => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.AppendEntriesReplyPayload)) return;
+            const reply: *align(1) const clusterd_proto.AppendEntriesReplyPayload = @ptrFromInt(msg_payload_va);
+            g_lease.onQuorumAck();
+            if (g_rsm.handleAppendEntriesReply(&g_consensus, reply)) {
+                g_consensus.commit_index = g_rsm.commit_index;
+                lib.serialWrite("clusterd: replicated log entry committed by quorum\n");
+            }
+        },
+        .mgmt_request => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.MgmtRequest)) return;
+            const req: *align(1) const clusterd_proto.MgmtRequest = @ptrFromInt(msg_payload_va);
+            var plane = clusterd_proto.ManagementPlane{
+                .consensus = g_consensus,
+                .rsm = g_rsm,
+                .lease = g_lease,
+                .fences = g_fences,
+                .audit = g_audit,
+            };
+            const resp = plane.handleMgmtRequest(req, CLUSTER_MGMT_SECRET, g_consensus_ticks);
+            g_consensus = plane.consensus;
+            g_rsm = plane.rsm;
+            g_lease = plane.lease;
+            g_fences = plane.fences;
+            g_audit = plane.audit;
+            _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .mgmt_response, std.mem.asBytes(&resp));
+        },
+        .mgmt_response => {},
     }
 }
 
@@ -988,18 +1094,23 @@ pub export fn umain() noreturn {
                         _ = sendClusterdMessage(dipc_phys, DMA_BASE_VA, token, p.node, .consensus_request_vote, std.mem.asBytes(&req));
                     }
                 }
-            } else if (g_consensus.role == .leader and g_consensus_ticks % 60 == 0) {
-                const hb = clusterd_proto.ConsensusHeartbeatPayload{
-                    .term = g_consensus.current_term,
-                    .leader_node_id = g_local_node_id,
-                    .commit_index = g_consensus.commit_index,
-                    .fencing_epoch = g_consensus.fencing_epoch,
-                    .seq = g_consensus_ticks,
-                    .signature = @splat(0),
-                };
-                for (&g_peers) |*p| {
-                    if (p.used) {
-                        _ = sendClusterdMessage(dipc_phys, DMA_BASE_VA, token, p.node, .consensus_heartbeat, std.mem.asBytes(&hb));
+            } else if (g_consensus.role == .leader) {
+                if (g_lease.tickLeader(&g_consensus)) {
+                    sendStorageFence(dipc_phys, DMA_BASE_VA, token, g_consensus.fencing_epoch);
+                    lib.serialWrite("clusterd: leader lease expired; self-fenced and quarantined\n");
+                } else if (g_consensus_ticks % 60 == 0) {
+                    const hb = clusterd_proto.ConsensusHeartbeatPayload{
+                        .term = g_consensus.current_term,
+                        .leader_node_id = g_local_node_id,
+                        .commit_index = g_consensus.commit_index,
+                        .fencing_epoch = g_consensus.fencing_epoch,
+                        .seq = g_consensus_ticks,
+                        .signature = @splat(0),
+                    };
+                    for (&g_peers) |*p| {
+                        if (p.used) {
+                            _ = sendClusterdMessage(dipc_phys, DMA_BASE_VA, token, p.node, .consensus_heartbeat, std.mem.asBytes(&hb));
+                        }
                     }
                 }
             }

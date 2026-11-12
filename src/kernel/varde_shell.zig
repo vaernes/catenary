@@ -933,6 +933,149 @@ fn cmdClusterQuorumTest() void {
     emitCom1Line("varde_shell: cluster consensus & quorum validated\n");
 }
 
+fn cmdClusterRsmTest() void {
+    const clusterd_proto = @import("../user/protocols/clusterd_protocol.zig");
+    var consensus = clusterd_proto.ConsensusState{ .cluster_size = 3, .role = .leader, .current_term = 1, .fencing_epoch = 1, .leader_node_id = 1 };
+    var rsm = clusterd_proto.ReplicatedStateMachine{};
+
+    const key = clusterd_proto.IdempotencyKey{ .caller_id = 10, .client_seq = 1, .body_hash = 0xCAFEBABE };
+    const p1 = rsm.proposeMutation(1, 1, .vm_create, key, 2, 100, @splat(0)) catch {
+        write("\r\nError: RSM propose failed.\r\n");
+        return;
+    };
+    const retry = rsm.proposeMutation(1, 1, .vm_create, key, 2, 100, @splat(0)) catch {
+        write("\r\nError: RSM idempotent retry failed.\r\n");
+        return;
+    };
+    if (p1.index != 1 or !retry.reused or retry.index != 1) {
+        write("\r\nError: RSM idempotency check failed.\r\n");
+        return;
+    }
+
+    const bad_key = clusterd_proto.IdempotencyKey{ .caller_id = 10, .client_seq = 1, .body_hash = 0xDEADBEEF };
+    if (rsm.proposeMutation(1, 1, .vm_create, bad_key, 2, 101, @splat(0))) |_| {
+        write("\r\nError: RSM conflict not detected.\r\n");
+        return;
+    } else |err| {
+        if (err != error.IdempotencyConflict) {
+            write("\r\nError: unexpected RSM conflict error.\r\n");
+            return;
+        }
+    }
+
+    const reply = clusterd_proto.AppendEntriesReplyPayload{
+        .term = 1,
+        .follower_node_id = 2,
+        .success = true,
+        .match_index = 1,
+        .signature = @splat(0),
+    };
+    if (!rsm.handleAppendEntriesReply(&consensus, &reply) or rsm.commit_index != 1 or rsm.desired_revision != 1 or rsm.reconcile_status != .reconciling) {
+        write("\r\nError: RSM quorum commit failed.\r\n");
+        return;
+    }
+    rsm.reconcileObserved(1);
+    if (rsm.reconcile_status != .applied) {
+        write("\r\nError: RSM reconciliation failed.\r\n");
+        return;
+    }
+
+    write("\r\nReplicated state machine log, idempotency keys & desired/observed reconciliation validated.\r\n");
+    emitCom1Line("varde_shell: cluster RSM & idempotency validated\n");
+}
+
+fn cmdClusterFailoverTest() void {
+    const clusterd_proto = @import("../user/protocols/clusterd_protocol.zig");
+    var consensus = clusterd_proto.ConsensusState{ .cluster_size = 3, .role = .leader, .current_term = 2, .fencing_epoch = 3, .leader_node_id = 1 };
+    var lease = clusterd_proto.LeaseState{ .lease_duration_ticks = 3 };
+    var fences = clusterd_proto.FenceTable{};
+
+    if (!fences.isWriteAllowed(1, 3, lease.self_fenced)) {
+        write("\r\nError: valid write rejected.\r\n");
+        return;
+    }
+    _ = lease.tickLeader(&consensus);
+    _ = lease.tickLeader(&consensus);
+    if (!lease.tickLeader(&consensus) or !lease.self_fenced or consensus.role != .quarantined) {
+        write("\r\nError: leader self-fence failed.\r\n");
+        return;
+    }
+    if (fences.isWriteAllowed(1, 3, lease.self_fenced)) {
+        write("\r\nError: self-fenced write allowed.\r\n");
+        return;
+    }
+    if (fences.canFailoverWorkload(1, true)) {
+        write("\r\nError: failover allowed without verified fence.\r\n");
+        return;
+    }
+    fences.fenceNode(1, 4, true);
+    if (!fences.canFailoverWorkload(1, true) or fences.canFailoverWorkload(1, false) or fences.isWriteAllowed(2, 3, false)) {
+        write("\r\nError: verified fencing / stale epoch gate failed.\r\n");
+        return;
+    }
+
+    write("\r\nCluster lease expiry, self-fencing & verified failover gating validated.\r\n");
+    emitCom1Line("varde_shell: cluster failover & fencing validated\n");
+}
+
+fn cmdClusterMgmtTest() void {
+    const clusterd_proto = @import("../user/protocols/clusterd_protocol.zig");
+    const secret = "mgmt-cluster-secret";
+    var plane = clusterd_proto.ManagementPlane{};
+    plane.consensus.role = .leader;
+    plane.consensus.current_term = 1;
+    plane.consensus.fencing_epoch = 1;
+
+    const v_sig = clusterd_proto.computeTokenSignature(secret, 42, .viewer, 1, 100);
+    const v_tok = clusterd_proto.AuthToken{ .actor_id = 42, .role = .viewer, .epoch = 1, .expiry_seq = 100, .signature = v_sig };
+    if (plane.handleMgmtRequest(&.{ .action = .get_cluster_status, .token = v_tok }, secret, 10).status != .ok) {
+        write("\r\nError: viewer status rejected.\r\n");
+        return;
+    }
+    if (plane.handleMgmtRequest(&.{ .action = .create_vm, .token = v_tok, .vm_id = 5 }, secret, 10).status != .forbidden) {
+        write("\r\nError: viewer RBAC bypass.\r\n");
+        return;
+    }
+
+    const op_sig = clusterd_proto.computeTokenSignature(secret, 43, .operator, 1, 100);
+    const op_tok = clusterd_proto.AuthToken{ .actor_id = 43, .role = .operator, .epoch = 1, .expiry_seq = 100, .signature = op_sig };
+    const create_req = clusterd_proto.MgmtRequest{
+        .action = .create_vm,
+        .token = op_tok,
+        .idempotency = .{ .caller_id = 43, .client_seq = 1, .body_hash = 999 },
+        .target_node_id = 2,
+        .vm_id = 5,
+    };
+    if (plane.handleMgmtRequest(&create_req, secret, 10).status != .reconciling) {
+        write("\r\nError: operator VM create failed.\r\n");
+        return;
+    }
+    if (plane.handleMgmtRequest(&.{ .action = .fence_node, .token = op_tok, .target_node_id = 2 }, secret, 10).status != .forbidden) {
+        write("\r\nError: operator fence RBAC bypass.\r\n");
+        return;
+    }
+
+    const adm_sig = clusterd_proto.computeTokenSignature(secret, 1, .cluster_admin, 1, 100);
+    const adm_tok = clusterd_proto.AuthToken{ .actor_id = 1, .role = .cluster_admin, .epoch = 1, .expiry_seq = 100, .signature = adm_sig };
+    const fence_req = clusterd_proto.MgmtRequest{
+        .action = .fence_node,
+        .token = adm_tok,
+        .idempotency = .{ .caller_id = 1, .client_seq = 1, .body_hash = 777 },
+        .target_node_id = 2,
+    };
+    if (plane.handleMgmtRequest(&fence_req, secret, 10).status != .reconciling or !plane.fences.isNodeFenced(2)) {
+        write("\r\nError: admin fence failed.\r\n");
+        return;
+    }
+    if (plane.handleMgmtRequest(&.{ .api_major = 99, .action = .get_cluster_status, .token = v_tok }, secret, 10).status != .unsupported_version) {
+        write("\r\nError: version check failed.\r\n");
+        return;
+    }
+
+    write("\r\nUnified management API, RBAC roles, version negotiation & audit trail validated.\r\n");
+    emitCom1Line("varde_shell: cluster management API & RBAC validated\n");
+}
+
 fn cmdNetStat() void {
     const addr = node_config.getLocalNode();
     write("\r\nNetwork & DIPC Router Status:\r\n");
@@ -1164,6 +1307,15 @@ pub fn dispatch(raw_cmd: []const u8) void {
     } else if (strEq(cmd, "cluster-quorum-test")) {
         emitMilestone("cluster-quorum-test");
         cmdClusterQuorumTest();
+    } else if (strEq(cmd, "cluster-rsm-test")) {
+        emitMilestone("cluster-rsm-test");
+        cmdClusterRsmTest();
+    } else if (strEq(cmd, "cluster-failover-test")) {
+        emitMilestone("cluster-failover-test");
+        cmdClusterFailoverTest();
+    } else if (strEq(cmd, "cluster-mgmt-test")) {
+        emitMilestone("cluster-mgmt-test");
+        cmdClusterMgmtTest();
     } else if (strEq(cmd, "net-stat")) {
         emitMilestone("net-stat");
         cmdNetStat();

@@ -101,21 +101,26 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
     b_ok=0
     telem_milestone="dashd: cluster telemetry received from remote node"
     consensus_milestone="clusterd: consensus quorum reached; elected leader"
+    rsm_milestone="clusterd: replicated log entry committed by quorum"
     if grep -Fq "$milestone1" qemu_serial_A.log 2>/dev/null && grep -Fq "$milestone2" qemu_serial_B.log 2>/dev/null; then
         if grep -Fq "$telem_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$telem_milestone" qemu_serial_B.log 2>/dev/null; then
             if grep -Fq "$consensus_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$consensus_milestone" qemu_serial_B.log 2>/dev/null; then
-                ok=1
-                echo "[+] PASS: Node A requested remote launch, Node B launched staged MicroVM, cross-node telemetry & cluster consensus leader election verified via DIPC."
-                break
+                if grep -Fq "$rsm_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$rsm_milestone" qemu_serial_B.log 2>/dev/null; then
+                    ok=1
+                    echo "[+] PASS: Node A requested remote launch, Node B launched staged MicroVM, cross-node telemetry, consensus leader election & replicated log quorum commit verified via DIPC."
+                    break
+                fi
             fi
         fi
     fi
     if grep -Fq "$milestone1" qemu_serial_B.log 2>/dev/null && grep -Fq "$milestone2" qemu_serial_A.log 2>/dev/null; then
         if grep -Fq "$telem_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$telem_milestone" qemu_serial_B.log 2>/dev/null; then
             if grep -Fq "$consensus_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$consensus_milestone" qemu_serial_B.log 2>/dev/null; then
-                ok=1
-                echo "[+] PASS: Node B requested remote launch, Node A launched staged MicroVM, cross-node telemetry & cluster consensus leader election verified via DIPC."
-                break
+                if grep -Fq "$rsm_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$rsm_milestone" qemu_serial_B.log 2>/dev/null; then
+                    ok=1
+                    echo "[+] PASS: Node B requested remote launch, Node A launched staged MicroVM, cross-node telemetry, consensus leader election & replicated log quorum commit verified via DIPC."
+                    break
+                fi
             fi
         fi
     fi

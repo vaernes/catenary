@@ -213,4 +213,19 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("cluster-quorum-test");
     try testing.expectEqualStrings("varde_shell: executed 'cluster-quorum-test'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Cluster consensus, term election, quorum validation & leader step-down validated.") != null);
+
+    // 21. Phase 17A Replicated state machine log & idempotency validation
+    varde_shell.dispatch("cluster-rsm-test");
+    try testing.expectEqualStrings("varde_shell: executed 'cluster-rsm-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Replicated state machine log, idempotency keys & desired/observed reconciliation validated.") != null);
+
+    // 22. Phase 17B Lease expiry, self-fencing & failover validation
+    varde_shell.dispatch("cluster-failover-test");
+    try testing.expectEqualStrings("varde_shell: executed 'cluster-failover-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Cluster lease expiry, self-fencing & verified failover gating validated.") != null);
+
+    // 23. Phase 17C Unified management API, RBAC & audit trail validation
+    varde_shell.dispatch("cluster-mgmt-test");
+    try testing.expectEqualStrings("varde_shell: executed 'cluster-mgmt-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Unified management API, RBAC roles, version negotiation & audit trail validated.") != null);
 }

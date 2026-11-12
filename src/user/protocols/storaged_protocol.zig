@@ -34,6 +34,8 @@ pub const ReqType = enum(u32) {
     snapshot_vm_disk = 34,
     /// Host control: restore a per-VM disk extent from a snapshot generation (sector = generation).
     restore_vm_disk = 35,
+    /// Host/cluster control: fence storage writes for a VM (vmid > 0) or entire node (vmid == 0) at epoch (sector).
+    fence_storage = 36,
 };
 
 /// Block I/O request.  The physical address of the data buffer (for reads:

@@ -97,6 +97,22 @@ pub const Op = enum(u16) {
     /// Follower consensus heartbeat acknowledgement.
     /// Payload: ConsensusHeartbeatReplyPayload.
     consensus_heartbeat_reply = 18,
+
+    /// Leader replicated log entry append request.
+    /// Payload: AppendEntriesPayload.
+    append_entries = 19,
+
+    /// Follower replicated log entry append reply.
+    /// Payload: AppendEntriesReplyPayload.
+    append_entries_reply = 20,
+
+    /// Versioned RBAC management API request.
+    /// Payload: MgmtRequest.
+    mgmt_request = 21,
+
+    /// Versioned RBAC management API response.
+    /// Payload: MgmtResponse.
+    mgmt_response = 22,
 };
 
 /// Header for clusterd service-to-service messages (not kernel_control messages).
@@ -440,6 +456,654 @@ pub const ConsensusState = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Phase 17A: Replicated State Machine Log & Idempotent Cluster Mutations
+// ---------------------------------------------------------------------------
+
+pub const MutationOp = enum(u16) {
+    vm_create = 1,
+    vm_stop = 2,
+    vm_migrate = 3,
+    config_set = 4,
+    fence_node = 5,
+    role_grant = 6,
+};
+
+pub const IdempotencyKey = extern struct {
+    caller_id: u32 = 0,
+    _pad0: u32 = 0,
+    client_seq: u64 = 0,
+    body_hash: u64 = 0,
+};
+
+pub const LogEntry = extern struct {
+    index: u32 = 0,
+    op: MutationOp = .vm_create,
+    _pad0: u16 = 0,
+    term: u64 = 0,
+    fencing_epoch: u64 = 0,
+    idempotency: IdempotencyKey = .{},
+    target_node_id: u32 = 0,
+    vm_id: u32 = 0,
+    payload: [32]u8 = @splat(0),
+};
+
+pub const AppendEntriesPayload = extern struct {
+    term: u64,
+    leader_node_id: u32,
+    prev_log_index: u32,
+    prev_log_term: u64,
+    leader_commit: u32,
+    entry_count: u32,
+    entry: LogEntry,
+    signature: [32]u8,
+};
+
+pub const AppendEntriesReplyPayload = extern struct {
+    term: u64,
+    follower_node_id: u32,
+    success: bool,
+    _pad: [3]u8 = @splat(0),
+    match_index: u32,
+    signature: [32]u8,
+};
+
+pub const ReconcileStatus = enum(u8) {
+    accepted = 0,
+    committed = 1,
+    reconciling = 2,
+    applied = 3,
+    blocked = 4,
+    failed = 5,
+};
+
+pub const MAX_LOG_ENTRIES: usize = 32;
+pub const MAX_IDEMPOTENCY_CACHE: usize = 32;
+
+pub const IdempotencyRecord = struct {
+    used: bool = false,
+    key: IdempotencyKey = .{},
+    log_index: u32 = 0,
+    status: ReconcileStatus = .accepted,
+};
+
+pub const ReplicatedStateMachine = struct {
+    entries: [MAX_LOG_ENTRIES]LogEntry = @splat(.{}),
+    log_len: u32 = 0,
+    commit_index: u32 = 0,
+    last_applied: u32 = 0,
+    desired_revision: u64 = 0,
+    observed_revision: u64 = 0,
+    reconcile_status: ReconcileStatus = .applied,
+    idempotency_cache: [MAX_IDEMPOTENCY_CACHE]IdempotencyRecord = @splat(.{}),
+    cache_cursor: usize = 0,
+    peer_match_index: [16]u32 = @splat(0),
+
+    pub const ProposeError = error{
+        LogFull,
+        IdempotencyConflict,
+    };
+
+    pub const ProposeResult = struct {
+        index: u32,
+        reused: bool,
+        status: ReconcileStatus,
+    };
+
+    pub fn lastLogIndex(self: *const ReplicatedStateMachine) u32 {
+        return self.log_len;
+    }
+
+    pub fn lastLogTerm(self: *const ReplicatedStateMachine) u64 {
+        if (self.log_len == 0) return 0;
+        return self.entries[self.log_len - 1].term;
+    }
+
+    pub fn lookupIdempotency(self: *const ReplicatedStateMachine, key: IdempotencyKey) ?*const IdempotencyRecord {
+        if (key.caller_id == 0 and key.client_seq == 0) return null;
+        for (&self.idempotency_cache) |*rec| {
+            if (rec.used and rec.key.caller_id == key.caller_id and rec.key.client_seq == key.client_seq) {
+                return rec;
+            }
+        }
+        return null;
+    }
+
+    fn recordIdempotency(self: *ReplicatedStateMachine, key: IdempotencyKey, log_index: u32, status: ReconcileStatus) void {
+        if (key.caller_id == 0 and key.client_seq == 0) return;
+        for (&self.idempotency_cache) |*rec| {
+            if (rec.used and rec.key.caller_id == key.caller_id and rec.key.client_seq == key.client_seq) {
+                rec.log_index = log_index;
+                rec.status = status;
+                return;
+            }
+        }
+        self.idempotency_cache[self.cache_cursor] = .{
+            .used = true,
+            .key = key,
+            .log_index = log_index,
+            .status = status,
+        };
+        self.cache_cursor = (self.cache_cursor + 1) % MAX_IDEMPOTENCY_CACHE;
+    }
+
+    pub fn proposeMutation(
+        self: *ReplicatedStateMachine,
+        term: u64,
+        fencing_epoch: u64,
+        op: MutationOp,
+        idempotency: IdempotencyKey,
+        target_node_id: u32,
+        vm_id: u32,
+        payload: [32]u8,
+    ) ProposeError!ProposeResult {
+        if (self.lookupIdempotency(idempotency)) |existing| {
+            if (existing.key.body_hash != idempotency.body_hash) {
+                return error.IdempotencyConflict;
+            }
+            return .{
+                .index = existing.log_index,
+                .reused = true,
+                .status = existing.status,
+            };
+        }
+        if (self.log_len >= MAX_LOG_ENTRIES) return error.LogFull;
+
+        const next_idx = self.log_len + 1;
+        self.entries[self.log_len] = .{
+            .index = next_idx,
+            .op = op,
+            .term = term,
+            .fencing_epoch = fencing_epoch,
+            .idempotency = idempotency,
+            .target_node_id = target_node_id,
+            .vm_id = vm_id,
+            .payload = payload,
+        };
+        self.log_len = next_idx;
+        self.reconcile_status = .accepted;
+        self.recordIdempotency(idempotency, next_idx, .accepted);
+        return .{
+            .index = next_idx,
+            .reused = false,
+            .status = .accepted,
+        };
+    }
+
+    pub fn handleAppendEntries(
+        self: *ReplicatedStateMachine,
+        consensus: *ConsensusState,
+        req: *align(1) const AppendEntriesPayload,
+    ) bool {
+        if (req.term < consensus.current_term) return false;
+        if (req.term > consensus.current_term or consensus.role == .candidate) {
+            consensus.current_term = req.term;
+            consensus.role = .follower;
+            consensus.voted_for = null;
+            consensus.votes_granted = 0;
+        }
+        consensus.leader_node_id = req.leader_node_id;
+        consensus.timer_ticks = 0;
+
+        if (req.prev_log_index > self.log_len) return false;
+        if (req.prev_log_index > 0 and self.entries[req.prev_log_index - 1].term != req.prev_log_term) {
+            return false;
+        }
+
+        if (req.entry_count > 0) {
+            const idx = req.entry.index;
+            if (idx == 0 or idx > MAX_LOG_ENTRIES) return false;
+            self.entries[idx - 1] = req.entry;
+            if (idx > self.log_len) {
+                self.log_len = idx;
+            }
+            self.recordIdempotency(req.entry.idempotency, idx, .accepted);
+        }
+
+        if (req.leader_commit > self.commit_index) {
+            const target = @min(req.leader_commit, self.log_len);
+            self.commitUpTo(target);
+        }
+        return true;
+    }
+
+    pub fn handleAppendEntriesReply(
+        self: *ReplicatedStateMachine,
+        consensus: *ConsensusState,
+        reply: *align(1) const AppendEntriesReplyPayload,
+    ) bool {
+        if (reply.term > consensus.current_term) {
+            consensus.current_term = reply.term;
+            consensus.role = .follower;
+            consensus.voted_for = null;
+            consensus.votes_granted = 0;
+            return false;
+        }
+        if (consensus.role != .leader or reply.term != consensus.current_term or !reply.success) {
+            return false;
+        }
+
+        const slot = reply.follower_node_id % 16;
+        if (reply.match_index > self.peer_match_index[slot]) {
+            self.peer_match_index[slot] = reply.match_index;
+        }
+
+        // Advance commit_index if quorum of nodes (leader + peers) have replicated up to n
+        var n = self.log_len;
+        while (n > self.commit_index) : (n -= 1) {
+            if (self.entries[n - 1].term != consensus.current_term) continue;
+            var acked: u32 = 1; // leader itself
+            for (self.peer_match_index) |m| {
+                if (m >= n) acked += 1;
+            }
+            if (acked >= consensus.quorum()) {
+                self.commitUpTo(n);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn commitUpTo(self: *ReplicatedStateMachine, target: u32) void {
+        const clamped = @min(target, self.log_len);
+        if (clamped <= self.commit_index) return;
+        self.commit_index = clamped;
+        while (self.last_applied < self.commit_index) {
+            self.last_applied += 1;
+            self.desired_revision += 1;
+            const e = self.entries[self.last_applied - 1];
+            self.recordIdempotency(e.idempotency, e.index, .committed);
+        }
+        self.reconcile_status = if (self.observed_revision >= self.desired_revision) .applied else .reconciling;
+    }
+
+    pub fn reconcileObserved(self: *ReplicatedStateMachine, observed_rev: u64) void {
+        if (observed_rev > self.observed_revision) {
+            self.observed_revision = observed_rev;
+        }
+        if (self.observed_revision >= self.desired_revision) {
+            self.reconcile_status = .applied;
+        } else {
+            self.reconcile_status = .reconciling;
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Phase 17B: Node Failover, Lease Expiry & Storage Fencing
+// ---------------------------------------------------------------------------
+
+pub const FenceRecord = struct {
+    used: bool = false,
+    node_id: u32 = 0,
+    fencing_epoch: u64 = 0,
+    verified: bool = false,
+};
+
+pub const FenceTable = struct {
+    records: [16]FenceRecord = @splat(.{}),
+    active_fencing_epoch: u64 = 0,
+
+    pub fn fenceNode(self: *FenceTable, node_id: u32, epoch: u64, verified: bool) void {
+        if (epoch > self.active_fencing_epoch) {
+            self.active_fencing_epoch = epoch;
+        }
+        for (&self.records) |*r| {
+            if (r.used and r.node_id == node_id) {
+                if (epoch >= r.fencing_epoch) {
+                    r.fencing_epoch = epoch;
+                    r.verified = verified;
+                }
+                return;
+            }
+        }
+        for (&self.records) |*r| {
+            if (!r.used) {
+                r.* = .{
+                    .used = true,
+                    .node_id = node_id,
+                    .fencing_epoch = epoch,
+                    .verified = verified,
+                };
+                return;
+            }
+        }
+    }
+
+    pub fn isNodeFenced(self: *const FenceTable, node_id: u32) bool {
+        for (&self.records) |*r| {
+            if (r.used and r.node_id == node_id) return true;
+        }
+        return false;
+    }
+
+    pub fn isWriteAllowed(self: *const FenceTable, node_id: u32, req_epoch: u64, self_fenced: bool) bool {
+        if (self_fenced) return false;
+        if (req_epoch < self.active_fencing_epoch) return false;
+        if (self.isNodeFenced(node_id)) return false;
+        return true;
+    }
+
+    pub fn canFailoverWorkload(self: *const FenceTable, failed_node_id: u32, has_quorum: bool) bool {
+        if (!has_quorum) return false;
+        for (&self.records) |*r| {
+            if (r.used and r.node_id == failed_node_id and r.verified) return true;
+        }
+        return false;
+    }
+};
+
+pub const LeaseState = struct {
+    lease_duration_ticks: u32 = 180,
+    ticks_since_heartbeat: u32 = 0,
+    ticks_without_quorum_ack: u32 = 0,
+    self_fenced: bool = false,
+
+    pub fn onHeartbeatReceived(self: *LeaseState) void {
+        self.ticks_since_heartbeat = 0;
+    }
+
+    pub fn onQuorumAck(self: *LeaseState) void {
+        self.ticks_without_quorum_ack = 0;
+    }
+
+    /// Returns true when follower lease expires and failover election should trigger.
+    pub fn tickFollower(self: *LeaseState) bool {
+        self.ticks_since_heartbeat +|= 1;
+        return self.ticks_since_heartbeat >= self.lease_duration_ticks;
+    }
+
+    /// Returns true if leader lost quorum contact past lease_duration_ticks and self-fenced.
+    pub fn tickLeader(self: *LeaseState, consensus: *ConsensusState) bool {
+        self.ticks_without_quorum_ack +|= 1;
+        if (self.ticks_without_quorum_ack >= self.lease_duration_ticks) {
+            self.self_fenced = true;
+            consensus.role = .quarantined;
+            return true;
+        }
+        return false;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Phase 17C: Unified Versioned Management API, RBAC & Audit Trail
+// ---------------------------------------------------------------------------
+
+pub const MGMT_API_MAJOR: u16 = 1;
+pub const MGMT_API_MINOR: u16 = 0;
+
+pub const MgmtRole = enum(u8) {
+    viewer = 1,
+    operator = 2,
+    cluster_admin = 3,
+};
+
+pub const MgmtAction = enum(u16) {
+    get_cluster_status = 1,
+    list_vms = 2,
+    create_vm = 3,
+    stop_vm = 4,
+    fence_node = 5,
+    rotate_key = 6,
+    set_policy = 7,
+};
+
+pub const MgmtStatus = enum(u8) {
+    ok = 0,
+    unauthorized = 1,
+    forbidden = 2,
+    unsupported_version = 3,
+    no_quorum = 4,
+    idempotency_conflict = 5,
+    fenced = 6,
+    reconciling = 7,
+};
+
+pub const AuthToken = extern struct {
+    actor_id: u32,
+    role: MgmtRole,
+    _pad: [3]u8 = @splat(0),
+    epoch: u64,
+    expiry_seq: u64,
+    signature: [32]u8,
+};
+
+pub const MgmtRequest = extern struct {
+    api_major: u16 = MGMT_API_MAJOR,
+    api_minor: u16 = MGMT_API_MINOR,
+    action: MgmtAction,
+    _pad0: u16 = 0,
+    token: AuthToken,
+    idempotency: IdempotencyKey = .{},
+    target_node_id: u32 = 0,
+    vm_id: u32 = 0,
+    payload: [32]u8 = @splat(0),
+};
+
+pub const MgmtResponse = extern struct {
+    status: MgmtStatus,
+    _pad0: [3]u8 = @splat(0),
+    target_node_id: u32,
+    revision: u64,
+    commit_index: u32,
+    _pad1: u32 = 0,
+    audit_seq: u64,
+};
+
+pub const MAX_AUDIT_ENTRIES: usize = 32;
+
+pub const AuditEntry = struct {
+    used: bool = false,
+    seq: u64 = 0,
+    actor_id: u32 = 0,
+    role: MgmtRole = .viewer,
+    action: MgmtAction = .get_cluster_status,
+    target_node_id: u32 = 0,
+    status: MgmtStatus = .ok,
+    revision: u64 = 0,
+};
+
+pub const AuditLog = struct {
+    entries: [MAX_AUDIT_ENTRIES]AuditEntry = @splat(.{}),
+    next_seq: u64 = 1,
+    cursor: usize = 0,
+
+    pub fn record(
+        self: *AuditLog,
+        actor_id: u32,
+        role: MgmtRole,
+        action: MgmtAction,
+        target_node_id: u32,
+        status: MgmtStatus,
+        revision: u64,
+    ) u64 {
+        const seq = self.next_seq;
+        self.next_seq += 1;
+        self.entries[self.cursor] = .{
+            .used = true,
+            .seq = seq,
+            .actor_id = actor_id,
+            .role = role,
+            .action = action,
+            .target_node_id = target_node_id,
+            .status = status,
+            .revision = revision,
+        };
+        self.cursor = (self.cursor + 1) % MAX_AUDIT_ENTRIES;
+        return seq;
+    }
+};
+
+pub fn computeTokenSignature(secret: []const u8, actor_id: u32, role: MgmtRole, epoch: u64, expiry_seq: u64) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("CATENARY-MGMT-TOKEN-V1");
+    hasher.update(secret);
+    hasher.update(std.mem.asBytes(&actor_id));
+    const role_byte = [_]u8{@intFromEnum(role)};
+    hasher.update(&role_byte);
+    hasher.update(std.mem.asBytes(&epoch));
+    hasher.update(std.mem.asBytes(&expiry_seq));
+    var out: [32]u8 = undefined;
+    hasher.final(&out);
+    return out;
+}
+
+pub fn isRolePermitted(role: MgmtRole, action: MgmtAction) bool {
+    return switch (action) {
+        .get_cluster_status, .list_vms => true,
+        .create_vm, .stop_vm => role == .operator or role == .cluster_admin,
+        .fence_node, .rotate_key, .set_policy => role == .cluster_admin,
+    };
+}
+
+pub fn authorizeMgmtRequest(
+    req: *align(1) const MgmtRequest,
+    secret: []const u8,
+    current_epoch: u64,
+    current_seq: u64,
+) MgmtStatus {
+    if (req.api_major != MGMT_API_MAJOR or req.api_minor > MGMT_API_MINOR) {
+        return .unsupported_version;
+    }
+    if (req.token.epoch < current_epoch or req.token.expiry_seq < current_seq) {
+        return .unauthorized;
+    }
+    const expected_sig = computeTokenSignature(
+        secret,
+        req.token.actor_id,
+        req.token.role,
+        req.token.epoch,
+        req.token.expiry_seq,
+    );
+    if (!std.mem.eql(u8, &req.token.signature, &expected_sig)) {
+        return .unauthorized;
+    }
+    if (!isRolePermitted(req.token.role, req.action)) {
+        return .forbidden;
+    }
+    return .ok;
+}
+
+pub const ManagementPlane = struct {
+    consensus: ConsensusState = .{},
+    rsm: ReplicatedStateMachine = .{},
+    lease: LeaseState = .{},
+    fences: FenceTable = .{},
+    audit: AuditLog = .{},
+
+    pub fn handleMgmtRequest(
+        self: *ManagementPlane,
+        req: *align(1) const MgmtRequest,
+        secret: []const u8,
+        current_seq: u64,
+    ) MgmtResponse {
+        const auth_status = authorizeMgmtRequest(req, secret, self.consensus.fencing_epoch, current_seq);
+        if (auth_status != .ok) {
+            const aseq = self.audit.record(
+                req.token.actor_id,
+                req.token.role,
+                req.action,
+                req.target_node_id,
+                auth_status,
+                self.rsm.desired_revision,
+            );
+            return .{
+                .status = auth_status,
+                .target_node_id = req.target_node_id,
+                .revision = self.rsm.desired_revision,
+                .commit_index = self.rsm.commit_index,
+                .audit_seq = aseq,
+            };
+        }
+
+        // Read-only queries succeed even without leader write authority
+        if (req.action == .get_cluster_status or req.action == .list_vms) {
+            const aseq = self.audit.record(
+                req.token.actor_id,
+                req.token.role,
+                req.action,
+                req.target_node_id,
+                .ok,
+                self.rsm.desired_revision,
+            );
+            return .{
+                .status = .ok,
+                .target_node_id = req.target_node_id,
+                .revision = self.rsm.desired_revision,
+                .commit_index = self.rsm.commit_index,
+                .audit_seq = aseq,
+            };
+        }
+
+        if (self.lease.self_fenced or self.consensus.role == .quarantined) {
+            const aseq = self.audit.record(req.token.actor_id, req.token.role, req.action, req.target_node_id, .fenced, self.rsm.desired_revision);
+            return .{
+                .status = .fenced,
+                .target_node_id = req.target_node_id,
+                .revision = self.rsm.desired_revision,
+                .commit_index = self.rsm.commit_index,
+                .audit_seq = aseq,
+            };
+        }
+
+        if (self.consensus.role != .leader) {
+            const aseq = self.audit.record(req.token.actor_id, req.token.role, req.action, req.target_node_id, .no_quorum, self.rsm.desired_revision);
+            return .{
+                .status = .no_quorum,
+                .target_node_id = req.target_node_id,
+                .revision = self.rsm.desired_revision,
+                .commit_index = self.rsm.commit_index,
+                .audit_seq = aseq,
+            };
+        }
+
+        const mut_op: MutationOp = switch (req.action) {
+            .create_vm => .vm_create,
+            .stop_vm => .vm_stop,
+            .fence_node => .fence_node,
+            .set_policy, .rotate_key => .config_set,
+            else => .config_set,
+        };
+
+        const prop = self.rsm.proposeMutation(
+            self.consensus.current_term,
+            self.consensus.fencing_epoch,
+            mut_op,
+            req.idempotency,
+            req.target_node_id,
+            req.vm_id,
+            req.payload,
+        ) catch |err| {
+            const st: MgmtStatus = switch (err) {
+                error.IdempotencyConflict => .idempotency_conflict,
+                error.LogFull => .no_quorum,
+            };
+            const aseq = self.audit.record(req.token.actor_id, req.token.role, req.action, req.target_node_id, st, self.rsm.desired_revision);
+            return .{
+                .status = st,
+                .target_node_id = req.target_node_id,
+                .revision = self.rsm.desired_revision,
+                .commit_index = self.rsm.commit_index,
+                .audit_seq = aseq,
+            };
+        };
+
+        if (req.action == .fence_node) {
+            self.fences.fenceNode(req.target_node_id, self.consensus.fencing_epoch + 1, true);
+        }
+
+        const out_status: MgmtStatus = if (prop.status == .applied) .ok else .reconciling;
+        const aseq = self.audit.record(req.token.actor_id, req.token.role, req.action, req.target_node_id, out_status, self.rsm.desired_revision);
+        return .{
+            .status = out_status,
+            .target_node_id = req.target_node_id,
+            .revision = self.rsm.desired_revision,
+            .commit_index = self.rsm.commit_index,
+            .audit_seq = aseq,
+        };
+    }
+};
+
 test "clusterd_protocol: signature verification, sequence replay, and epoch advancement" {
     const std_test = @import("std").testing;
     const secret = "catenary-cluster-master-secret";
@@ -547,5 +1211,122 @@ test "clusterd_protocol: consensus quorum, election, and term step-down" {
     try std_test.expect(state.handleVoteRequest(&peer_candidate_req, 1));
     try std_test.expectEqual(ConsensusRole.follower, state.role);
     try std_test.expectEqual(@as(?u32, 2), state.voted_for);
+}
+
+test "clusterd_protocol: replicated state machine, idempotency, and reconciliation" {
+    const std_test = @import("std").testing;
+    var consensus = ConsensusState{ .cluster_size = 3, .role = .leader, .current_term = 1, .fencing_epoch = 1, .leader_node_id = 1 };
+    var rsm = ReplicatedStateMachine{};
+
+    const key1 = IdempotencyKey{ .caller_id = 10, .client_seq = 1, .body_hash = 0xCAFEBABE };
+    const res1 = try rsm.proposeMutation(1, 1, .vm_create, key1, 2, 100, @splat(0));
+    try std_test.expectEqual(@as(u32, 1), res1.index);
+    try std_test.expect(!res1.reused);
+
+    // Idempotent retry with same body hash returns existing entry
+    const retry = try rsm.proposeMutation(1, 1, .vm_create, key1, 2, 100, @splat(0));
+    try std_test.expectEqual(@as(u32, 1), retry.index);
+    try std_test.expect(retry.reused);
+
+    // Conflicting body hash with same key fails
+    const conflict_key = IdempotencyKey{ .caller_id = 10, .client_seq = 1, .body_hash = 0xDEADBEEF };
+    try std_test.expectError(error.IdempotencyConflict, rsm.proposeMutation(1, 1, .vm_create, conflict_key, 2, 101, @splat(0)));
+
+    // Quorum replication commits entry and advances desired revision
+    const reply = AppendEntriesReplyPayload{
+        .term = 1,
+        .follower_node_id = 2,
+        .success = true,
+        .match_index = 1,
+        .signature = @splat(0),
+    };
+    try std_test.expect(rsm.handleAppendEntriesReply(&consensus, &reply));
+    try std_test.expectEqual(@as(u32, 1), rsm.commit_index);
+    try std_test.expectEqual(@as(u64, 1), rsm.desired_revision);
+    try std_test.expectEqual(ReconcileStatus.reconciling, rsm.reconcile_status);
+
+    // Observed state catches up -> applied
+    rsm.reconcileObserved(1);
+    try std_test.expectEqual(ReconcileStatus.applied, rsm.reconcile_status);
+}
+
+test "clusterd_protocol: lease expiry, self-fencing, and failover gating" {
+    const std_test = @import("std").testing;
+    var consensus = ConsensusState{ .cluster_size = 3, .role = .leader, .current_term = 2, .fencing_epoch = 3, .leader_node_id = 1 };
+    var lease = LeaseState{ .lease_duration_ticks = 3 };
+    var fences = FenceTable{};
+
+    try std_test.expect(fences.isWriteAllowed(1, 3, lease.self_fenced));
+
+    // Tick without quorum ack -> self-fence at tick 3
+    try std_test.expect(!lease.tickLeader(&consensus));
+    try std_test.expect(!lease.tickLeader(&consensus));
+    try std_test.expect(lease.tickLeader(&consensus));
+    try std_test.expect(lease.self_fenced);
+    try std_test.expectEqual(ConsensusRole.quarantined, consensus.role);
+    try std_test.expect(!fences.isWriteAllowed(1, 3, lease.self_fenced));
+
+    // Failover requires both quorum AND verified fencing of failed node
+    try std_test.expect(!fences.canFailoverWorkload(1, true));
+    fences.fenceNode(1, 4, true);
+    try std_test.expect(fences.canFailoverWorkload(1, true));
+    try std_test.expect(!fences.canFailoverWorkload(1, false));
+    try std_test.expect(!fences.isWriteAllowed(2, 3, false)); // stale epoch 3 < active 4
+}
+
+test "clusterd_protocol: management API version, RBAC, and audit trail" {
+    const std_test = @import("std").testing;
+    const secret = "mgmt-cluster-secret";
+    var plane = ManagementPlane{};
+    plane.consensus.role = .leader;
+    plane.consensus.current_term = 1;
+    plane.consensus.fencing_epoch = 1;
+
+    const viewer_sig = computeTokenSignature(secret, 42, .viewer, 1, 100);
+    const viewer_token = AuthToken{ .actor_id = 42, .role = .viewer, .epoch = 1, .expiry_seq = 100, .signature = viewer_sig };
+
+    // Viewer can read status
+    const status_req = MgmtRequest{ .action = .get_cluster_status, .token = viewer_token };
+    const status_resp = plane.handleMgmtRequest(&status_req, secret, 10);
+    try std_test.expectEqual(MgmtStatus.ok, status_resp.status);
+
+    // Viewer cannot create VM -> forbidden
+    const forbidden_req = MgmtRequest{ .action = .create_vm, .token = viewer_token, .vm_id = 5 };
+    const forbidden_resp = plane.handleMgmtRequest(&forbidden_req, secret, 10);
+    try std_test.expectEqual(MgmtStatus.forbidden, forbidden_resp.status);
+
+    // Operator can create VM -> reconciling
+    const op_sig = computeTokenSignature(secret, 43, .operator, 1, 100);
+    const op_token = AuthToken{ .actor_id = 43, .role = .operator, .epoch = 1, .expiry_seq = 100, .signature = op_sig };
+    const create_req = MgmtRequest{
+        .action = .create_vm,
+        .token = op_token,
+        .idempotency = .{ .caller_id = 43, .client_seq = 1, .body_hash = 999 },
+        .target_node_id = 2,
+        .vm_id = 5,
+    };
+    const create_resp = plane.handleMgmtRequest(&create_req, secret, 10);
+    try std_test.expectEqual(MgmtStatus.reconciling, create_resp.status);
+    try std_test.expectEqual(@as(u32, 1), plane.rsm.log_len);
+
+    // Operator cannot fence node -> forbidden; Cluster Admin can fence node
+    const op_fence = MgmtRequest{ .action = .fence_node, .token = op_token, .target_node_id = 2 };
+    try std_test.expectEqual(MgmtStatus.forbidden, plane.handleMgmtRequest(&op_fence, secret, 10).status);
+
+    const admin_sig = computeTokenSignature(secret, 1, .cluster_admin, 1, 100);
+    const admin_token = AuthToken{ .actor_id = 1, .role = .cluster_admin, .epoch = 1, .expiry_seq = 100, .signature = admin_sig };
+    const admin_fence = MgmtRequest{
+        .action = .fence_node,
+        .token = admin_token,
+        .idempotency = .{ .caller_id = 1, .client_seq = 1, .body_hash = 777 },
+        .target_node_id = 2,
+    };
+    const admin_resp = plane.handleMgmtRequest(&admin_fence, secret, 10);
+    try std_test.expectEqual(MgmtStatus.reconciling, admin_resp.status);
+    try std_test.expect(plane.fences.isNodeFenced(2));
+
+    // Unsupported version rejected
+    const bad_ver = MgmtRequest{ .api_major = 99, .action = .get_cluster_status, .token = viewer_token };
+    try std_test.expectEqual(MgmtStatus.unsupported_version, plane.handleMgmtRequest(&bad_ver, secret, 10).status);
 }
 

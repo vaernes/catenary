@@ -133,9 +133,11 @@ const BLK_ATTACH_VM_DISK = @backingInt(lib.BlkReqType.attach_vm_disk);
 const BLK_DETACH_VM_DISK = @backingInt(lib.BlkReqType.detach_vm_disk);
 const BLK_SNAPSHOT_VM_DISK = @backingInt(lib.BlkReqType.snapshot_vm_disk);
 const BLK_RESTORE_VM_DISK = @backingInt(lib.BlkReqType.restore_vm_disk);
+const BLK_FENCE_STORAGE = @backingInt(lib.BlkReqType.fence_storage);
 const HOST_METADATA_VMID = storage_protocol.HOST_METADATA_VMID;
 const CONTAINERD_ENDPOINT = @backingInt(lib.ReservedEndpoint.containerd);
 const CONFIGD_ENDPOINT = @backingInt(lib.ReservedEndpoint.configd);
+const CLUSTERD_ENDPOINT = @backingInt(lib.ReservedEndpoint.clusterd);
 const KERNEL_CONTROL_ENDPOINT = @backingInt(lib.ReservedEndpoint.kernel_control);
 
 // Lba size (LBA = logical block address, a 512-byte sector).
@@ -143,11 +145,14 @@ const SECTOR_SIZE: u32 = 512;
 
 const VmDiskExtent = struct {
     attached: bool = false,
+    fenced: bool = false,
     start_lba: u64 = 0,
     sectors: u64 = 0,
 };
 
 var g_vm_disks: [partition_metadata.MAX_VM_DISKS]VmDiskExtent = @splat(.{});
+var g_node_storage_fenced: bool = false;
+var g_fenced_epoch: u64 = 0;
 
 fn isLoopbackOrLinkLocal(node: *const [16]u8) bool {
     const loopback = lib.Ipv6Addr.loopback();
@@ -170,7 +175,7 @@ fn isAuthorizedVmDiskAdmin(
     src_endpoint: u64,
     src_node: *const [16]u8,
 ) bool {
-    return src_endpoint == CONFIGD_ENDPOINT and isLoopbackOrLinkLocal(src_node);
+    return (src_endpoint == CONFIGD_ENDPOINT or src_endpoint == CLUSTERD_ENDPOINT) and isLoopbackOrLinkLocal(src_node);
 }
 
 fn isAuthorizedVmIoClient(
@@ -182,7 +187,7 @@ fn isAuthorizedVmIoClient(
     const loopback = lib.Ipv6Addr.loopback();
     if (src_endpoint != KERNEL_CONTROL_ENDPOINT or !std.mem.eql(u8, src_node, &loopback.bytes)) return false;
     if (vmid == 0 or vmid > partition_metadata.MAX_VM_DISKS) return false;
-    return table[vmid - 1].attached;
+    return table[vmid - 1].attached and !table[vmid - 1].fenced;
 }
 
 fn attachVmDisk(
@@ -922,10 +927,22 @@ pub export fn umain() noreturn {
         const dst_node_valid = isLoopbackOrLinkLocal(&incoming_hdr.dst.node.bytes);
         if (request_envelope_valid and dst_node_valid and
             (req_type == BLK_ATTACH_VM_DISK or req_type == BLK_DETACH_VM_DISK or
-            req_type == BLK_SNAPSHOT_VM_DISK or req_type == BLK_RESTORE_VM_DISK))
+            req_type == BLK_SNAPSHOT_VM_DISK or req_type == BLK_RESTORE_VM_DISK or
+            req_type == BLK_FENCE_STORAGE))
         {
             if (isAuthorizedVmDiskAdmin(incoming_hdr.src.endpoint, &incoming_hdr.src.node.bytes)) {
-                if (req_type == BLK_ATTACH_VM_DISK) {
+                if (req_type == BLK_FENCE_STORAGE) {
+                    if (vmid == 0) {
+                        if (sector >= g_fenced_epoch) {
+                            g_fenced_epoch = sector;
+                            g_node_storage_fenced = true;
+                            lib.serialWrite("storaged: node-wide storage fenced by cluster epoch\n");
+                        }
+                    } else if (vmid <= partition_metadata.MAX_VM_DISKS) {
+                        g_vm_disks[vmid - 1].fenced = true;
+                        lib.serialWrite("storaged: per-VM disk fenced\n");
+                    }
+                } else if (req_type == BLK_ATTACH_VM_DISK) {
                     if (attachVmDisk(&g_vm_disks, vmid, sector, @as(u64, data_len))) {
                         lib.serialWrite("storaged: per-VM disk attached\n");
                     } else {
@@ -979,7 +996,7 @@ pub export fn umain() noreturn {
             );
 
         var io_status: u8 = 1;
-        if (is_host_metadata or is_vm_io) {
+        if (!g_node_storage_fenced and (is_host_metadata or is_vm_io)) {
             if (req_type == 4) {
                 if (data_len == 0 and data_hpa == 0 and doFlush() == 0) io_status = 0;
             } else if ((req_type == 0 or req_type == 1 or req_type == BLK_WRITE_FUA) and data_len > 0 and
