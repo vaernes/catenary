@@ -34,6 +34,9 @@ SMOKE_PROFILE=vnic-bind ./test_qemu.sh
 # Exercise Phase 10 two-VM per-VM disk extents, FUA+flush, dual-stack vSwitch flows, anti-spoofing, and VM stop/delete reclamation
 SMOKE_PROFILE=phase10 ./test_qemu.sh
 
+# Exercise Phase 11 Direct Type-1 Generic UEFI Full-VM platform, Secure Boot dbx rejection, ACPI/PCI/GOP/TPM2 validation, and warm reboot
+SMOKE_PROFILE=phase11 ./test_qemu.sh
+
 # Verify storage fails closed when no NVMe device is present
 SMOKE_PROFILE=no-nvme ./test_qemu.sh
 

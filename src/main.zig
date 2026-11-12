@@ -109,6 +109,8 @@ pub export var limine_stack_request: limine.StackSizeRequest = .{ .stack_size = 
 
 pub fn serialWrite(s: []const u8) void {
     if (comptime builtin.cpu.arch == .x86_64) {
+        @import("arch/x86_64/smp.zig").serialAcquire();
+        defer @import("arch/x86_64/smp.zig").serialRelease();
         for (s) |c| {
             if (uart_com1_present) {
                 outb(0x3F8, c);

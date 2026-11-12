@@ -1,37 +1,35 @@
-# Project: Catenary OS - Phase 9 (Multi-VCPU, SMP MicroVMs & Live Serial Console)
+# Project: Catenary OS - Phase 11 (Direct Type-1 Generic UEFI Full-VM Platform)
 
-> **Scope and evidence:** QEMU is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 9 is complete against its QEMU scope, based on the live guest integration and regression evidence below. The historical 50/50 test report covers Python models and simulated traces, not a 50/50 QEMU run; see [TEST_READY.md](TEST_READY.md). Hardware-specific behavior and claims beyond the tested QEMU paths are not established.
+> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 11 is complete against its QEMU scope, based on live direct UEFI guest firmware execution, ACPI 2.0+ platform tables, multi-device PCI bus 0 enumeration, GOP framebuffer, per-VM virtual TPM 2.0 CRB, persistent EFI variable store with Secure Boot verification, Virtio-Blk FUA write+flush, warm reboot lifecycle survival, and prerequisite admission rejection for unprovisioned OS media.
 
-## Architecture
-Catenary OS is a distributed exokernel operating system written in Zig (targeting Zig 0.17.1).
-Phase 9 targets concurrent multi-MicroVM execution across SMP cores, with live guest serial console streaming and switching in the Ring-3 `windowd` TUI. A vCPU count or one VMCS per VM does not by itself establish correct multi-vCPU execution; that requires separate per-vCPU state and integration evidence.
+## Architecture & Subsystems
+Catenary OS is a distributed exokernel operating system and Type-1 bare-metal hypervisor written in Zig (targeting Zig 0.17.1).
+Phase 11 introduces a direct Type-1 generic UEFI Full-VM platform hosting unassisted guest firmware and full-VM profiles directly on Intel VMX/EPT without requiring an intermediate support VM or nested hypervisor.
 
-### Intended subsystem architecture and interface contracts:
-1. **Ring 0 Virtualization Core (`src/arch/x86_64/vmx.zig`, `src/arch/x86_64/smp.zig`, `src/arch/x86_64/gdt.zig`)**:
-   - Independent 4-level EPT radix tree per MicroVM (`translateEptGpaToHpa`), eliminating flat `guest_maps` collisions.
-   - Dedicated VMCS per MicroVM instance.
-   - Per-core VMX initialization (`per_cpu_vmxon`, `vmx.initApCore(ap_idx)`) in `smp.apEntry`.
-   - Per-core host exit stack (`per_cpu_host_stack`) and per-core `VMCS_HOST_TR_BASE` via `gdt.tssBaseForCpu(cpu_id)`.
-   - Per-instance emulated device state (`VirtualDeviceState` for PIC, PIT, LAPIC, UART 0x3F8, PCI).
-2. **Kernel Scheduler & Registry (`src/kernel/scheduler.zig`, `src/vmm/microvm_registry.zig`, `src/vmm/microvm_bridge.zig`)**:
-   - Thread and Instance core affinity (`pinned_cpu: ?u8`), binding each MicroVM's VMCS to a dedicated SMP core.
-   - Scheduler dispatch updated to allow AP cores to execute pinned VMX threads (`scheduler.zig`).
-   - Spinlock-synchronized `microvm_registry` and `microvm_bridge` for multi-core thread safety.
-3. **Console Syscall ABI & Trap Handling (`src/syscall_abi.zig`, `src/user/lib.zig`, `src/services/service_bootstrap.zig`, `src/arch/x86_64/user_mode.zig`)**:
-   - Virtual 16550 UART with 4096-byte circular TX buffer and 256-byte RX FIFO.
-   - Emulation of Data Ready (DR) in LSR, Received Data Available (RDA) in IIR, and IRQ4 interrupt assertion.
-   - Dual-path TX: circular buffer in memory for `windowd` + mirrored to host physical COM1 with `[vm<id>]` prefix.
-   - Syscalls: `SYS_GET_VM_CONSOLE_LOG = 28` and `SYS_VM_CONSOLE_INJECT = 29`.
-4. **Ring 3 Compositor & TUI (`src/user/windowd.zig`)**:
-   - `Pane.guest_console = 3`, using DMA slot 3 (`DMA_CONSOLE_SLOT`).
-   - Interactive live guest serial console displaying streaming Linux guest `ttyS0` output.
-   - Console switching between running MicroVMs via hotkeys (`[F6]` direct focus, `[F7]`/`[F8]` cycle VMs, `[C]`/`[Enter]` in VM manager).
-   - Raw keyboard character forwarding to active MicroVM via `SYS_VM_CONSOLE_INJECT`.
-   - Scrollback navigation via `[PageUp]` / `[PageDown]`.
-5. **Test Harness & Smoke Automation (`test_qemu.sh`)**:
-   - `SMOKE_PROFILE=phase9` running QEMU with `-smp 2` (or more).
-   - Python monitor socket stream injection (`inject_ui_phase9_keys`) to provision/start MicroVM 2, switch console, and interact with guest shell.
-   - Regex-based verification of concurrent core progression milestones, EPT isolation, console switching, and clean exit code 0.
+### Key Phase 11 Subsystems and Interface Contracts:
+1. **Direct Virtual PC Platform (`src/vmm/pc_platform.zig`)**:
+   - ACPI 2.0+ standard table builder and validator: `RSDP`, `RSDT`, `XSDT`, `FADT`/`FACP`, `MADT`/`APIC`, `MCFG` (PCI Express MMCONFIG), and `TPM2` at fixed GPA `0x000E_0000`.
+   - Per-VM MC146818 CMOS/RTC emulation (`0x70`/`0x71`) tracking BCD time, daylight savings flags, and diagnostic status bytes.
+   - Multi-device PCI Bus 0 emulation: `00:00.0` Host Bridge (`8086:29C0`), `00:01.0` GOP Framebuffer (`1AF4:1111`), `00:02.0` Virtio-Net (`1AF4:1041`), and `00:03.0` Virtio-Blk (`1AF4:1042`).
+   - Linear Graphics Output Protocol (GOP) Framebuffer MMIO region at GPA `0xFD00_0000` (1024×768×32, 3072 KiB).
+2. **Persistent EFI Variable Store & Secure Boot (`src/vmm/efi_vars.zig`)**:
+   - MMIO-accessible EFI Variable store at GPA `0xFE00_2000` supporting status/command/data register protocol.
+   - Non-volatile NVRAM state tracking `boot_order`, `boot0001`, `boot_count`, `generation`, and CRC32 payload verification.
+   - SHA-256 authenticated boot-image verification: authenticates against allowed `db`, rejects revoked hashes in `dbx`, and rejects unsigned/empty trust databases.
+3. **Per-VM Virtual TPM 2.0 CRB Device (`src/vmm/vtpm.zig`)**:
+   - Command Response Buffer (CRB) MMIO interface at GPA `0xFED4_0000`.
+   - Implements `TPM2_Startup`, `TPM2_SelfTest`, `TPM2_GetCapability`, `TPM2_PCR_Extend` (SHA-256), `TPM2_PCR_Read`, `TPM2_Create` (sealing data to PCR[0]), and `TPM2_Unseal` (enforcing measurement policy matches, returning `TPM_RC_POLICY_FAIL` on mismatch).
+   - Non-volatile monotonic counter persistent across VM lifecycles.
+4. **Full-VM Profile Admission & 64-Bit Direct UEFI Guest Firmware (`src/vmm/uefi_firmware.zig`)**:
+   - Admission rules (`validateFullVmAdmission`) enforcing CPU/RAM/disk/installer media prerequisites (rejects `win11-26h2` and `ubuntu-26.04` if unprovisioned; rejects `uefi-revoked` in `dbx`; admits `uefi-test`).
+   - Reset vector ROM at `0xFFF0_0000` jumping to 64-bit direct UEFI firmware at `0x0010_0000`.
+   - Firmware validates ACPI tables, enumerates PCI bus 0 devices, paints GOP framebuffer banner, exercises TPM 2.0 startup/extend/seal/unseal, persists EFI `boot_count`, performs Virtio-Blk FUA writes, survives warm reboot, and verifies NVMe extent readback.
+5. **Varde Shell & Lifecycle Controls (`src/kernel/varde_shell.zig`, `src/arch/x86_64/vmx.zig`)**:
+   - Shell commands: `vm-create-full <profile>`, `vm-reboot <id>`, and `vm-send <id> <cmd>`.
+   - VMX VM-exit dispatching to per-VM PCI config, RTC, and MMIO interceptors.
+   - Warm reboot lifecycle preserving NVRAM and disk extents while resetting registers, EPT guest state, and vCPU control structures.
+6. **Automated Verification Harness (`test_qemu.sh`)**:
+   - Acceptance profile `SMOKE_PROFILE=phase11` exercising prerequisite admission rejection, dbx rejection, admitted VM boot, TPM 2.0 measurement, Virtio-Blk FUA write+flush, warm reboot survival, and post-reboot disk extent readback.
 
 ---
 

@@ -10,6 +10,10 @@ const linux_boot = @import("../../vmm/linux_boot.zig");
 const microvm_registry = @import("../../vmm/microvm_registry.zig");
 const virtio_net = @import("../../vmm/virtio_net.zig");
 const virtio_blk = @import("../../vmm/virtio_blk.zig");
+const pc_platform = @import("../../vmm/pc_platform.zig");
+const efi_vars = @import("../../vmm/efi_vars.zig");
+const vtpm = @import("../../vmm/vtpm.zig");
+const uefi_firmware = @import("../../vmm/uefi_firmware.zig");
 const dipc = @import("../../ipc/dipc.zig");
 const microvm_bridge = @import("../../vmm/microvm_bridge.zig");
 const guest_image_blob = @import("guest_image_blob");
@@ -374,52 +378,32 @@ fn configureMsrBitmap() VmxError!void {
     try vmwriteChecked(VMCS_CTRL_MSR_BITMAPS, bitmap_hpa);
 }
 
-fn pciConfigReadDword(addr: u32) u32 {
-    if ((addr & PCI_CONFIG_ADDRESS_ENABLE) == 0) return 0xFFFF_FFFF;
-
-    const bus = @as(u8, @truncate(addr >> 16));
-    const device = @as(u5, @truncate((addr >> 11) & 0x1F));
-    const function = @as(u3, @truncate((addr >> 8) & 0x7));
-    const reg = @as(u8, @truncate(addr & 0xFC));
-
-    if (bus != 0 or device != 0 or function != 0) return 0xFFFF_FFFF;
-
-    return switch (reg) {
-        0x00 => PCI_ROOT_VENDOR_DEVICE,
-        0x04 => pci_root_command,
-        0x08 => PCI_ROOT_CLASS_REVISION,
-        0x0C => 0,
-        0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x30, 0x34, 0x3C => 0,
-        else => 0,
-    };
-}
-
-fn pciConfigWriteDword(addr: u32, value: u32, mask: u32) void {
-    if ((addr & PCI_CONFIG_ADDRESS_ENABLE) == 0) return;
-
-    const bus = @as(u8, @truncate(addr >> 16));
-    const device = @as(u5, @truncate((addr >> 11) & 0x1F));
-    const function = @as(u3, @truncate((addr >> 8) & 0x7));
-    const reg = @as(u8, @truncate(addr & 0xFC));
-
-    if (bus != 0 or device != 0 or function != 0) return;
-
-    switch (reg) {
-        0x04 => {
-            const current = @as(u32, pci_root_command);
-            const merged = (current & ~mask) | (value & mask);
-            pci_root_command = @as(u16, @truncate(merged & 0x0000_FFFF));
-        },
-        else => {},
+fn pciConfigReadDword(maybe_inst: ?*microvm_registry.Instance, addr: u32) u32 {
+    if (maybe_inst) |inst| {
+        return pc_platform.pciReadDword(&inst.devices.pci.dev_commands, addr);
     }
+    var fallback_cmds: [pc_platform.PCI_MAX_BUS0_DEVS]u16 = .{ pci_root_command, 0, 0, 0 };
+    return pc_platform.pciReadDword(&fallback_cmds, addr);
 }
 
-fn handlePciConfigIo(port: u16, is_in: bool, size: u8, regs: *GuestRegs) bool {
+fn pciConfigWriteDword(maybe_inst: ?*microvm_registry.Instance, addr: u32, value: u32, mask: u32) void {
+    if (maybe_inst) |inst| {
+        pc_platform.pciWriteDword(&inst.devices.pci.dev_commands, addr, value, mask);
+        inst.devices.pci.root_command = inst.devices.pci.dev_commands[0];
+        return;
+    }
+    var fallback_cmds: [pc_platform.PCI_MAX_BUS0_DEVS]u16 = .{ pci_root_command, 0, 0, 0 };
+    pc_platform.pciWriteDword(&fallback_cmds, addr, value, mask);
+    pci_root_command = fallback_cmds[0];
+}
+
+fn handlePciConfigIo(maybe_inst: ?*microvm_registry.Instance, port: u16, is_in: bool, size: u8, regs: *GuestRegs) bool {
+    const cfg_addr_ptr: *u32 = if (maybe_inst) |inst| &inst.devices.pci.config_address else &pci_config_address;
     if (port == PCI_CONFIG_ADDRESS_PORT and size == 4) {
         if (is_in) {
-            writeGuestIoValue(regs, 4, pci_config_address);
+            writeGuestIoValue(regs, 4, cfg_addr_ptr.*);
         } else {
-            pci_config_address = readGuestIoValue(regs, 4) & 0x8000_FFFC;
+            cfg_addr_ptr.* = readGuestIoValue(regs, 4) & 0x8000_FFFC;
         }
         return true;
     }
@@ -427,7 +411,7 @@ fn handlePciConfigIo(port: u16, is_in: bool, size: u8, regs: *GuestRegs) bool {
     if (port >= PCI_CONFIG_DATA_PORT and port <= PCI_CONFIG_DATA_PORT + 3) {
         const data_offset = @as(u8, @truncate(port - PCI_CONFIG_DATA_PORT));
         const shift = @as(u5, @truncate(data_offset * 8));
-        const full = pciConfigReadDword(pci_config_address);
+        const full = pciConfigReadDword(maybe_inst, cfg_addr_ptr.*);
         const value = switch (size) {
             1 => (full >> shift) & 0xFF,
             2 => (full >> shift) & 0xFFFF,
@@ -440,7 +424,7 @@ fn handlePciConfigIo(port: u16, is_in: bool, size: u8, regs: *GuestRegs) bool {
         } else {
             const mask = @as(u32, @truncate(ioMask(size))) << shift;
             const shifted = readGuestIoValue(regs, size) << shift;
-            pciConfigWriteDword(pci_config_address, shifted, mask);
+            pciConfigWriteDword(maybe_inst, cfg_addr_ptr.*, shifted, mask);
         }
         return true;
     }
@@ -453,8 +437,13 @@ fn lapicRegIndex(offset: u64) ?usize {
     return @as(usize, @intCast(offset >> 2));
 }
 
-fn lapicWriteRaw(offset: u32, value: u32) void {
+fn lapicWriteRaw( offset: u32, value: u32) void {
     const idx = lapicRegIndex(@as(u64, offset)) orelse return;
+    if (getCurrentInstanceId()) |vmid| {
+        if (microvm_registry.findMutable(vmid)) |inst| {
+            inst.devices.lapic.regs[idx] = value;
+        }
+    }
     lapic_regs[idx] = value;
 }
 
@@ -483,6 +472,14 @@ fn resetLapicState() void {
 
 fn lapicRead(offset: u64) u32 {
     const idx = lapicRegIndex(offset) orelse return 0;
+    if (getCurrentInstanceId()) |vmid| {
+        if (microvm_registry.findMutable(vmid)) |inst| {
+            if (offset == APIC_LVR_REG and inst.devices.lapic.regs[idx] == 0) {
+                return APIC_VERSION_VALUE;
+            }
+            return inst.devices.lapic.regs[idx];
+        }
+    }
     return lapic_regs[idx];
 }
 
@@ -612,14 +609,15 @@ fn guestRamBytes(inst: *const microvm_registry.Instance) u64 {
 }
 
 fn isGuestMmioWindow(gpa: u64) bool {
-    return gpa >= 0xFEC0_0000 and gpa < 0xFF00_0000;
+    return (gpa >= 0xFD00_0000 and gpa < 0xFF00_0000) or
+        (gpa >= uefi_firmware.UEFI_ROM_GPA and gpa < uefi_firmware.UEFI_ROM_GPA + uefi_firmware.UEFI_ROM_SIZE);
 }
 
 fn guestPoolCapacityPages(inst: *const microvm_registry.Instance) u64 {
     const guest_pages = guestRamBytes(inst) / @as(u64, pmm.PAGE_SIZE);
     const leaf_tables = (guest_pages + 511) / 512;
     const directory_tables = (guest_pages + 262_143) / 262_144;
-    return guest_pages + leaf_tables + directory_tables + 4;
+    return guest_pages + leaf_tables + directory_tables + 16;
 }
 
 fn chooseInitrdGpa(guest_ram_bytes: u64, kernel_gpa: u64, kernel_size: usize, initrd_size: usize) VmxError!u64 {
@@ -1513,6 +1511,150 @@ pub fn stageGuestForInstance(inst: *microvm_registry.Instance) VmxError!void {
     smp.serialRelease();
 }
 
+pub fn stageUefiFullVmForInstance(inst: *microvm_registry.Instance, is_warm_reboot: bool) VmxError!void {
+    inst.vm_profile = .uefi_fullvm;
+    const approved_img = uefi_firmware.getApprovedUefiImage();
+    const revoked_img = uefi_firmware.getRevokedUefiImage();
+
+    if (!is_warm_reboot) {
+        efi_vars.resetInstance(inst.instance_id);
+        if (!efi_vars.initDefaultSecureBootStore(inst.instance_id, approved_img, revoked_img)) {
+            return error.GuestImageInvalid;
+        }
+        vtpm.resetInstance(inst.instance_id);
+    } else {
+        efi_vars.resetForReboot(inst.instance_id);
+        vtpm.resetForReboot(inst.instance_id);
+        virtio_blk.resetInstance(inst.instance_id);
+        virtio_net.resetInstance(inst.instance_id);
+        inst.devices.pic.reset();
+        inst.devices.pit.reset();
+        inst.devices.lapic.reset();
+        inst.devices.pci.reset();
+        inst.devices.rtc.reset();
+        inst.devices.gop.reset();
+    }
+
+    // Verify Secure Boot policy before staging firmware into guest RAM
+    efi_vars.verifyBootImage(inst.instance_id, approved_img) catch {
+        serialWrite("VMX: Secure Boot rejected UEFI image for VM ");
+        printDec(inst.instance_id);
+        serialWrite("\n");
+        return error.GuestImageInvalid;
+    };
+
+    if (inst.ept_pml4_phys == null) {
+        inst.ept_pml4_phys = pmm.allocPage() orelse return error.OutOfMemory;
+        clearPage(inst.ept_pml4_phys.?);
+    }
+
+    // Seed low memory BIOS Data Area & boot GDT
+    const low_hpa = try ensureGuestPageForInstance(inst, 0);
+    const low: [*]u8 = @ptrFromInt(low_hpa + vmx_hhdm_offset);
+    std.mem.writeInt(u16, low[0x40E..0x410], GUEST_EBDA_SEGMENT, .little);
+    std.mem.writeInt(u16, low[0x413..0x415], GUEST_BASE_MEMORY_KB, .little);
+
+    const gdt_hpa = try ensureGuestPageForInstance(inst, GUEST_BOOT_GDT_GPA);
+    const gdt_page: [*]u8 = @ptrFromInt(gdt_hpa + vmx_hhdm_offset);
+    const gdt_entries = @as(*[512]u64, @ptrCast(@alignCast(gdt_page)));
+    @memset(gdt_entries, 0);
+    gdt_entries[2] = 0x00af9a000000ffff; // 64-bit code selector 0x10
+    gdt_entries[3] = 0x00af92000000ffff; // 64-bit data selector 0x18
+
+    // Build and verify ACPI 2.0+ tables (RSDP, RSDT, XSDT, FACP, APIC, MCFG, TPM2) at 0x000E_0000
+    const acpi_hpa = try ensureGuestPageForInstance(inst, pc_platform.ACPI_TABLES_GPA);
+    const acpi_page = @as(*[pc_platform.ACPI_REGION_SIZE]u8, @ptrFromInt(acpi_hpa + vmx_hhdm_offset));
+    pc_platform.buildGuestAcpiTables(acpi_page, @intCast(inst.vcpus));
+    if (!pc_platform.verifyGuestAcpiTables(acpi_page)) return error.GuestImageInvalid;
+
+    // Stage UEFI firmware code at 0x0010_0000
+    try copyIntoGuestForInstance(inst, uefi_firmware.UEFI_CODE_GPA, approved_img);
+
+    // Pre-map and zero Virtio-Blk queue, descriptor, request, data, and serial command pages
+    const scratch_pages = [_]u64{
+        uefi_firmware.VIRTIO_DESC_GPA,
+        uefi_firmware.VIRTIO_AVAIL_GPA,
+        uefi_firmware.VIRTIO_USED_GPA,
+        uefi_firmware.VIRTIO_REQ_HDR_GPA,
+        uefi_firmware.VIRTIO_DATA_BUF_GPA,
+        uefi_firmware.SERIAL_CMD_BUF_GPA,
+        uefi_firmware.UEFI_STACK_TOP_GPA - pmm.PAGE_SIZE,
+    };
+    for (scratch_pages) |page_gpa| {
+        const hpa = try ensureGuestPageForInstance(inst, page_gpa);
+        clearPage(hpa);
+    }
+
+    // Stage UEFI Firmware Reset Vector ROM at 0xFFF0_0000
+    const rom_hpa = try ensureGuestPageForInstance(inst, uefi_firmware.UEFI_ROM_GPA);
+    const rom_page = @as(*[uefi_firmware.UEFI_ROM_SIZE]u8, @ptrFromInt(rom_hpa + vmx_hhdm_offset));
+    uefi_firmware.buildResetVectorPage(rom_page);
+
+    // Build guest 64-bit identity page tables (0..8 GiB via 2 MiB leaves)
+    const pml4_gpa: u64 = 0x0009_0000;
+    const pdpt_gpa: u64 = 0x0009_1000;
+    const pd_base_gpa: u64 = 0x0009_2000;
+    _ = try ensureGuestPageForInstance(inst, pml4_gpa);
+    _ = try ensureGuestPageForInstance(inst, pdpt_gpa);
+    for (0..GUEST_IDENTITY_PD_TABLES) |i| {
+        _ = try ensureGuestPageForInstance(inst, pd_base_gpa + (@as(u64, @intCast(i)) * pmm.PAGE_SIZE));
+    }
+
+    const pml4 = @as(*[512]u64, @ptrCast(@alignCast(guestPagePtrForInstance(inst, pml4_gpa).?)));
+    const pdpt = @as(*[512]u64, @ptrCast(@alignCast(guestPagePtrForInstance(inst, pdpt_gpa).?)));
+    @memset(pml4, 0);
+    @memset(pdpt, 0);
+    pml4[0] = (pdpt_gpa & 0x000F_FFFF_FFFF_F000) | 0x3;
+    pml4[256] = pml4[0];
+
+    const huge_page_size: u64 = 2 * 1024 * 1024;
+    for (0..GUEST_IDENTITY_PD_TABLES) |pdpt_i| {
+        const pd_gpa_i = pd_base_gpa + (@as(u64, @intCast(pdpt_i)) * pmm.PAGE_SIZE);
+        const pd_i = @as(*[512]u64, @ptrCast(@alignCast(guestPagePtrForInstance(inst, pd_gpa_i).?)));
+        @memset(pd_i, 0);
+        pdpt[pdpt_i] = (pd_gpa_i & 0x000F_FFFF_FFFF_F000) | 0x3;
+        for (0..512) |pd_i_entry| {
+            const page_index = (@as(u64, @intCast(pdpt_i)) * 512) + @as(u64, @intCast(pd_i_entry));
+            pd_i[pd_i_entry] = (page_index * huge_page_size) | 0x83;
+        }
+    }
+
+    const stack_top = (uefi_firmware.UEFI_STACK_TOP_GPA - 16) & ~@as(u64, 0xF);
+    const launch_state: GuestLaunchState = .{
+        .layout = .{
+            .boot_params_gpa = pc_platform.ACPI_TABLES_GPA,
+            .cmdline_gpa = 0,
+            .kernel_load_gpa = uefi_firmware.UEFI_CODE_GPA,
+            .guest_stack_top_gpa = uefi_firmware.UEFI_STACK_TOP_GPA,
+            .guest_pml4_gpa = pml4_gpa,
+            .guest_pdpt_gpa = pdpt_gpa,
+            .guest_pd_gpa = pd_base_gpa,
+        },
+        .guest_rip = uefi_firmware.UEFI_ROM_GPA,
+        .guest_rsp = stack_top,
+        .guest_cr3 = pml4_gpa,
+        .boot_params_gpa = pc_platform.ACPI_TABLES_GPA,
+        .guest_rsi = pc_platform.ACPI_TABLES_GPA,
+    };
+    if (inst.instance_id < per_instance_launch_state.len) {
+        per_instance_launch_state[inst.instance_id] = launch_state;
+    }
+    staged_launch_state = launch_state;
+    inst.launch_rsi = pc_platform.ACPI_TABLES_GPA;
+    guest_linux_entry_active = true;
+
+    smp.serialAcquire();
+    serialWrite("VMX: initialized EPT root for VM ");
+    printDec(inst.instance_id);
+    serialWrite("\n");
+    serialWrite("VMX: staged UEFI Full-VM for VM ");
+    printDec(inst.instance_id);
+    serialWrite(" warm_reboot=");
+    printDec(if (is_warm_reboot) 1 else 0);
+    serialWrite("\n");
+    smp.serialRelease();
+}
+
 fn stageLinuxGuest() VmxError!void {
     const id = current_instance_id orelse return error.Unsupported;
     const inst = microvm_registry.findMutable(id) orelse return error.Unsupported;
@@ -1960,13 +2102,14 @@ fn handleIoExit(regs: *GuestRegs) void {
     const size = ioAccessSize(qualification);
     const is_in = (qualification & 8) != 0;
 
-    if (handlePciConfigIo(port, is_in, size, regs)) {
+    const active_vmid = getCurrentInstanceId();
+    const maybe_inst = if (active_vmid) |id| microvm_registry.findMutable(id) else null;
+
+    if (handlePciConfigIo(maybe_inst, port, is_in, size, regs)) {
         advanceGuestRip();
         return;
     }
 
-    const active_vmid = getCurrentInstanceId();
-    const maybe_inst = if (active_vmid) |id| microvm_registry.findMutable(id) else null;
     const serial_dlab = if (maybe_inst) |inst|
         (inst.devices.uart.lcr & 0x80) != 0
     else
@@ -1978,6 +2121,16 @@ fn handleIoExit(regs: *GuestRegs) void {
         handlePitIo(maybe_inst, port, is_in, regs);
     } else if (port == 0x61) {
         handlePort61(maybe_inst, is_in, regs);
+    } else if (port == pc_platform.CMOS_INDEX_PORT or port == pc_platform.CMOS_DATA_PORT) {
+        if (is_in) {
+            const val: u8 = if (maybe_inst) |inst| inst.devices.rtc.ioIn(port) else 0x26;
+            regs.rax = (regs.rax & 0xFFFF_FFFF_FFFF_FF00) | val;
+        } else {
+            const val = @as(u8, @truncate(regs.rax));
+            if (maybe_inst) |inst| {
+                inst.devices.rtc.ioOut(port, val);
+            }
+        }
     } else if (port == 0x3F8) {
         if (is_in) {
             if (serial_dlab) {
@@ -2267,6 +2420,40 @@ fn handleEptViolation(regs: *GuestRegs) bool {
             lapicWrite(offset, val);
         } else {
             regs.rax = lapicRead(offset);
+        }
+        advanceGuestRip();
+        return true;
+    }
+    if (gpa >= pc_platform.GOP_MMIO_BASE and gpa < pc_platform.GOP_MMIO_BASE + pc_platform.GOP_MMIO_SIZE) {
+        const vmid = getCurrentInstanceId() orelse return false;
+        const inst = microvm_registry.findMutable(vmid) orelse return false;
+        const offset = gpa - pc_platform.GOP_MMIO_BASE;
+        if (is_write) {
+            inst.devices.gop.mmioWrite(offset, val);
+        } else {
+            regs.rax = inst.devices.gop.mmioRead(offset);
+        }
+        advanceGuestRip();
+        return true;
+    }
+    if (gpa >= efi_vars.EFI_VAR_MMIO_BASE and gpa < efi_vars.EFI_VAR_MMIO_BASE + efi_vars.EFI_VAR_MMIO_SIZE) {
+        const vmid = getCurrentInstanceId() orelse return false;
+        const offset = gpa - efi_vars.EFI_VAR_MMIO_BASE;
+        if (is_write) {
+            efi_vars.mmioWrite(vmid, offset, val);
+        } else {
+            regs.rax = efi_vars.mmioRead(vmid, offset);
+        }
+        advanceGuestRip();
+        return true;
+    }
+    if (gpa >= vtpm.TPM_CRB_MMIO_BASE and gpa < vtpm.TPM_CRB_MMIO_BASE + vtpm.TPM_CRB_MMIO_SIZE) {
+        const vmid = getCurrentInstanceId() orelse return false;
+        const offset = gpa - vtpm.TPM_CRB_MMIO_BASE;
+        if (is_write) {
+            vtpm.mmioWrite(vmid, offset, val);
+        } else {
+            regs.rax = vtpm.mmioRead(vmid, offset);
         }
         advanceGuestRip();
         return true;
@@ -3053,6 +3240,41 @@ fn drainMicrovmIngress(active_vmid: ?u32) void {
     }
 }
 
+fn performWarmReboot(inst: *microvm_registry.Instance, regs: *GuestRegs) void {
+    inst.reboot_requested = false;
+    if (@import("builtin").is_test) return;
+    if (inst.vm_profile == .uefi_fullvm) {
+        stageUefiFullVmForInstance(inst, true) catch |err| {
+            serialWrite("VMX: warm reboot restage failed err=0x");
+            printHex(@intFromError(err));
+            serialWrite("\n");
+            return;
+        };
+    } else {
+        virtio_blk.resetInstance(inst.instance_id);
+        virtio_net.resetInstance(inst.instance_id);
+        inst.devices.pic.reset();
+        inst.devices.pit.reset();
+        inst.devices.lapic.reset();
+        inst.devices.pci.reset();
+        stageGuestForInstance(inst) catch return;
+    }
+
+    const launch_state: *const GuestLaunchState = if (inst.instance_id < per_instance_launch_state.len)
+        &per_instance_launch_state[inst.instance_id]
+    else
+        &staged_launch_state;
+    loadGuestState(launch_state) catch {};
+    regs.* = std.mem.zeroes(GuestRegs);
+    regs.rsi = launch_state.guest_rsi;
+
+    smp.serialAcquire();
+    serialWrite("VMX: warm reboot completed for VM ");
+    printDec(inst.instance_id);
+    serialWrite("\n");
+    smp.serialRelease();
+}
+
 pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
     const tsc_end = cpu.rdtsc();
     const core_id = smp.getCurrentCpuId();
@@ -3115,6 +3337,9 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
                     if (vmptrld(vmcs)) {
                         inst.vmcs_active_cpu = @intCast(core_id);
                     }
+                }
+                if (inst.reboot_requested) {
+                    performWarmReboot(inst, regs);
                 }
             }
         }
@@ -3616,6 +3841,8 @@ pub fn reclaimInstanceResources(instance: *microvm_registry.Instance) bool {
     microvm_bridge.dropForVm(instance.instance_id);
     virtio_net.resetInstance(instance.instance_id);
     virtio_blk.resetInstance(instance.instance_id);
+    efi_vars.resetInstance(instance.instance_id);
+    vtpm.resetInstance(instance.instance_id);
     if (instance.instance_id < per_instance_launch_state.len) {
         per_instance_launch_state[instance.instance_id] = .{};
     }

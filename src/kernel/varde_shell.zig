@@ -56,6 +56,8 @@ const smp = @import("../arch/x86_64/smp.zig");
 const service_registry = @import("../services/service_registry.zig");
 const pmm = @import("pmm.zig");
 const microvm_registry = @import("../vmm/microvm_registry.zig");
+const efi_vars = @import("../vmm/efi_vars.zig");
+const uefi_firmware = @import("../vmm/uefi_firmware.zig");
 const node_config = @import("../ipc/node_config.zig");
 
 const OS_NAME = if (builtin.is_test) "Catenary OS" else @import("../main.zig").OS_NAME;
@@ -266,7 +268,10 @@ fn cmdHelp() void {
     write("  ps / services                 — list Ring-3 service daemons\r\n");
     write("  vmlist / vms                  — list MicroVMs and telemetry\r\n");
     write("  vm-create <name> [vcpu] [mb]  — provision & start a MicroVM\r\n");
+    write("  vm-create-full <profile>      — validate & start Full-VM (uefi-test, ubuntu-26.04, win11-26h2)\r\n");
     write("  vm-start <id>                 — start MicroVM by ID\r\n");
+    write("  vm-reboot <id>                — warm reboot VM (preserving NVMe & EFI NVRAM)\r\n");
+    write("  vm-send <id> <cmd>            — send command line to VM serial console\r\n");
     write("  vm-kill <id> / vm-stop <id>   — stop MicroVM by ID\r\n");
     write("  vm-delete <id>                — delete MicroVM from registry\r\n");
     write("  vnic-bind <vm> <ip4|-> <ip6|-> — set vNIC source addresses (clears rules)\r\n");
@@ -373,6 +378,184 @@ fn cmdVmCreate(args: []const u8) void {
     } else {
         write("\r\nError: MicroVM registry full.\r\n");
     }
+}
+
+fn emitCom1Line(msg: []const u8) void {
+    if (!builtin.is_test) {
+        @import("../main.zig").serialWrite(msg);
+    }
+}
+
+fn emitCom1Msg(msg: []const u8) void {
+    if (!builtin.is_test) {
+        @import("../main.zig").serialWrite(msg);
+    }
+}
+
+fn emitCom1Kv(prefix: []const u8, val: []const u8) void {
+    if (!builtin.is_test) {
+        var buf: [256]u8 = undefined;
+        const total = prefix.len + val.len + 1;
+        if (total <= buf.len) {
+            @memcpy(buf[0..prefix.len], prefix);
+            @memcpy(buf[prefix.len .. prefix.len + val.len], val);
+            buf[total - 1] = '\n';
+            @import("../main.zig").serialWrite(buf[0..total]);
+        } else {
+            @import("../main.zig").serialWrite(prefix);
+            @import("../main.zig").serialWrite(val);
+            @import("../main.zig").serialWrite("\n");
+        }
+    }
+}
+
+fn cmdVmCreateFull(args: []const u8) void {
+    const profile_arg = trimSpaces(args);
+    if (profile_arg.len == 0) {
+        write("\r\nUsage: vm-create-full <uefi-test|uefi-revoked|ubuntu-26.04|win11-26h2>\r\n");
+        return;
+    }
+
+    const kind = uefi_firmware.FullVmProfileKind.fromName(profile_arg) orelse {
+        write("\r\nError: unknown Full-VM profile '");
+        write(profile_arg);
+        write("'.\r\n");
+        emitCom1Line("varde_shell: vm-create-full rejected reason=unknown-profile\n");
+        return;
+    };
+
+    // Use slot 8 for pre-admission Secure Boot policy verification so running VMs are untouched
+    const probe_vmid: u32 = 8;
+    _ = efi_vars.initDefaultSecureBootStore(
+        probe_vmid,
+        uefi_firmware.getApprovedUefiImage(),
+        uefi_firmware.getRevokedUefiImage(),
+    );
+
+    uefi_firmware.validateFullVmAdmission(probe_vmid, kind, .{}) catch |err| {
+        const reason = switch (err) {
+            error.MissingInstallerMedia => "missing-installer-media",
+            error.InsufficientVcpus => "insufficient-vcpus",
+            error.InsufficientRam => "insufficient-ram",
+            error.InsufficientDisk => "insufficient-disk",
+            error.SecureBootDisabled => "secure-boot-disabled",
+            error.Tpm2Unavailable => "tpm2-unavailable",
+            error.SecureBootRevokedInDbx => "secure-boot-dbx-revoked",
+            error.SecureBootNotInAllowedDb => "secure-boot-untrusted-image",
+            error.SecureBootEmptyTrustDb => "secure-boot-empty-db",
+        };
+        write("\r\nFull-VM admission rejected for profile '");
+        write(kind.label());
+        write("': ");
+        write(reason);
+        write("\r\n");
+        var reject_buf: [256]u8 = undefined;
+        const reject_pfx = "varde_shell: vm-create-full rejected profile=";
+        const reject_mid = " reason=";
+        const reject_len = reject_pfx.len + kind.label().len + reject_mid.len + reason.len + 1;
+        if (reject_len <= reject_buf.len) {
+            var off: usize = 0;
+            @memcpy(reject_buf[off .. off + reject_pfx.len], reject_pfx);
+            off += reject_pfx.len;
+            @memcpy(reject_buf[off .. off + kind.label().len], kind.label());
+            off += kind.label().len;
+            @memcpy(reject_buf[off .. off + reject_mid.len], reject_mid);
+            off += reject_mid.len;
+            @memcpy(reject_buf[off .. off + reason.len], reason);
+            off += reason.len;
+            reject_buf[off] = '\n';
+            emitCom1Line(reject_buf[0 .. off + 1]);
+        }
+        return;
+    };
+
+    var name_buf: [32]u8 = @splat(0);
+    const label = kind.label();
+    @memcpy(name_buf[0..label.len], label);
+    const container_buf: [32]u8 = "uefi-ovmf".* ++ @as([23]u8, @splat(0));
+
+    const online_cpus = smp.getCpuCount();
+    const target_core: u8 = if (online_cpus > 1) 1 else 0;
+    const id = microvm_registry.createWithAffinity(name_buf, container_buf, 16 * 256, 1, 0, 0, 0, 0, target_core) orelse {
+        write("\r\nError: MicroVM registry full.\r\n");
+        return;
+    };
+
+    if (!builtin.is_test) {
+        const build_options = @import("build_options");
+        if (build_options.vmm_active) {
+            const vmx = @import("../arch/x86_64/vmx.zig");
+            if (microvm_registry.findMutable(id)) |inst| {
+                vmx.stageUefiFullVmForInstance(inst, false) catch {
+                    _ = microvm_registry.delete(id);
+                    write("\r\nError: failed to stage UEFI Full-VM.\r\n");
+                    return;
+                };
+                if (microvm_registry.start(id)) {
+                    const scheduler = @import("scheduler.zig");
+                    _ = scheduler.spawnWithVmx(null, true, inst.instance_id, 0, target_core) catch {
+                        _ = microvm_registry.fail(id);
+                    };
+                    @import("../vmm/microvm_bridge.zig").broadcastTelemetryFromContext();
+                }
+            }
+        } else {
+            _ = microvm_registry.start(id);
+        }
+    } else {
+        if (microvm_registry.findMutable(id)) |inst| {
+            inst.vm_profile = .uefi_fullvm;
+        }
+        _ = microvm_registry.start(id);
+    }
+
+    write("\r\nAdmitted and started UEFI Full-VM '");
+    write(label);
+    write("' (ID=");
+    writeDec(id);
+    write(")\r\n");
+    emitCom1Kv("varde_shell: vm-create-full admitted profile=", label);
+}
+
+fn cmdVmReboot(args: []const u8) void {
+    const id = parseU32(args) orelse {
+        write("\r\nUsage: vm-reboot <id>\r\n");
+        return;
+    };
+    if (microvm_registry.requestReboot(id)) {
+        write("\r\nWarm reboot requested for VM ");
+        writeDec(id);
+        write(".\r\n");
+        emitCom1Line("varde_shell: vm-reboot requested\n");
+    } else {
+        write("\r\nError: VM not running or invalid ID.\r\n");
+    }
+}
+
+fn cmdVmSend(args: []const u8) void {
+    const trimmed = trimSpaces(args);
+    if (trimmed.len == 0) {
+        write("\r\nUsage: vm-send <id> <cmd>\r\n");
+        return;
+    }
+    var p1: usize = 0;
+    while (p1 < trimmed.len and trimmed[p1] != ' ') : (p1 += 1) {}
+    const id = parseU32(trimmed[0..p1]) orelse {
+        write("\r\nUsage: vm-send <id> <cmd>\r\n");
+        return;
+    };
+    const payload = trimSpaces(trimmed[p1..]);
+    if (payload.len == 0) {
+        write("\r\nUsage: vm-send <id> <cmd>\r\n");
+        return;
+    }
+    for (payload) |ch| {
+        _ = microvm_registry.injectConsoleInput(id, ch);
+    }
+    _ = microvm_registry.injectConsoleInput(id, '\n');
+    write("\r\nSent command to VM ");
+    writeDec(id);
+    write(".\r\n");
 }
 
 fn cmdVmAction(args: []const u8, action: enum { start, stop, delete }, cmd_name: []const u8) void {
@@ -615,10 +798,22 @@ pub fn dispatch(raw_cmd: []const u8) void {
     } else if (strEq(cmd, "vms") or strEq(cmd, "vmlist")) {
         emitMilestone("vmlist");
         cmdVms();
+    } else if (strEq(cmd, "vm-create-full") or startsWith(cmd, "vm-create-full ")) {
+        emitMilestone("vm-create-full");
+        const args = if (cmd.len > 14) cmd[14..] else "";
+        cmdVmCreateFull(args);
     } else if (strEq(cmd, "vm-create") or startsWith(cmd, "vm-create ")) {
         emitMilestone("vm-create");
         const args = if (cmd.len > 9) cmd[9..] else "";
         cmdVmCreate(args);
+    } else if (strEq(cmd, "vm-reboot") or startsWith(cmd, "vm-reboot ")) {
+        emitMilestone("vm-reboot");
+        const args = if (cmd.len > 9) trimSpaces(cmd[9..]) else "";
+        cmdVmReboot(args);
+    } else if (strEq(cmd, "vm-send") or startsWith(cmd, "vm-send ")) {
+        emitMilestone("vm-send");
+        const args = if (cmd.len > 7) trimSpaces(cmd[7..]) else "";
+        cmdVmSend(args);
     } else if (strEq(cmd, "vm-start") or startsWith(cmd, "vm-start ")) {
         emitMilestone("vm-start");
         const args = if (cmd.len > 8) trimSpaces(cmd[8..]) else "";

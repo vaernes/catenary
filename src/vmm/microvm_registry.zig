@@ -7,9 +7,15 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const pmm = @import("../kernel/pmm.zig");
+const pc_platform = @import("pc_platform.zig");
 
 pub const MIN_INSTANCES: usize = 8;
 pub const TARGET_INSTANCES: usize = 8;
+
+pub const VmProfile = enum(u8) {
+    linux_microvm = 0,
+    uefi_fullvm = 1,
+};
 
 pub const MicrovmState = enum(u8) {
     empty = 0,
@@ -145,6 +151,7 @@ pub const VmUartState = struct {
 pub const VmPciState = struct {
     config_address: u32 = 0,
     root_command: u16 = 0,
+    dev_commands: [pc_platform.PCI_MAX_BUS0_DEVS]u16 = @splat(0),
 
     pub fn reset(self: *VmPciState) void {
         self.* = .{};
@@ -169,6 +176,8 @@ pub const VirtualDeviceState = struct {
     lapic: VmLapicState = .{},
     uart: VmUartState = .{},
     pci: VmPciState = .{},
+    rtc: pc_platform.VmRtcState = .{},
+    gop: pc_platform.VmGopState = .{},
     misc: VmMiscState = .{},
 
     pub fn reset(self: *VirtualDeviceState) void {
@@ -177,6 +186,8 @@ pub const VirtualDeviceState = struct {
         self.lapic.reset();
         self.uart.reset();
         self.pci.reset();
+        self.rtc.reset();
+        self.gop.reset();
         self.misc.reset();
     }
 };
@@ -189,6 +200,8 @@ pub const Instance = struct {
     in_use: bool = false,
     instance_id: u32 = 0,
     state: MicrovmState = .empty,
+    vm_profile: VmProfile = .linux_microvm,
+    reboot_requested: bool = false,
     name: [32]u8 = @splat(0),
     container: [32]u8 = @splat(0),
     /// Guest RAM size in 4 KiB pages (e.g. 16384 = 64 MiB).
@@ -219,6 +232,8 @@ pub const Instance = struct {
         self.in_use = false;
         self.instance_id = 0;
         self.state = .empty;
+        self.vm_profile = .linux_microvm;
+        self.reboot_requested = false;
         @memset(&self.name, 0);
         @memset(&self.container, 0);
         self.mem_pages = 0;
@@ -399,6 +414,17 @@ pub fn stop(instance_id: u32) bool {
     defer releaseLock(flags);
     const slot = findMutableInternal(instance_id) orelse return false;
     return requestStopState(&slot.state);
+}
+
+/// Request that a running instance warm-reboot at its next VM-exit check.
+pub fn requestReboot(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    if (slot.state != .running) return false;
+    slot.reboot_requested = true;
+    return true;
 }
 
 fn completeStopState(state: *MicrovmState) bool {

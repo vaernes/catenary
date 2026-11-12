@@ -165,4 +165,23 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("clear");
     try testing.expectEqualStrings("varde_shell: executed 'clear'\n", getMilestone());
     try testing.expectEqual(@as(usize, 0), varde_shell.history_pos);
+
+    // 15. Phase 11 Full-VM admission gate & warm reboot commands
+    varde_shell.dispatch("vm-create-full win11-26h2");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-create-full'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "missing-installer-media") != null);
+
+    varde_shell.dispatch("vm-create-full uefi-revoked");
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "secure-boot-dbx-revoked") != null);
+
+    varde_shell.dispatch("vm-create-full uefi-test");
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Admitted and started UEFI Full-VM 'uefi-test'") != null);
+
+    varde_shell.dispatch("vm-send 2 disk-write");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-send'\n", getMilestone());
+    try testing.expect(microvm_registry.hasConsoleInput(2));
+
+    varde_shell.dispatch("vm-reboot 2");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-reboot'\n", getMilestone());
+    try testing.expect(microvm_registry.lookup(2).?.reboot_requested);
 }
