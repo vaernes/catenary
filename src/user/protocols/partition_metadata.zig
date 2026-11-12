@@ -7,6 +7,16 @@ pub const JOURNAL_LBA: u64 = PART_BASE_LBA - 1;
 pub const VM_DISK_BASE_LBA: u64 = PART_BASE_LBA + @as(u64, MAX_PARTS) * PART_SECTORS;
 pub const VM_DISK_SECTORS: u64 = PART_SECTORS;
 pub const MAX_VM_DISKS: u32 = 8;
+pub const MAX_VM_SNAPSHOTS: usize = 4;
+pub const VM_SNAPSHOT_BASE_LBA: u64 = VM_DISK_BASE_LBA + @as(u64, MAX_VM_DISKS) * VM_DISK_SECTORS;
+
+pub fn vmSnapshotStartLba(vmid: u32, generation: u32) ?u64 {
+    if (vmid == 0 or vmid > MAX_VM_DISKS) return null;
+    if (generation == 0 or generation > MAX_VM_SNAPSHOTS) return null;
+    const vm_offset = @as(u64, vmid - 1) * @as(u64, MAX_VM_SNAPSHOTS) * VM_DISK_SECTORS;
+    const snap_offset = @as(u64, generation - 1) * VM_DISK_SECTORS;
+    return VM_SNAPSHOT_BASE_LBA + vm_offset + snap_offset;
+}
 pub const PART_MAGIC: u64 = 0x5452_4150_524E_524E;
 pub const PART_VERSION: u32 = 2;
 pub const PART_MAGIC_V2: u64 = 0x3252_4150_524E_524E;

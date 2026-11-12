@@ -1,35 +1,30 @@
-# Project: Catenary OS - Phase 11 (Direct Type-1 Generic UEFI Full-VM Platform)
+# Project: Catenary OS - Phase 12 (Coordinated VM Snapshots & Crash-Consistent Recovery)
 
-> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 11 is complete against its QEMU scope, based on live direct UEFI guest firmware execution, ACPI 2.0+ platform tables, multi-device PCI bus 0 enumeration, GOP framebuffer, per-VM virtual TPM 2.0 CRB, persistent EFI variable store with Secure Boot verification, Virtio-Blk FUA write+flush, warm reboot lifecycle survival, and prerequisite admission rejection for unprovisioned OS media.
+> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 12 is complete against its QEMU scope, based on atomic pause/freeze vCPU synchronization, coordinated subsystem checkpoints across compute, memory, virtual devices, persistent EFI variable NVRAM, and virtual TPM 2.0 CRB, per-VM NVMe disk extent snapshot allocation in `storaged`, generation-bound rollback, and live smoke test verification.
 
 ## Architecture & Subsystems
 Catenary OS is a distributed exokernel operating system and Type-1 bare-metal hypervisor written in Zig (targeting Zig 0.17.1).
-Phase 11 introduces a direct Type-1 generic UEFI Full-VM platform hosting unassisted guest firmware and full-VM profiles directly on Intel VMX/EPT without requiring an intermediate support VM or nested hypervisor.
+Phase 12 delivers coordinated offline and crash-consistent VM snapshots and restore capabilities in accordance with Milestone V5 and Gate S1 of `docs/VIRTUALIZATION_PLAN.md`.
 
-### Key Phase 11 Subsystems and Interface Contracts:
-1. **Direct Virtual PC Platform (`src/vmm/pc_platform.zig`)**:
-   - ACPI 2.0+ standard table builder and validator: `RSDP`, `RSDT`, `XSDT`, `FADT`/`FACP`, `MADT`/`APIC`, `MCFG` (PCI Express MMCONFIG), and `TPM2` at fixed GPA `0x000E_0000`.
-   - Per-VM MC146818 CMOS/RTC emulation (`0x70`/`0x71`) tracking BCD time, daylight savings flags, and diagnostic status bytes.
-   - Multi-device PCI Bus 0 emulation: `00:00.0` Host Bridge (`8086:29C0`), `00:01.0` GOP Framebuffer (`1AF4:1111`), `00:02.0` Virtio-Net (`1AF4:1041`), and `00:03.0` Virtio-Blk (`1AF4:1042`).
-   - Linear Graphics Output Protocol (GOP) Framebuffer MMIO region at GPA `0xFD00_0000` (1024×768×32, 3072 KiB).
-2. **Persistent EFI Variable Store & Secure Boot (`src/vmm/efi_vars.zig`)**:
-   - MMIO-accessible EFI Variable store at GPA `0xFE00_2000` supporting status/command/data register protocol.
-   - Non-volatile NVRAM state tracking `boot_order`, `boot0001`, `boot_count`, `generation`, and CRC32 payload verification.
-   - SHA-256 authenticated boot-image verification: authenticates against allowed `db`, rejects revoked hashes in `dbx`, and rejects unsigned/empty trust databases.
-3. **Per-VM Virtual TPM 2.0 CRB Device (`src/vmm/vtpm.zig`)**:
-   - Command Response Buffer (CRB) MMIO interface at GPA `0xFED4_0000`.
-   - Implements `TPM2_Startup`, `TPM2_SelfTest`, `TPM2_GetCapability`, `TPM2_PCR_Extend` (SHA-256), `TPM2_PCR_Read`, `TPM2_Create` (sealing data to PCR[0]), and `TPM2_Unseal` (enforcing measurement policy matches, returning `TPM_RC_POLICY_FAIL` on mismatch).
-   - Non-volatile monotonic counter persistent across VM lifecycles.
-4. **Full-VM Profile Admission & 64-Bit Direct UEFI Guest Firmware (`src/vmm/uefi_firmware.zig`)**:
-   - Admission rules (`validateFullVmAdmission`) enforcing CPU/RAM/disk/installer media prerequisites (rejects `win11-26h2` and `ubuntu-26.04` if unprovisioned; rejects `uefi-revoked` in `dbx`; admits `uefi-test`).
-   - Reset vector ROM at `0xFFF0_0000` jumping to 64-bit direct UEFI firmware at `0x0010_0000`.
-   - Firmware validates ACPI tables, enumerates PCI bus 0 devices, paints GOP framebuffer banner, exercises TPM 2.0 startup/extend/seal/unseal, persists EFI `boot_count`, performs Virtio-Blk FUA writes, survives warm reboot, and verifies NVMe extent readback.
-5. **Varde Shell & Lifecycle Controls (`src/kernel/varde_shell.zig`, `src/arch/x86_64/vmx.zig`)**:
-   - Shell commands: `vm-create-full <profile>`, `vm-reboot <id>`, and `vm-send <id> <cmd>`.
-   - VMX VM-exit dispatching to per-VM PCI config, RTC, and MMIO interceptors.
-   - Warm reboot lifecycle preserving NVRAM and disk extents while resetting registers, EPT guest state, and vCPU control structures.
+### Key Phase 12 Subsystems and Interface Contracts:
+1. **Snapshot Manifest & State Store (`src/vmm/vm_snapshot.zig`)**:
+   - `SnapshotManifest` binding `magic = 0x534E_4150_524E_524E` ("SNAPRNRN"), generation, timestamp TSC, guest vCPU registers, virtual device state, EFI variable store CRC32 and generation, vTPM PCR[0] bank digest and monotonic counter, and disk extent base LBA and sector bounds.
+   - Atomic capture (`createSnapshot`) and rollback (`restoreSnapshot`) APIs validating generation consistency.
+2. **Ring-3 `storaged` NVMe Extent Snapshot & Restore Protocol (`src/user/storaged.zig`, `src/user/protocols/storaged_protocol.zig`, `src/user/protocols/partition_metadata.zig`)**:
+   - Extended block request types: `snapshot_vm_disk = 34` and `restore_vm_disk = 35`.
+   - Layout allocation: `VM_SNAPSHOT_BASE_LBA` reserving isolated snapshot extents per VM (`MAX_VM_SNAPSHOTS = 4`) disjoint from base VM disks and host partitions.
+   - Synchronized ordered cache flushes ensuring persistence barriers before snapshot acknowledgment.
+3. **EFI Variable NVRAM & vTPM Checkpoints (`src/vmm/efi_vars.zig`, `src/vmm/vtpm.zig`)**:
+   - `checkpointStore` and `restoreStoreFromCheckpoint` preserving NVRAM payloads, generation numbers, and CRC32 integrity.
+   - `checkpointState` and `restoreStateFromCheckpoint` snapshotting PCR banks, startup states, and NV monotonic counters.
+4. **VMX Pause/Thaw & Full Register Restore (`src/arch/x86_64/vmx.zig`, `src/vmm/microvm_registry.zig`)**:
+   - `pause_requested` and `is_paused` flags checked on VM-exit.
+   - `restoreVmRegistersFromSnapshot` restoring RIP, RSP, RFLAGS, and CR3 directly into VMCS and guest structures.
+5. **Varde Shell & Operator Commands (`src/kernel/varde_shell.zig`)**:
+   - `vm-snapshot <id> [label]`: Triggers coordinated freeze and snapshot generation capture.
+   - `vm-restore <id> <generation>`: Rolls back memory, registers, disk extent, NVRAM, and TPM to specified generation.
 6. **Automated Verification Harness (`test_qemu.sh`)**:
-   - Acceptance profile `SMOKE_PROFILE=phase11` exercising prerequisite admission rejection, dbx rejection, admitted VM boot, TPM 2.0 measurement, Virtio-Blk FUA write+flush, warm reboot survival, and post-reboot disk extent readback.
+   - Acceptance profile `SMOKE_PROFILE=phase12` verifying direct UEFI VM launch, Virtio-Blk FUA disk write, snapshot creation, state restore to generation 1, and post-restore disk extent readback.
 
 ---
 

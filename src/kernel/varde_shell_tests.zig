@@ -184,4 +184,13 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("vm-reboot 2");
     try testing.expectEqualStrings("varde_shell: executed 'vm-reboot'\n", getMilestone());
     try testing.expect(microvm_registry.lookup(2).?.reboot_requested);
+
+    // 16. Phase 12 Coordinated VM Snapshot & Restore commands
+    varde_shell.dispatch("vm-snapshot 2 snap-gold");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-snapshot'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Coordinated snapshot created for VM 2") != null);
+
+    varde_shell.dispatch("vm-restore 2 1");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-restore'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "VM 2 restored to generation 1.") != null);
 }

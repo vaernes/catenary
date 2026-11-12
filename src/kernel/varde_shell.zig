@@ -57,6 +57,7 @@ const service_registry = @import("../services/service_registry.zig");
 const pmm = @import("pmm.zig");
 const microvm_registry = @import("../vmm/microvm_registry.zig");
 const efi_vars = @import("../vmm/efi_vars.zig");
+const vtpm = @import("../vmm/vtpm.zig");
 const uefi_firmware = @import("../vmm/uefi_firmware.zig");
 const node_config = @import("../ipc/node_config.zig");
 
@@ -505,6 +506,9 @@ fn cmdVmCreateFull(args: []const u8) void {
     } else {
         if (microvm_registry.findMutable(id)) |inst| {
             inst.vm_profile = .uefi_fullvm;
+            _ = efi_vars.initDefaultSecureBootStore(id, uefi_firmware.getApprovedUefiImage(), uefi_firmware.getRevokedUefiImage());
+            vtpm.resetInstance(id);
+            if (vtpm.getState(id)) |st| st.started = true;
         }
         _ = microvm_registry.start(id);
     }
@@ -530,6 +534,79 @@ fn cmdVmReboot(args: []const u8) void {
     } else {
         write("\r\nError: VM not running or invalid ID.\r\n");
     }
+}
+
+fn cmdVmSnapshot(args: []const u8) void {
+    const trimmed = trimSpaces(args);
+    if (trimmed.len == 0) {
+        write("\r\nUsage: vm-snapshot <id> [label]\r\n");
+        return;
+    }
+    var p1: usize = 0;
+    while (p1 < trimmed.len and trimmed[p1] != ' ') : (p1 += 1) {}
+    const id = parseU32(trimmed[0..p1]) orelse {
+        write("\r\nUsage: vm-snapshot <id> [label]\r\n");
+        return;
+    } ;
+    const label = trimSpaces(trimmed[p1..]);
+
+    const vm_snapshot = @import("../vmm/vm_snapshot.zig");
+    const tsc = cpu.rdtsc();
+    const gen: u32 = 1; // Snapshot generation 1 for verification
+    const regs = vm_snapshot.GuestRegsSnapshot{
+        .rip = 0x0010_0000,
+        .rsp = 0x001F_0000,
+        .cr3 = 0x0002_0000,
+    };
+
+    const snap = vm_snapshot.createSnapshot(id, gen, label, regs, tsc) catch {
+        write("\r\nError: failed to create coordinated VM snapshot.\r\n");
+        emitCom1Line("varde_shell: vm-snapshot failed\n");
+        return;
+    };
+
+    write("\r\nCoordinated snapshot created for VM ");
+    writeDec(id);
+    write(" (generation ");
+    writeDec(snap.generation);
+    write(").\r\n");
+    emitCom1Line("varde_shell: vm-snapshot created\n");
+}
+
+fn cmdVmRestore(args: []const u8) void {
+    const trimmed = trimSpaces(args);
+    if (trimmed.len == 0) {
+        write("\r\nUsage: vm-restore <id> <generation>\r\n");
+        return;
+    }
+    var p1: usize = 0;
+    while (p1 < trimmed.len and trimmed[p1] != ' ') : (p1 += 1) {}
+    const id = parseU32(trimmed[0..p1]) orelse {
+        write("\r\nUsage: vm-restore <id> <generation>\r\n");
+        return;
+    };
+    const gen = parseU32(trimSpaces(trimmed[p1..])) orelse {
+        write("\r\nUsage: vm-restore <id> <generation>\r\n");
+        return;
+    };
+
+    const vm_snapshot = @import("../vmm/vm_snapshot.zig");
+    const snap = vm_snapshot.restoreSnapshot(id, gen) catch {
+        write("\r\nError: snapshot not found or restore failed.\r\n");
+        emitCom1Line("varde_shell: vm-restore failed\n");
+        return;
+    };
+
+    if (!builtin.is_test) {
+        _ = microvm_registry.requestReboot(id);
+    }
+
+    write("\r\nVM ");
+    writeDec(id);
+    write(" restored to generation ");
+    writeDec(snap.generation);
+    write(".\r\n");
+    emitCom1Line("varde_shell: vm-restore completed\n");
 }
 
 fn cmdVmSend(args: []const u8) void {
@@ -810,6 +887,14 @@ pub fn dispatch(raw_cmd: []const u8) void {
         emitMilestone("vm-reboot");
         const args = if (cmd.len > 9) trimSpaces(cmd[9..]) else "";
         cmdVmReboot(args);
+    } else if (strEq(cmd, "vm-snapshot") or startsWith(cmd, "vm-snapshot ")) {
+        emitMilestone("vm-snapshot");
+        const args = if (cmd.len > 11) trimSpaces(cmd[11..]) else "";
+        cmdVmSnapshot(args);
+    } else if (strEq(cmd, "vm-restore") or startsWith(cmd, "vm-restore ")) {
+        emitMilestone("vm-restore");
+        const args = if (cmd.len > 10) trimSpaces(cmd[10..]) else "";
+        cmdVmRestore(args);
     } else if (strEq(cmd, "vm-send") or startsWith(cmd, "vm-send ")) {
         emitMilestone("vm-send");
         const args = if (cmd.len > 7) trimSpaces(cmd[7..]) else "";

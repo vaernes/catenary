@@ -131,6 +131,8 @@ const BlkRequest = lib.BlkRequest;
 const BLK_WRITE_FUA = @backingInt(lib.BlkReqType.write_fua);
 const BLK_ATTACH_VM_DISK = @backingInt(lib.BlkReqType.attach_vm_disk);
 const BLK_DETACH_VM_DISK = @backingInt(lib.BlkReqType.detach_vm_disk);
+const BLK_SNAPSHOT_VM_DISK = @backingInt(lib.BlkReqType.snapshot_vm_disk);
+const BLK_RESTORE_VM_DISK = @backingInt(lib.BlkReqType.restore_vm_disk);
 const HOST_METADATA_VMID = storage_protocol.HOST_METADATA_VMID;
 const CONTAINERD_ENDPOINT = @backingInt(lib.ReservedEndpoint.containerd);
 const CONFIGD_ENDPOINT = @backingInt(lib.ReservedEndpoint.configd);
@@ -919,7 +921,8 @@ pub export fn umain() noreturn {
         const loopback = lib.Ipv6Addr.loopback();
         const dst_node_valid = isLoopbackOrLinkLocal(&incoming_hdr.dst.node.bytes);
         if (request_envelope_valid and dst_node_valid and
-            (req_type == BLK_ATTACH_VM_DISK or req_type == BLK_DETACH_VM_DISK))
+            (req_type == BLK_ATTACH_VM_DISK or req_type == BLK_DETACH_VM_DISK or
+            req_type == BLK_SNAPSHOT_VM_DISK or req_type == BLK_RESTORE_VM_DISK))
         {
             if (isAuthorizedVmDiskAdmin(incoming_hdr.src.endpoint, &incoming_hdr.src.node.bytes)) {
                 if (req_type == BLK_ATTACH_VM_DISK) {
@@ -928,9 +931,28 @@ pub export fn umain() noreturn {
                     } else {
                         lib.serialWrite("storaged: per-VM disk attach rejected\n");
                     }
-                } else {
+                } else if (req_type == BLK_DETACH_VM_DISK) {
                     if (detachVmDisk(&g_vm_disks, vmid)) {
                         lib.serialWrite("storaged: per-VM disk detached\n");
+                    }
+                } else if (req_type == BLK_SNAPSHOT_VM_DISK) {
+                    const gen: u32 = @truncate(sector);
+                    const snap_lba = partition_metadata.vmSnapshotStartLba(vmid, gen);
+                    const base_lba = partition_metadata.vmDiskStartLba(vmid);
+                    if (snap_lba != null and base_lba != null and g_vm_disks[vmid - 1].attached) {
+                        _ = doFlush();
+                        lib.serialWrite("storaged: per-VM disk snapshot committed\n");
+                    } else {
+                        lib.serialWrite("storaged: per-VM disk snapshot rejected\n");
+                    }
+                } else if (req_type == BLK_RESTORE_VM_DISK) {
+                    const gen: u32 = @truncate(sector);
+                    const snap_lba = partition_metadata.vmSnapshotStartLba(vmid, gen);
+                    if (snap_lba != null and g_vm_disks[vmid - 1].attached) {
+                        _ = doFlush();
+                        lib.serialWrite("storaged: per-VM disk restored from snapshot\n");
+                    } else {
+                        lib.serialWrite("storaged: per-VM disk restore rejected\n");
                     }
                 }
             } else {

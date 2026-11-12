@@ -3275,6 +3275,18 @@ fn performWarmReboot(inst: *microvm_registry.Instance, regs: *GuestRegs) void {
     smp.serialRelease();
 }
 
+pub fn restoreVmRegistersFromSnapshot(inst: *microvm_registry.Instance, snap: *const @import("../../vmm/vm_snapshot.zig").SnapshotManifest) void {
+    if (inst.vmcs_phys) |vmcs| {
+        _ = vmptrld(vmcs);
+        _ = vmwrite(VMCS_GUEST_RIP, snap.guest_regs.rip);
+        _ = vmwrite(VMCS_GUEST_RSP, snap.guest_regs.rsp);
+        _ = vmwrite(VMCS_GUEST_RFLAGS, snap.guest_regs.rflags);
+        if (snap.guest_regs.cr3 != 0) {
+            _ = vmwrite(VMCS_GUEST_CR3, snap.guest_regs.cr3);
+        }
+    }
+}
+
 pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
     const tsc_end = cpu.rdtsc();
     const core_id = smp.getCurrentCpuId();
@@ -3340,6 +3352,16 @@ pub export fn catenary_vmx_vmexit_bridge(regs: *GuestRegs) u8 {
                 }
                 if (inst.reboot_requested) {
                     performWarmReboot(inst, regs);
+                }
+                if (inst.pause_requested) {
+                    inst.is_paused = true;
+                    inst.state = .paused;
+                    smp.serialAcquire();
+                    serialWrite("VMX: VM ");
+                    printDec(inst.instance_id);
+                    serialWrite(" execution paused\n");
+                    smp.serialRelease();
+                    return 0; // Suspend VM resume
                 }
             }
         }

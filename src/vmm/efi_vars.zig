@@ -127,7 +127,28 @@ pub const VmEfiVarStore = struct {
     }
 };
 
+pub const MAX_SNAPSHOTS: usize = 4;
+
 var stores: [MAX_VMS]VmEfiVarStore = @splat(.{});
+var store_snapshots: [MAX_VMS][MAX_SNAPSHOTS]VmEfiVarStore = @splat(@splat(.{}));
+
+pub fn checkpointStore(vmid: u32, generation: u32) bool {
+    const idx = slotIndex(vmid) orelse return false;
+    if (generation == 0 or generation > MAX_SNAPSHOTS) return false;
+    const snap_idx = @as(usize, generation - 1);
+    store_snapshots[idx][snap_idx] = stores[idx];
+    return true;
+}
+
+pub fn restoreStoreFromCheckpoint(vmid: u32, generation: u32) bool {
+    const idx = slotIndex(vmid) orelse return false;
+    if (generation == 0 or generation > MAX_SNAPSHOTS) return false;
+    const snap_idx = @as(usize, generation - 1);
+    const snap = store_snapshots[idx][snap_idx];
+    if (!snap.initialized) return false;
+    stores[idx] = snap;
+    return true;
+}
 
 fn slotIndex(vmid: u32) ?usize {
     if (vmid == 0 or vmid > MAX_VMS) return null;

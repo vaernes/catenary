@@ -84,6 +84,16 @@ case "${SMOKE_PROFILE}" in
         DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
         DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1"
         ;;
+    phase12)
+        if [ "${SMP:-2}" -lt 2 ]; then
+            SMP=2
+        fi
+        DEFAULT_TIMEOUT_SECS=180
+        DEFAULT_ZIG_BUILD_ARGS="-Dserial_syscall_keepalive=false -Dvmm_active=true -Dvmm_launch_linux=true"
+        DEFAULT_CORE_PATTERNS="booting...;smp: AP core;selftest: PASS paging.canonical;Timer initialized.;inputd: registered at endpoint 8;windowd: registered at endpoint 9;varde_shell: vm-create-full admitted profile=uefi-test;VMX: staged UEFI Full-VM for VM 2 warm_reboot=0;uefi_vm: ready;uefi_vm: disk FUA write+flush OK tag=CATENARY-UEFI-PERSIST;varde_shell: vm-snapshot created;varde_shell: vm-restore completed;uefi_vm: disk readback after reboot OK tag=CATENARY-UEFI-PERSIST"
+        DEFAULT_VMX_EPT_PATTERNS="VMX: initialized EPT root for VM 1;VMX: initialized EPT root for VM 2"
+        DEFAULT_VMX_LINUX_PATTERNS="VMX: launching VM 1 on core 0;VMX: launching VM 2 on core 1"
+        ;;
     no-nvme)
         NVME_DEVICE_ARGS=()
         DEFAULT_CORE_PATTERNS="booting...;selftest: PASS paging.canonical;Timer initialized.;storaged: no NVMe found; block requests will fail;containerd: block I/O FAILED"
@@ -559,6 +569,62 @@ s.close()
 '
 }
 
+inject_ui_phase12_keys() {
+    python3 -c '
+import socket, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect("/tmp/catenary_qemu_mon.sock")
+time.sleep(0.2)
+
+def send_keys(keys, delay=0.08):
+    for k in keys:
+        s.sendall(f"sendkey {k}\n".encode())
+        time.sleep(delay)
+
+def send_command(command, delay=0.05):
+    special = {" ": "spc", "-": "minus", ".": "dot", ":": "shift-semicolon"}
+    send_keys([special.get(ch, ch) for ch in command] + ["ret"], delay)
+
+def wait_for(marker, count=1, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with open("qemu_serial.log", "r", errors="replace") as log:
+            if log.read().count(marker) >= count:
+                return
+        time.sleep(0.25)
+    raise SystemExit(f"Missing Phase 12 milestone ({count}x): {marker}")
+
+# 1. Switch to Varde Shell (F4)
+send_keys(["f4"], 0.2)
+
+# 2. Create and launch direct UEFI Full-VM (uefi-test)
+send_command("vm-create-full uefi-test")
+wait_for("varde_shell: vm-create-full admitted profile=uefi-test", 1)
+wait_for("uefi_vm: ready", 1, 60)
+wait_for("storaged: per-VM disk attached", 2, 30)
+
+# 3. Send disk-write command to VM 2 via vm-send
+send_command("vm-send 2 disk-write")
+wait_for("uefi_vm: disk FUA write+flush OK tag=CATENARY-UEFI-PERSIST", 1, 30)
+
+# 4. Create coordinated snapshot 1 for VM 2
+send_command("vm-snapshot 2 snap-phase12")
+wait_for("varde_shell: vm-snapshot created", 1, 30)
+
+# 5. Restore VM 2 to generation 1
+send_command("vm-restore 2 1")
+wait_for("varde_shell: vm-restore completed", 1, 30)
+wait_for("uefi_vm: ready", 2, 30)
+
+# 6. Verify NVMe disk extent and registers after restore
+send_command("vm-send 2 disk-verify")
+wait_for("uefi_vm: disk readback after reboot OK tag=CATENARY-UEFI-PERSIST", 1, 30)
+
+s.close()
+'
+}
+
 echo "[+] Waiting for all milestones (timeout ${TIMEOUT_SECS}s)..."
 ok=0
 required_patterns=()
@@ -611,6 +677,13 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
             if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "kernel_control: staged MicroVM launched via DIPC"; then
                 echo "[+] Injecting Phase 11 Full-VM Admission, Secure Boot & Warm Reboot keystrokes via QEMU monitor..."
                 inject_ui_phase11_keys
+                ui_keys_injected=1
+            fi
+        fi
+        if [ "${SMOKE_PROFILE}" = "phase12" ] && [ "${ui_keys_injected}" -eq 0 ]; then
+            if pattern_seen "windowd: registered at endpoint 9" && pattern_seen "inputd: registered at endpoint 8" && pattern_seen "kernel_control: staged MicroVM launched via DIPC"; then
+                echo "[+] Injecting Phase 12 Coordinated VM Snapshot & Restore keystrokes via QEMU monitor..."
+                inject_ui_phase12_keys
                 ui_keys_injected=1
             fi
         fi

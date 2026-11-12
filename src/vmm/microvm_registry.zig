@@ -25,6 +25,7 @@ pub const MicrovmState = enum(u8) {
     deleted = 4,
     stopping = 5,
     failed = 6,
+    paused = 7,
 };
 
 // ---------------------------------------------------------------------------
@@ -225,6 +226,9 @@ pub const Instance = struct {
     exit_count: u64 = 0,
     /// Linux 64-bit boot protocol RSI parameter (pointer to struct boot_params GPA)
     launch_rsi: u64 = 0,
+    /// Pause request flag for snapshot/checkpoint capture
+    pause_requested: bool = false,
+    is_paused: bool = false,
     /// Per-instance emulated device registers
     devices: VirtualDeviceState = .{},
 
@@ -234,6 +238,8 @@ pub const Instance = struct {
         self.state = .empty;
         self.vm_profile = .linux_microvm;
         self.reboot_requested = false;
+        self.pause_requested = false;
+        self.is_paused = false;
         @memset(&self.name, 0);
         @memset(&self.container, 0);
         self.mem_pages = 0;
@@ -424,6 +430,28 @@ pub fn requestReboot(instance_id: u32) bool {
     const slot = findMutableInternal(instance_id) orelse return false;
     if (slot.state != .running) return false;
     slot.reboot_requested = true;
+    return true;
+}
+
+pub fn requestPause(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    if (slot.state != .running) return false;
+    slot.pause_requested = true;
+    return true;
+}
+
+pub fn resumeFromPause(instance_id: u32) bool {
+    ensureInit();
+    const flags = acquireLock();
+    defer releaseLock(flags);
+    const slot = findMutableInternal(instance_id) orelse return false;
+    if (slot.state != .paused and !slot.is_paused) return false;
+    slot.pause_requested = false;
+    slot.is_paused = false;
+    slot.state = .running;
     return true;
 }
 

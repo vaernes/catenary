@@ -190,7 +190,27 @@ pub const VmTpmState = struct {
     }
 };
 
+pub const MAX_SNAPSHOTS: usize = 4;
+
 var vtpm_states: [MAX_VMS]VmTpmState = @splat(.{});
+var vtpm_snapshots: [MAX_VMS][MAX_SNAPSHOTS]VmTpmState = @splat(@splat(.{}));
+
+pub fn checkpointState(vmid: u32, generation: u32) bool {
+    const idx = slotIndex(vmid) orelse return false;
+    if (generation == 0 or generation > MAX_SNAPSHOTS) return false;
+    const snap_idx = @as(usize, generation - 1);
+    vtpm_snapshots[idx][snap_idx] = vtpm_states[idx];
+    return true;
+}
+
+pub fn restoreStateFromCheckpoint(vmid: u32, generation: u32) bool {
+    const idx = slotIndex(vmid) orelse return false;
+    if (generation == 0 or generation > MAX_SNAPSHOTS) return false;
+    const snap_idx = @as(usize, generation - 1);
+    const snap = vtpm_snapshots[idx][snap_idx];
+    vtpm_states[idx] = snap;
+    return true;
+}
 
 fn slotIndex(vmid: u32) ?usize {
     if (vmid == 0 or vmid > MAX_VMS) return null;

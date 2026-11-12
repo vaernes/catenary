@@ -30,6 +30,10 @@ pub const ReqType = enum(u32) {
     attach_vm_disk = 32,
     /// Host control: detach a per-VM disk extent.
     detach_vm_disk = 33,
+    /// Host control: snapshot a per-VM disk extent at a generation (sector = generation).
+    snapshot_vm_disk = 34,
+    /// Host control: restore a per-VM disk extent from a snapshot generation (sector = generation).
+    restore_vm_disk = 35,
 };
 
 /// Block I/O request.  The physical address of the data buffer (for reads:

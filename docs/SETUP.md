@@ -37,6 +37,9 @@ SMOKE_PROFILE=phase10 ./test_qemu.sh
 # Exercise Phase 11 Direct Type-1 Generic UEFI Full-VM platform, Secure Boot dbx rejection, ACPI/PCI/GOP/TPM2 validation, and warm reboot
 SMOKE_PROFILE=phase11 ./test_qemu.sh
 
+# Exercise Phase 12 Coordinated VM Snapshots & Crash-Consistent Recovery across compute, memory, disk, NVRAM, and vTPM
+SMOKE_PROFILE=phase12 ./test_qemu.sh
+
 # Verify storage fails closed when no NVMe device is present
 SMOKE_PROFILE=no-nvme ./test_qemu.sh
 
