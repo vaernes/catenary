@@ -61,6 +61,12 @@ var g_local_netd_ready: bool = false;
 var g_netd_node_query_sent: bool = false;
 var g_netd_peer_snapshot_sent: bool = false;
 var g_discovery_ticks: u32 = 0;
+var g_local_node_id: u32 = 1;
+var g_consensus: clusterd_proto.ConsensusState = .{
+    .cluster_size = 3,
+};
+var g_election_initiated: bool = false;
+var g_consensus_ticks: u32 = 0;
 
 fn zeroResources() clusterd_proto.ResourceAdvertisement {
     return .{
@@ -539,6 +545,7 @@ fn handleNetdProtocol(
             if (msg_payload_len != @sizeOf(netd_proto.NodeAddrReply)) return;
             const reply: *align(1) const netd_proto.NodeAddrReply = @ptrFromInt(msg_payload_va);
             g_local_node = .{ .bytes = reply.addr };
+            g_local_node_id = @as(u32, g_local_node.bytes[15]);
             g_local_resources.flags |= lib.NODE_FLAG_NODE_ADDR_CONFIGURED;
             const req = netd_proto.PeerSnapshotRequest{};
             _ = sendNetdMessage(scratch_phys, scratch_va, token, .peer_snapshot_request, std.mem.asBytes(&req));
@@ -780,6 +787,65 @@ fn handleClusterdProtocol(
             _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .heartbeat_pong, std.mem.asBytes(&pong));
         },
         .heartbeat_pong => {},
+        .consensus_request_vote => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.RequestVotePayload)) return;
+            const req: *align(1) const clusterd_proto.RequestVotePayload = @ptrFromInt(msg_payload_va);
+            lib.serialWrite("clusterd: received consensus_request_vote\n");
+            const granted = g_consensus.handleVoteRequest(req, g_local_node_id);
+            if (granted) {
+                lib.serialWrite("clusterd: vote granted to candidate\n");
+            } else {
+                lib.serialWrite("clusterd: vote rejected\n");
+            }
+            const reply = clusterd_proto.RequestVoteReplyPayload{
+                .term = g_consensus.current_term,
+                .voter_node_id = g_local_node_id,
+                .vote_granted = granted,
+                .signature = @splat(0),
+            };
+            _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .consensus_request_vote_reply, std.mem.asBytes(&reply));
+        },
+        .consensus_request_vote_reply => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.RequestVoteReplyPayload)) return;
+            const reply: *align(1) const clusterd_proto.RequestVoteReplyPayload = @ptrFromInt(msg_payload_va);
+            lib.serialWrite("clusterd: received consensus_request_vote_reply\n");
+            if (g_consensus.handleVoteReply(reply)) {
+                lib.serialWrite("clusterd: consensus quorum reached; elected leader\n");
+                // Immediately broadcast initial leader heartbeat to synchronize epoch
+                const hb = clusterd_proto.ConsensusHeartbeatPayload{
+                    .term = g_consensus.current_term,
+                    .leader_node_id = g_local_node_id,
+                    .commit_index = g_consensus.commit_index,
+                    .fencing_epoch = g_consensus.fencing_epoch,
+                    .seq = 1,
+                    .signature = @splat(0),
+                };
+                for (&g_peers) |*p| {
+                    if (p.used) {
+                        _ = sendClusterdMessage(scratch_phys, scratch_va, token, p.node, .consensus_heartbeat, std.mem.asBytes(&hb));
+                    }
+                }
+            }
+        },
+        .consensus_heartbeat => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.ConsensusHeartbeatPayload)) return;
+            const hb: *align(1) const clusterd_proto.ConsensusHeartbeatPayload = @ptrFromInt(msg_payload_va);
+            if (g_consensus.handleHeartbeat(hb)) {
+                lib.serialWrite("clusterd: follower accepted leader heartbeat\n");
+                const ack = clusterd_proto.ConsensusHeartbeatReplyPayload{
+                    .term = g_consensus.current_term,
+                    .follower_node_id = g_local_node_id,
+                    .success = true,
+                    .match_index = hb.commit_index,
+                    .signature = @splat(0),
+                };
+                _ = sendClusterdMessage(scratch_phys, scratch_va, token, src_node, .consensus_heartbeat_reply, std.mem.asBytes(&ack));
+            }
+        },
+        .consensus_heartbeat_reply => {
+            if (msg_payload_len != @sizeOf(clusterd_proto.ConsensusHeartbeatReplyPayload)) return;
+            lib.serialWrite("clusterd: leader heartbeat acknowledged by peer\n");
+        },
     }
 }
 
@@ -808,8 +874,9 @@ fn dispatchDipcMessage(
     recv_va: u64,
 ) void {
     const in_header: *align(1) const lib.PageHeader = @ptrFromInt(recv_va);
-    if (isLoopback(g_local_node) and !isLoopback(in_header.dst.node)) {
+    if (isLoopback(g_local_node) and !isLoopback(in_header.dst.node) and in_header.dst.node.bytes[0] != 0xff) {
         g_local_node = in_header.dst.node;
+        g_local_node_id = @as(u32, g_local_node.bytes[15]);
         g_local_resources.flags |= lib.NODE_FLAG_NODE_ADDR_CONFIGURED;
     }
     const payload_len = @as(usize, in_header.payload_len);
@@ -879,6 +946,62 @@ pub export fn umain() noreturn {
                 _ = lib.syscall(SYS_FREE_PAGE, DIPC_RECV_VA, 0, token);
             } else {
                 _ = lib.syscall(SYS_FREE_PAGE, page_phys, 0, token);
+            }
+        }
+
+        g_consensus_ticks +%= 1;
+        if (!isLoopback(g_local_node) and g_local_node.bytes[0] != 0xff) {
+            if (!g_election_initiated) {
+                var peer_count: usize = 0;
+                for (&g_peers) |*p| {
+                    if (p.used) peer_count += 1;
+                }
+                if (peer_count > 0 and g_consensus.role == .follower) {
+                    g_election_initiated = true;
+                    g_consensus.startElection(g_local_node_id);
+                    lib.serialWrite("clusterd: consensus election started\n");
+                    const req = clusterd_proto.RequestVotePayload{
+                        .term = g_consensus.current_term,
+                        .candidate_node_id = g_local_node_id,
+                        .last_log_term = 0,
+                        .last_log_index = 0,
+                        .signature = @splat(0),
+                    };
+                    for (&g_peers) |*p| {
+                        if (p.used) {
+                            _ = sendClusterdMessage(dipc_phys, DMA_BASE_VA, token, p.node, .consensus_request_vote, std.mem.asBytes(&req));
+                        }
+                    }
+                }
+            }
+
+            if (g_consensus.role == .candidate and g_consensus_ticks % 100 == 0) {
+                const req = clusterd_proto.RequestVotePayload{
+                    .term = g_consensus.current_term,
+                    .candidate_node_id = g_local_node_id,
+                    .last_log_term = 0,
+                    .last_log_index = 0,
+                    .signature = @splat(0),
+                };
+                for (&g_peers) |*p| {
+                    if (p.used) {
+                        _ = sendClusterdMessage(dipc_phys, DMA_BASE_VA, token, p.node, .consensus_request_vote, std.mem.asBytes(&req));
+                    }
+                }
+            } else if (g_consensus.role == .leader and g_consensus_ticks % 60 == 0) {
+                const hb = clusterd_proto.ConsensusHeartbeatPayload{
+                    .term = g_consensus.current_term,
+                    .leader_node_id = g_local_node_id,
+                    .commit_index = g_consensus.commit_index,
+                    .fencing_epoch = g_consensus.fencing_epoch,
+                    .seq = g_consensus_ticks,
+                    .signature = @splat(0),
+                };
+                for (&g_peers) |*p| {
+                    if (p.used) {
+                        _ = sendClusterdMessage(dipc_phys, DMA_BASE_VA, token, p.node, .consensus_heartbeat, std.mem.asBytes(&hb));
+                    }
+                }
             }
         }
 

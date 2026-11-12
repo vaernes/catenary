@@ -208,4 +208,9 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("cluster-auth-test");
     try testing.expectEqualStrings("varde_shell: executed 'cluster-auth-test'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Cluster authentication, monotonic replay prevention & fencing epochs validated.") != null);
+
+    // 20. Phase 16 Cluster consensus, term election & quorum validation
+    varde_shell.dispatch("cluster-quorum-test");
+    try testing.expectEqualStrings("varde_shell: executed 'cluster-quorum-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Cluster consensus, term election, quorum validation & leader step-down validated.") != null);
 }

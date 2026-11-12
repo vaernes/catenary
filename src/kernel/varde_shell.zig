@@ -860,6 +860,79 @@ fn cmdClusterAuthTest() void {
     emitCom1Line("varde_shell: cluster authentication & fencing validated\n");
 }
 
+fn cmdClusterQuorumTest() void {
+    const clusterd_proto = @import("../user/protocols/clusterd_protocol.zig");
+    var state = clusterd_proto.ConsensusState{
+        .cluster_size = 3,
+    };
+    if (state.quorum() != 2) {
+        write("\r\nError: quorum calculation failed.\r\n");
+        return;
+    }
+
+    // 1. Candidate start election
+    state.startElection(1);
+    if (state.role != .candidate or state.current_term != 1 or state.votes_granted != 1 or state.hasQuorum()) {
+        write("\r\nError: candidate election initialization failed.\r\n");
+        return;
+    }
+
+    // 2. Reject stale vote reply
+    const stale_reply = clusterd_proto.RequestVoteReplyPayload{
+        .term = 0,
+        .voter_node_id = 2,
+        .vote_granted = true,
+        .signature = @splat(0),
+    };
+    if (state.handleVoteReply(&stale_reply) or state.votes_granted != 1) {
+        write("\r\nError: stale vote reply accepted.\r\n");
+        return;
+    }
+
+    // 3. Quorum-granting vote reply (2 of 3) promotes candidate to Leader
+    const valid_reply = clusterd_proto.RequestVoteReplyPayload{
+        .term = 1,
+        .voter_node_id = 2,
+        .vote_granted = true,
+        .signature = @splat(0),
+    };
+    if (!state.handleVoteReply(&valid_reply) or state.role != .leader or state.leader_node_id.? != 1) {
+        write("\r\nError: quorum vote failed to elect leader.\r\n");
+        return;
+    }
+
+    // 4. Discovering higher term in heartbeat causes step-down to follower
+    const higher_hb = clusterd_proto.ConsensusHeartbeatPayload{
+        .term = 2,
+        .leader_node_id = 3,
+        .commit_index = 0,
+        .fencing_epoch = 2,
+        .seq = 1,
+        .signature = @splat(0),
+    };
+    if (!state.handleHeartbeat(&higher_hb) or state.role != .follower or state.current_term != 2 or state.leader_node_id.? != 3) {
+        write("\r\nError: heartbeat step-down failed.\r\n");
+        return;
+    }
+
+    // 5. Candidate tie-breaking on equal terms favors higher node ID
+    state.startElection(1); // term 3, candidate 1
+    const peer_candidate_req = clusterd_proto.RequestVotePayload{
+        .term = 3,
+        .candidate_node_id = 2,
+        .last_log_term = 0,
+        .last_log_index = 0,
+        .signature = @splat(0),
+    };
+    if (!state.handleVoteRequest(&peer_candidate_req, 1) or state.role != .follower or state.voted_for.? != 2) {
+        write("\r\nError: candidate tie-break failed.\r\n");
+        return;
+    }
+
+    write("\r\nCluster consensus, term election, quorum validation & leader step-down validated.\r\n");
+    emitCom1Line("varde_shell: cluster consensus & quorum validated\n");
+}
+
 fn cmdNetStat() void {
     const addr = node_config.getLocalNode();
     write("\r\nNetwork & DIPC Router Status:\r\n");
@@ -1088,6 +1161,9 @@ pub fn dispatch(raw_cmd: []const u8) void {
     } else if (strEq(cmd, "cluster-auth-test")) {
         emitMilestone("cluster-auth-test");
         cmdClusterAuthTest();
+    } else if (strEq(cmd, "cluster-quorum-test")) {
+        emitMilestone("cluster-quorum-test");
+        cmdClusterQuorumTest();
     } else if (strEq(cmd, "net-stat")) {
         emitMilestone("net-stat");
         cmdNetStat();

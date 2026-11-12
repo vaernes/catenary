@@ -100,18 +100,23 @@ for ((i=0; i<${TIMEOUT_SECS}; i++)); do
     a_ok=0
     b_ok=0
     telem_milestone="dashd: cluster telemetry received from remote node"
+    consensus_milestone="clusterd: consensus quorum reached; elected leader"
     if grep -Fq "$milestone1" qemu_serial_A.log 2>/dev/null && grep -Fq "$milestone2" qemu_serial_B.log 2>/dev/null; then
         if grep -Fq "$telem_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$telem_milestone" qemu_serial_B.log 2>/dev/null; then
-            ok=1
-            echo "[+] PASS: Node A requested remote launch, Node B launched staged MicroVM, cross-node telemetry verified via DIPC."
-            break
+            if grep -Fq "$consensus_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$consensus_milestone" qemu_serial_B.log 2>/dev/null; then
+                ok=1
+                echo "[+] PASS: Node A requested remote launch, Node B launched staged MicroVM, cross-node telemetry & cluster consensus leader election verified via DIPC."
+                break
+            fi
         fi
     fi
     if grep -Fq "$milestone1" qemu_serial_B.log 2>/dev/null && grep -Fq "$milestone2" qemu_serial_A.log 2>/dev/null; then
         if grep -Fq "$telem_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$telem_milestone" qemu_serial_B.log 2>/dev/null; then
-            ok=1
-            echo "[+] PASS: Node B requested remote launch, Node A launched staged MicroVM, cross-node telemetry verified via DIPC."
-            break
+            if grep -Fq "$consensus_milestone" qemu_serial_A.log 2>/dev/null || grep -Fq "$consensus_milestone" qemu_serial_B.log 2>/dev/null; then
+                ok=1
+                echo "[+] PASS: Node B requested remote launch, Node A launched staged MicroVM, cross-node telemetry & cluster consensus leader election verified via DIPC."
+                break
+            fi
         fi
     fi
     sleep 1

@@ -81,6 +81,22 @@ pub const Op = enum(u16) {
     /// Heartbeat response.
     /// Payload: HeartbeatPayload.
     heartbeat_pong = 14,
+
+    /// Candidate requests vote in leader election.
+    /// Payload: RequestVotePayload.
+    consensus_request_vote = 15,
+
+    /// Response to consensus_request_vote.
+    /// Payload: RequestVoteReplyPayload.
+    consensus_request_vote_reply = 16,
+
+    /// Leader consensus heartbeat / commit sync.
+    /// Payload: ConsensusHeartbeatPayload.
+    consensus_heartbeat = 17,
+
+    /// Follower consensus heartbeat acknowledgement.
+    /// Payload: ConsensusHeartbeatReplyPayload.
+    consensus_heartbeat_reply = 18,
 };
 
 /// Header for clusterd service-to-service messages (not kernel_control messages).
@@ -291,6 +307,139 @@ pub fn validateMessageReplay(
     }
 }
 
+pub const ConsensusRole = enum(u16) {
+    follower = 0,
+    candidate = 1,
+    leader = 2,
+    quarantined = 3,
+};
+
+pub const RequestVotePayload = extern struct {
+    term: u64,
+    candidate_node_id: u32,
+    _pad0: u32 = 0,
+    last_log_term: u64,
+    last_log_index: u64,
+    signature: [32]u8,
+};
+
+pub const RequestVoteReplyPayload = extern struct {
+    term: u64,
+    voter_node_id: u32,
+    vote_granted: bool,
+    _pad: [3]u8 = @splat(0),
+    signature: [32]u8,
+};
+
+pub const ConsensusHeartbeatPayload = extern struct {
+    term: u64,
+    leader_node_id: u32,
+    commit_index: u32,
+    fencing_epoch: u64,
+    seq: u64,
+    signature: [32]u8,
+};
+
+pub const ConsensusHeartbeatReplyPayload = extern struct {
+    term: u64,
+    follower_node_id: u32,
+    success: bool,
+    _pad: [3]u8 = @splat(0),
+    match_index: u32,
+    signature: [32]u8,
+};
+
+pub const ConsensusState = struct {
+    role: ConsensusRole = .follower,
+    current_term: u64 = 0,
+    voted_for: ?u32 = null,
+    leader_node_id: ?u32 = null,
+    cluster_size: u32 = 3,
+    votes_granted: u32 = 0,
+    commit_index: u32 = 0,
+    fencing_epoch: u64 = 0,
+    timer_ticks: u32 = 0,
+
+    pub fn quorum(self: *const ConsensusState) u32 {
+        return (self.cluster_size / 2) + 1;
+    }
+
+    pub fn hasQuorum(self: *const ConsensusState) bool {
+        return self.votes_granted >= self.quorum();
+    }
+
+    pub fn startElection(self: *ConsensusState, local_id: u32) void {
+        self.role = .candidate;
+        self.current_term += 1;
+        self.voted_for = local_id;
+        self.votes_granted = 1; // self vote
+        self.leader_node_id = null;
+        self.timer_ticks = 0;
+    }
+
+    pub fn handleVoteReply(self: *ConsensusState, reply: *align(1) const RequestVoteReplyPayload) bool {
+        if (reply.term > self.current_term) {
+            self.current_term = reply.term;
+            self.role = .follower;
+            self.voted_for = null;
+            self.votes_granted = 0;
+            return false;
+        }
+        if (self.role == .candidate and reply.term == self.current_term and reply.vote_granted) {
+            self.votes_granted += 1;
+            if (self.hasQuorum()) {
+                self.role = .leader;
+                self.leader_node_id = self.voted_for;
+                self.fencing_epoch += 1; // advance fencing epoch on new leadership
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pub fn handleVoteRequest(self: *ConsensusState, req: *align(1) const RequestVotePayload, _: u32) bool {
+        if (req.term < self.current_term) return false;
+        if (req.term > self.current_term) {
+            self.current_term = req.term;
+            self.role = .follower;
+            self.voted_for = null;
+            self.votes_granted = 0;
+        }
+        // If equal term and both are candidates, tie-break in favor of higher candidate_node_id
+        if (self.role == .candidate and req.term == self.current_term and self.voted_for != null) {
+            if (req.candidate_node_id > self.voted_for.?) {
+                self.role = .follower;
+                self.voted_for = req.candidate_node_id;
+                self.votes_granted = 0;
+                self.timer_ticks = 0;
+                return true;
+            }
+        }
+        if (self.voted_for == null or self.voted_for.? == req.candidate_node_id) {
+            self.voted_for = req.candidate_node_id;
+            self.timer_ticks = 0;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn handleHeartbeat(self: *ConsensusState, hb: *align(1) const ConsensusHeartbeatPayload) bool {
+        if (hb.term < self.current_term) return false;
+        if (hb.term > self.current_term or self.role == .candidate) {
+            self.current_term = hb.term;
+            self.role = .follower;
+            self.voted_for = null;
+            self.votes_granted = 0;
+        }
+        self.leader_node_id = hb.leader_node_id;
+        if (hb.fencing_epoch > self.fencing_epoch) {
+            self.fencing_epoch = hb.fencing_epoch;
+        }
+        self.timer_ticks = 0;
+        return true;
+    }
+};
+
 test "clusterd_protocol: signature verification, sequence replay, and epoch advancement" {
     const std_test = @import("std").testing;
     const secret = "catenary-cluster-master-secret";
@@ -328,5 +477,75 @@ test "clusterd_protocol: signature verification, sequence replay, and epoch adva
     // Monotonic within new epoch
     try validateMessageReplay(&epoch, &last_seq, 2, 2);
     try std_test.expectEqual(@as(u64, 2), last_seq);
+}
+
+test "clusterd_protocol: consensus quorum, election, and term step-down" {
+    const std_test = @import("std").testing;
+    var state = ConsensusState{
+        .cluster_size = 3,
+    };
+    try std_test.expectEqual(@as(u32, 2), state.quorum());
+    try std_test.expectEqual(ConsensusRole.follower, state.role);
+
+    // 1. Candidate start election
+    state.startElection(1);
+    try std_test.expectEqual(ConsensusRole.candidate, state.role);
+    try std_test.expectEqual(@as(u64, 1), state.current_term);
+    try std_test.expectEqual(@as(u32, 1), state.votes_granted);
+    try std_test.expect(!state.hasQuorum());
+
+    // 2. Stale vote reply rejected
+    const stale_reply = RequestVoteReplyPayload{
+        .term = 0,
+        .voter_node_id = 2,
+        .vote_granted = true,
+        .signature = @splat(0),
+    };
+    try std_test.expect(!state.handleVoteReply(&stale_reply));
+    try std_test.expectEqual(@as(u32, 1), state.votes_granted);
+
+    // 3. Quorum-granting vote reply from Node 2 (2 of 3 votes)
+    const valid_reply = RequestVoteReplyPayload{
+        .term = 1,
+        .voter_node_id = 2,
+        .vote_granted = true,
+        .signature = @splat(0),
+    };
+    try std_test.expect(state.handleVoteReply(&valid_reply));
+    try std_test.expectEqual(ConsensusRole.leader, state.role);
+    try std_test.expectEqual(@as(?u32, 1), state.leader_node_id);
+    try std_test.expectEqual(@as(u64, 1), state.fencing_epoch);
+
+    // 4. Discovering higher term in heartbeat causes step-down to follower
+    const higher_hb = ConsensusHeartbeatPayload{
+        .term = 2,
+        .leader_node_id = 3,
+        .commit_index = 0,
+        .fencing_epoch = 2,
+        .seq = 1,
+        .signature = @splat(0),
+    };
+    try std_test.expect(state.handleHeartbeat(&higher_hb));
+    try std_test.expectEqual(ConsensusRole.follower, state.role);
+    try std_test.expectEqual(@as(u64, 2), state.current_term);
+    try std_test.expectEqual(@as(?u32, 3), state.leader_node_id);
+    try std_test.expectEqual(@as(u64, 2), state.fencing_epoch);
+
+    // 5. Candidate tie-break on equal terms favors higher candidate ID
+    state.startElection(1);
+    try std_test.expectEqual(ConsensusRole.candidate, state.role);
+    try std_test.expectEqual(@as(u64, 3), state.current_term);
+
+    // Request from candidate with higher ID (2 > 1) wins vote and steps down candidate 1
+    const peer_candidate_req = RequestVotePayload{
+        .term = 3,
+        .candidate_node_id = 2,
+        .last_log_term = 0,
+        .last_log_index = 0,
+        .signature = @splat(0),
+    };
+    try std_test.expect(state.handleVoteRequest(&peer_candidate_req, 1));
+    try std_test.expectEqual(ConsensusRole.follower, state.role);
+    try std_test.expectEqual(@as(?u32, 2), state.voted_for);
 }
 
