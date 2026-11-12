@@ -193,4 +193,9 @@ test "varde_shell: all 14 commands execute, format output, and emit exact COM1 m
     varde_shell.dispatch("vm-restore 2 1");
     try testing.expectEqualStrings("varde_shell: executed 'vm-restore'\n", getMilestone());
     try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "VM 2 restored to generation 1.") != null);
+
+    // 17. Phase 13 Nested VMX L0 capability validation
+    varde_shell.dispatch("vm-nested-test 2");
+    try testing.expectEqualStrings("varde_shell: executed 'vm-nested-test'\n", getMilestone());
+    try testing.expect(std.mem.indexOf(u8, getHistoryLog(), "Nested VMX L0 capability validated for VM 2") != null);
 }

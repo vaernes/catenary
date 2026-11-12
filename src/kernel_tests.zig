@@ -12,6 +12,7 @@ test {
     _ = @import("vmm/vtpm.zig");
     _ = @import("vmm/uefi_firmware.zig");
     _ = @import("vmm/vm_snapshot.zig");
+    _ = @import("vmm/nested_vmx.zig");
     _ = @import("arch/x86_64/vmx.zig");
     _ = @import("user/tui/tui_tests.zig");
     _ = @import("user/tui/stress_tests.zig");

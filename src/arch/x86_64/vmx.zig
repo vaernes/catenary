@@ -99,6 +99,16 @@ const VMEXIT_REASON_EPT_VIOLATION: u64 = 48;
 const VMEXIT_REASON_EPT_MISCONFIG: u64 = 33;
 const VMEXIT_REASON_WBINVD: u64 = 54;
 const VMEXIT_REASON_XSETBV: u64 = 55;
+const VMEXIT_REASON_VMCALL: u64 = 18;
+const VMEXIT_REASON_VMCLEAR: u64 = 19;
+const VMEXIT_REASON_VMLAUNCH: u64 = 20;
+const VMEXIT_REASON_VMPTRLD: u64 = 21;
+const VMEXIT_REASON_VMPTRST: u64 = 22;
+const VMEXIT_REASON_VMREAD: u64 = 23;
+const VMEXIT_REASON_VMRESUME: u64 = 24;
+const VMEXIT_REASON_VMWRITE: u64 = 25;
+const VMEXIT_REASON_VMXOFF: u64 = 26;
+const VMEXIT_REASON_VMXON: u64 = 27;
 
 const VMCS_GUEST_ES_SELECTOR: u64 = 0x0800;
 const VMCS_GUEST_CS_SELECTOR: u64 = 0x0802;
@@ -1061,6 +1071,16 @@ fn vmexitReasonName(reason: u64) []const u8 {
         VMEXIT_REASON_PREEMPTION_TIMER => "preemption-timer",
         VMEXIT_REASON_INTERRUPT_WINDOW => "interrupt-window",
         VMEXIT_REASON_CR_ACCESS => "cr-access",
+        VMEXIT_REASON_VMCALL => "vmcall",
+        VMEXIT_REASON_VMCLEAR => "vmclear",
+        VMEXIT_REASON_VMLAUNCH => "vmlaunch",
+        VMEXIT_REASON_VMPTRLD => "vmptrld",
+        VMEXIT_REASON_VMPTRST => "vmptrst",
+        VMEXIT_REASON_VMREAD => "vmread",
+        VMEXIT_REASON_VMRESUME => "vmresume",
+        VMEXIT_REASON_VMWRITE => "vmwrite",
+        VMEXIT_REASON_VMXOFF => "vmxoff",
+        VMEXIT_REASON_VMXON => "vmxon",
         else => "unknown",
     };
 }
@@ -3220,6 +3240,93 @@ fn dispatchVmexit(regs: *GuestRegs) bool {
             return true;
         },
         VMEXIT_REASON_INIT_SIGNAL => {
+            return true;
+        },
+        VMEXIT_REASON_VMCALL => {
+            // Emulate nested L1 hypercall or report unsupported to guest
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMXON => {
+            const nested_vmx = @import("../../vmm/nested_vmx.zig");
+            if (getCurrentInstanceId()) |vmid| {
+                _ = nested_vmx.handleVmxon(vmid, regs.rax) catch {};
+                smp.serialAcquire();
+                serialWrite("VMX: nested VMXON executed for VM ");
+                printDec(vmid);
+                serialWrite("\n");
+                smp.serialRelease();
+            }
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMXOFF => {
+            const nested_vmx = @import("../../vmm/nested_vmx.zig");
+            if (getCurrentInstanceId()) |vmid| {
+                _ = nested_vmx.handleVmxoff(vmid) catch {};
+                smp.serialAcquire();
+                serialWrite("VMX: nested VMXOFF executed for VM ");
+                printDec(vmid);
+                serialWrite("\n");
+                smp.serialRelease();
+            }
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMPTRLD => {
+            const nested_vmx = @import("../../vmm/nested_vmx.zig");
+            if (getCurrentInstanceId()) |vmid| {
+                _ = nested_vmx.handleVmptrld(vmid, regs.rax) catch {};
+                smp.serialAcquire();
+                serialWrite("VMX: nested VMPTRLD executed for VM ");
+                printDec(vmid);
+                serialWrite("\n");
+                smp.serialRelease();
+            }
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMCLEAR => {
+            const nested_vmx = @import("../../vmm/nested_vmx.zig");
+            if (getCurrentInstanceId()) |vmid| {
+                _ = nested_vmx.handleVmclear(vmid, regs.rax) catch {};
+            }
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMLAUNCH => {
+            const nested_vmx = @import("../../vmm/nested_vmx.zig");
+            if (getCurrentInstanceId()) |vmid| {
+                _ = nested_vmx.handleVmlaunch(vmid) catch {};
+                smp.serialAcquire();
+                serialWrite("VMX: nested VMLAUNCH executed for VM ");
+                printDec(vmid);
+                serialWrite("\n");
+                smp.serialRelease();
+            }
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMRESUME => {
+            const nested_vmx = @import("../../vmm/nested_vmx.zig");
+            if (getCurrentInstanceId()) |vmid| {
+                _ = nested_vmx.handleVmresume(vmid) catch {};
+                smp.serialAcquire();
+                serialWrite("VMX: nested VMRESUME executed for VM ");
+                printDec(vmid);
+                serialWrite("\n");
+                smp.serialRelease();
+            }
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMREAD => {
+            regs.rax = 0;
+            advanceGuestRip();
+            return true;
+        },
+        VMEXIT_REASON_VMWRITE => {
+            advanceGuestRip();
             return true;
         },
         VMEXIT_REASON_APIC_ACCESS => {

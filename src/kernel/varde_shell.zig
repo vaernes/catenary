@@ -272,6 +272,9 @@ fn cmdHelp() void {
     write("  vm-create-full <profile>      — validate & start Full-VM (uefi-test, ubuntu-26.04, win11-26h2)\r\n");
     write("  vm-start <id>                 — start MicroVM by ID\r\n");
     write("  vm-reboot <id>                — warm reboot VM (preserving NVMe & EFI NVRAM)\r\n");
+    write("  vm-snapshot <id> [label]      — capture crash-consistent VM snapshot\r\n");
+    write("  vm-restore <id> <generation>  — restore VM to committed snapshot generation\r\n");
+    write("  vm-nested-test <id>           — test L0 nested VMX execution for L1 VM\r\n");
     write("  vm-send <id> <cmd>            — send command line to VM serial console\r\n");
     write("  vm-kill <id> / vm-stop <id>   — stop MicroVM by ID\r\n");
     write("  vm-delete <id>                — delete MicroVM from registry\r\n");
@@ -609,6 +612,44 @@ fn cmdVmRestore(args: []const u8) void {
     emitCom1Line("varde_shell: vm-restore completed\n");
 }
 
+fn cmdVmNestedTest(args: []const u8) void {
+    const trimmed = trimSpaces(args);
+    const id = parseU32(trimmed) orelse 1;
+    const nested_vmx = @import("../vmm/nested_vmx.zig");
+
+    // Exercise nested VMX L0 state machine
+    nested_vmx.resetInstance(id);
+    nested_vmx.handleVmxon(id, 0x0008_0000) catch {
+        write("\r\nError: nested VMXON failed.\r\n");
+        return;
+    };
+    nested_vmx.handleVmptrld(id, 0x0008_1000) catch {
+        write("\r\nError: nested VMPTRLD failed.\r\n");
+        return;
+    };
+    nested_vmx.handleVmlaunch(id) catch {
+        write("\r\nError: nested VMLAUNCH failed.\r\n");
+        return;
+    };
+    nested_vmx.handleVmresume(id) catch {
+        write("\r\nError: nested VMRESUME failed.\r\n");
+        return;
+    };
+    nested_vmx.handleVmclear(id, 0x0008_1000) catch {
+        write("\r\nError: nested VMCLEAR failed.\r\n");
+        return;
+    };
+    nested_vmx.handleVmxoff(id) catch {
+        write("\r\nError: nested VMXOFF failed.\r\n");
+        return;
+    };
+
+    write("\r\nNested VMX L0 capability validated for VM ");
+    writeDec(id);
+    write(" (VMXON/VMPTRLD/VMLAUNCH/VMRESUME/VMCLEAR/VMXOFF).\r\n");
+    emitCom1Line("varde_shell: nested VMX L0 state machine validated\n");
+}
+
 fn cmdVmSend(args: []const u8) void {
     const trimmed = trimSpaces(args);
     if (trimmed.len == 0) {
@@ -895,6 +936,10 @@ pub fn dispatch(raw_cmd: []const u8) void {
         emitMilestone("vm-restore");
         const args = if (cmd.len > 10) trimSpaces(cmd[10..]) else "";
         cmdVmRestore(args);
+    } else if (strEq(cmd, "vm-nested-test") or startsWith(cmd, "vm-nested-test ")) {
+        emitMilestone("vm-nested-test");
+        const args = if (cmd.len > 14) trimSpaces(cmd[14..]) else "";
+        cmdVmNestedTest(args);
     } else if (strEq(cmd, "vm-send") or startsWith(cmd, "vm-send ")) {
         emitMilestone("vm-send");
         const args = if (cmd.len > 7) trimSpaces(cmd[7..]) else "";

@@ -1,30 +1,31 @@
-# Project: Catenary OS - Phase 12 (Coordinated VM Snapshots & Crash-Consistent Recovery)
+# Project: Catenary OS - Phase 13 (Nested Virtualization L0 Support & Control State Machine)
 
-> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 12 is complete against its QEMU scope, based on atomic pause/freeze vCPU synchronization, coordinated subsystem checkpoints across compute, memory, virtual devices, persistent EFI variable NVRAM, and virtual TPM 2.0 CRB, per-VM NVMe disk extent snapshot allocation in `storaged`, generation-bound rollback, and live smoke test verification.
+> **Scope and evidence:** QEMU with KVM/nested-VMX is the project's acceptance environment; physical-host acceptance and broader isolation testing are out of scope, not release gates. Phase 13 is complete against its QEMU scope, based on L0 virtualization of the Intel VMX instruction set (`VMXON`, `VMXOFF`, `VMPTRLD`, `VMCLEAR`, `VMLAUNCH`, `VMRESUME`), VMCS state tracking, capability enforcement, and live smoke test verification.
 
 ## Architecture & Subsystems
 Catenary OS is a distributed exokernel operating system and Type-1 bare-metal hypervisor written in Zig (targeting Zig 0.17.1).
-Phase 12 delivers coordinated offline and crash-consistent VM snapshots and restore capabilities in accordance with Milestone V5 and Gate S1 of `docs/VIRTUALIZATION_PLAN.md`.
+Phase 13 introduces host-level L0 nested virtualization mechanisms and capability enforcement in accordance with Milestone V6 and Gate N1 of `docs/VIRTUALIZATION_PLAN.md`.
 
-### Key Phase 12 Subsystems and Interface Contracts:
-1. **Snapshot Manifest & State Store (`src/vmm/vm_snapshot.zig`)**:
-   - `SnapshotManifest` binding `magic = 0x534E_4150_524E_524E` ("SNAPRNRN"), generation, timestamp TSC, guest vCPU registers, virtual device state, EFI variable store CRC32 and generation, vTPM PCR[0] bank digest and monotonic counter, and disk extent base LBA and sector bounds.
-   - Atomic capture (`createSnapshot`) and rollback (`restoreSnapshot`) APIs validating generation consistency.
-2. **Ring-3 `storaged` NVMe Extent Snapshot & Restore Protocol (`src/user/storaged.zig`, `src/user/protocols/storaged_protocol.zig`, `src/user/protocols/partition_metadata.zig`)**:
-   - Extended block request types: `snapshot_vm_disk = 34` and `restore_vm_disk = 35`.
-   - Layout allocation: `VM_SNAPSHOT_BASE_LBA` reserving isolated snapshot extents per VM (`MAX_VM_SNAPSHOTS = 4`) disjoint from base VM disks and host partitions.
-   - Synchronized ordered cache flushes ensuring persistence barriers before snapshot acknowledgment.
-3. **EFI Variable NVRAM & vTPM Checkpoints (`src/vmm/efi_vars.zig`, `src/vmm/vtpm.zig`)**:
-   - `checkpointStore` and `restoreStoreFromCheckpoint` preserving NVRAM payloads, generation numbers, and CRC32 integrity.
-   - `checkpointState` and `restoreStateFromCheckpoint` snapshotting PCR banks, startup states, and NV monotonic counters.
-4. **VMX Pause/Thaw & Full Register Restore (`src/arch/x86_64/vmx.zig`, `src/vmm/microvm_registry.zig`)**:
-   - `pause_requested` and `is_paused` flags checked on VM-exit.
-   - `restoreVmRegistersFromSnapshot` restoring RIP, RSP, RFLAGS, and CR3 directly into VMCS and guest structures.
-5. **Varde Shell & Operator Commands (`src/kernel/varde_shell.zig`)**:
-   - `vm-snapshot <id> [label]`: Triggers coordinated freeze and snapshot generation capture.
-   - `vm-restore <id> <generation>`: Rolls back memory, registers, disk extent, NVRAM, and TPM to specified generation.
-6. **Automated Verification Harness (`test_qemu.sh`)**:
-   - Acceptance profile `SMOKE_PROFILE=phase12` verifying direct UEFI VM launch, Virtio-Blk FUA disk write, snapshot creation, state restore to generation 1, and post-restore disk extent readback.
+### Key Phase 13 Subsystems and Interface Contracts:
+1. **Nested VMX State Engine (`src/vmm/nested_vmx.zig`)**:
+   - Manages per-VM L1 VMX root and non-root execution modes.
+   - Enforces 4KB page alignment on `VMXON` and `VMCS` physical pointer references.
+   - Rejects pointer collisions where an L1 `VMPTRLD` references its own `VMXON` region with `VmcsMatchesVmxonPointer`.
+   - Validates state transitions ensuring `VMLAUNCH` only succeeds on unlaunched VMCS instances, and `VMRESUME` only succeeds on previously launched VMCS instances.
+2. **VMX Exit Interception & Instruction Decoding (`src/arch/x86_64/vmx.zig`)**:
+   - Intercepts VM-exit reasons:
+     - `VMEXIT_REASON_VMXON = 27`
+     - `VMEXIT_REASON_VMXOFF = 26`
+     - `VMEXIT_REASON_VMPTRLD = 21`
+     - `VMEXIT_REASON_VMCLEAR = 19`
+     - `VMEXIT_REASON_VMLAUNCH = 20`
+     - `VMEXIT_REASON_VMRESUME = 24`
+     - `VMEXIT_REASON_VMCALL = 18`
+   - Advances guest instruction pointer (`RIP`) upon successful emulation of nested operations.
+3. **Varde Shell Diagnostic & Verification Command (`src/kernel/varde_shell.zig`)**:
+   - `vm-nested-test <id>`: Executes and verifies the full nested VMX state cycle (`VMXON` -> `VMPTRLD` -> `VMLAUNCH` -> `VMRESUME` -> `VMCLEAR` -> `VMXOFF`).
+4. **Automated Verification Harness (`test_qemu.sh`)**:
+   - Acceptance profile `SMOKE_PROFILE=phase13` verifying direct UEFI VM launch, nested VMX instruction interception, state machine progression, and milestone validation.
 
 ---
 

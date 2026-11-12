@@ -40,6 +40,9 @@ SMOKE_PROFILE=phase11 ./test_qemu.sh
 # Exercise Phase 12 Coordinated VM Snapshots & Crash-Consistent Recovery across compute, memory, disk, NVRAM, and vTPM
 SMOKE_PROFILE=phase12 ./test_qemu.sh
 
+# Exercise Phase 13 Nested Virtualization L0 support, instruction state machine (VMXON/VMPTRLD/VMLAUNCH/VMRESUME/VMCLEAR/VMXOFF)
+SMOKE_PROFILE=phase13 ./test_qemu.sh
+
 # Verify storage fails closed when no NVMe device is present
 SMOKE_PROFILE=no-nvme ./test_qemu.sh
 
