@@ -3988,14 +3988,15 @@ pub fn reclaimInstanceById(instance_id: u32) bool {
     return reclaimInstanceResources(inst);
 }
 
-var vmx_reclaim_test_backing: [32][4096]u8 align(4096) = undefined;
-
 test "VM resource reclamation zeroes and frees EPT tables, guest leaves, and VMCS" {
-    @memset(std.mem.asBytes(&vmx_reclaim_test_backing), 0);
-    const hhdm = @intFromPtr(&vmx_reclaim_test_backing);
+    const TestState = struct {
+        var vmx_reclaim_test_backing: [32][4096]u8 align(4096) = undefined;
+    };
+    @memset(std.mem.asBytes(&TestState.vmx_reclaim_test_backing), 0);
+    const hhdm = @intFromPtr(&TestState.vmx_reclaim_test_backing);
     var entry = limine.MemmapEntry{
         .base = 0,
-        .length = @sizeOf(@TypeOf(vmx_reclaim_test_backing)),
+        .length = @sizeOf(@TypeOf(TestState.vmx_reclaim_test_backing)),
         .kind = limine.MEMMAP_USABLE,
     };
     var entries = [_]*limine.MemmapEntry{&entry};

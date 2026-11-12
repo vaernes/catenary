@@ -430,15 +430,8 @@ fn cmdVmCreateFull(args: []const u8) void {
         return;
     };
 
-    // Use slot 8 for pre-admission Secure Boot policy verification so running VMs are untouched
-    const probe_vmid: u32 = 8;
-    _ = efi_vars.initDefaultSecureBootStore(
-        probe_vmid,
-        uefi_firmware.getApprovedUefiImage(),
-        uefi_firmware.getRevokedUefiImage(),
-    );
-
-    uefi_firmware.validateFullVmAdmission(probe_vmid, kind, .{}) catch |err| {
+    // Pre-admission policy check uses an ephemeral trust store so no VM slots are polluted
+    uefi_firmware.validateFullVmAdmission(null, kind, .{}) catch |err| {
         const reason = switch (err) {
             error.MissingInstallerMedia => "missing-installer-media",
             error.InsufficientVcpus => "insufficient-vcpus",

@@ -600,32 +600,34 @@ pub fn handleVirtioBlkResponse(vmid: u32, head_idx: u16, io_status: u8) void {
 
 const limine = @import("../kernel/limine.zig");
 
-var test_backing: [16][4096]u8 align(4096) = undefined;
-var test_irq_count: usize = 0;
-
-fn testTranslateDiscontiguous(_: u32, gpa: u64) ?u64 {
-    const page = gpa & ~@as(u64, 0xFFF);
-    // Deliberately map GPA pages 0..3 to reversed host pages 4..1 so cross-page
-    // accesses fail if code assumes contiguous host physical memory.
-    return switch (page) {
-        0x1000 => 4 * pmm.PAGE_SIZE,
-        0x2000 => 3 * pmm.PAGE_SIZE,
-        0x3000 => 2 * pmm.PAGE_SIZE,
-        0x4000 => 1 * pmm.PAGE_SIZE,
-        else => null,
-    };
-}
-
-fn testRecordIrq(_: u32, _: u8) void {
-    test_irq_count += 1;
-}
-
 test "virtio-blk cross-page rings, failure completion, and event-idx suppression" {
-    @memset(std.mem.asBytes(&test_backing), 0);
-    const hhdm = @intFromPtr(&test_backing);
+    const TestState = struct {
+        var test_backing: [16][4096]u8 align(4096) = undefined;
+        var test_irq_count: usize = 0;
+
+        fn testTranslateDiscontiguous(_: u32, gpa: u64) ?u64 {
+            const page = gpa & ~@as(u64, 0xFFF);
+            // Deliberately map GPA pages 0..3 to reversed host pages 4..1 so cross-page
+            // accesses fail if code assumes contiguous host physical memory.
+            return switch (page) {
+                0x1000 => 4 * pmm.PAGE_SIZE,
+                0x2000 => 3 * pmm.PAGE_SIZE,
+                0x3000 => 2 * pmm.PAGE_SIZE,
+                0x4000 => 1 * pmm.PAGE_SIZE,
+                else => null,
+            };
+        }
+
+        fn testRecordIrq(_: u32, _: u8) void {
+            test_irq_count += 1;
+        }
+    };
+
+    @memset(std.mem.asBytes(&TestState.test_backing), 0);
+    const hhdm = @intFromPtr(&TestState.test_backing);
     var entry = limine.MemmapEntry{
         .base = 0,
-        .length = @sizeOf(@TypeOf(test_backing)),
+        .length = @sizeOf(@TypeOf(TestState.test_backing)),
         .kind = limine.MEMMAP_USABLE,
     };
     var entries = [_]*limine.MemmapEntry{&entry};
@@ -637,10 +639,10 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     pmm.init(&memmap, hhdm);
     for (1..5) |p| pmm.setBit(p);
 
-    test_irq_count = 0;
+    TestState.test_irq_count = 0;
     virtio_blk.init();
-    gpa_to_hpa_fn = testTranslateDiscontiguous;
-    inject_irq_fn = testRecordIrq;
+    gpa_to_hpa_fn = TestState.testTranslateDiscontiguous;
+    inject_irq_fn = TestState.testRecordIrq;
     defer {
         gpa_to_hpa_fn = null;
         inject_irq_fn = null;
@@ -715,7 +717,7 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     try std.testing.expectEqual(@as(u32, 0), readGuestInt(u32, hhdm, vmid, q.device_addr + 4).?);
     try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 8).?);
     try std.testing.expectEqual(@as(u16, 1), readGuestInt(u16, hhdm, vmid, q.device_addr + 4 + (4 * 8)).?);
-    try std.testing.expectEqual(@as(usize, 0), test_irq_count);
+    try std.testing.expectEqual(@as(usize, 0), TestState.test_irq_count);
 
     // Now test handleVirtioBlkResponse with IOERR when used_event matches old_used_idx (1):
     // must report used_len = 1 (not 513!) and trigger IRQ!
@@ -724,7 +726,7 @@ test "virtio-blk cross-page rings, failure completion, and event-idx suppression
     try std.testing.expectEqual(@as(u8, virtio_blk.VIRTIO_BLK_S_IOERR), readGuestInt(u8, hhdm, vmid, 0x1400).?);
     try std.testing.expectEqual(@as(u16, 2), readGuestInt(u16, hhdm, vmid, q.device_addr + 2).?);
     try std.testing.expectEqual(@as(u32, 1), readGuestInt(u32, hhdm, vmid, q.device_addr + 4 + 8 + 4).?);
-    try std.testing.expectEqual(@as(usize, 1), test_irq_count);
+    try std.testing.expectEqual(@as(usize, 1), TestState.test_irq_count);
 
     // Verify 2-descriptor chain validation: valid for FLUSH, invalid for IN/OUT
     _ = writeGuestInt(u32, hhdm, vmid, 0x1100, virtio_blk.VIRTIO_BLK_T_FLUSH);

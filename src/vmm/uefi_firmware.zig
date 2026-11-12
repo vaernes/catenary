@@ -101,7 +101,7 @@ pub const AdmissionError = error{
 };
 
 pub fn validateFullVmAdmission(
-    vmid: u32,
+    vmid: ?u32,
     kind: FullVmProfileKind,
     caps: HostVmCapabilities,
 ) AdmissionError!void {
@@ -119,11 +119,20 @@ pub fn validateFullVmAdmission(
         .uefi_revoked => getRevokedUefiImage(),
         else => getApprovedUefiImage(),
     };
-    efi_vars.verifyBootImage(vmid, image) catch |err| switch (err) {
-        error.EmptyTrustDatabase, error.InvalidVmId => return error.SecureBootEmptyTrustDb,
-        error.RevokedInDbx => return error.SecureBootRevokedInDbx,
-        error.NotInAllowedDb => return error.SecureBootNotInAllowedDb,
-    };
+    if (vmid) |id| {
+        efi_vars.verifyBootImage(id, image) catch |err| switch (err) {
+            error.EmptyTrustDatabase, error.InvalidVmId => return error.SecureBootEmptyTrustDb,
+            error.RevokedInDbx => return error.SecureBootRevokedInDbx,
+            error.NotInAllowedDb => return error.SecureBootNotInAllowedDb,
+        };
+    } else {
+        var ephemeral = efi_vars.createDefaultStore(getApprovedUefiImage(), getRevokedUefiImage());
+        efi_vars.verifyBootImageStore(&ephemeral, image) catch |err| switch (err) {
+            error.EmptyTrustDatabase, error.InvalidVmId => return error.SecureBootEmptyTrustDb,
+            error.RevokedInDbx => return error.SecureBootRevokedInDbx,
+            error.NotInAllowedDb => return error.SecureBootNotInAllowedDb,
+        };
+    }
 }
 
 pub fn buildResetVectorPage(out_page: *[UEFI_ROM_SIZE]u8) void {

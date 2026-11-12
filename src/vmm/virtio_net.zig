@@ -513,26 +513,28 @@ pub fn injectPacket(vmid: u32, data: []const u8) void {
 
 const limine = @import("../kernel/limine.zig");
 
-var net_test_backing: [16][4096]u8 align(4096) = undefined;
-
-fn netTestTranslateDiscontiguous(_: u32, gpa: u64) ?u64 {
-    const page = gpa & ~@as(u64, 0xFFF);
-    return switch (page) {
-        0x1000 => 4 * pmm.PAGE_SIZE,
-        0x2000 => 3 * pmm.PAGE_SIZE,
-        0x3000 => 2 * pmm.PAGE_SIZE,
-        0x4000 => 1 * pmm.PAGE_SIZE,
-        0x5000 => 5 * pmm.PAGE_SIZE,
-        else => null,
-    };
-}
-
 test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppression" {
-    @memset(std.mem.asBytes(&net_test_backing), 0);
-    const hhdm = @intFromPtr(&net_test_backing);
+    const TestState = struct {
+        var net_test_backing: [16][4096]u8 align(4096) = undefined;
+
+        fn netTestTranslateDiscontiguous(_: u32, gpa: u64) ?u64 {
+            const page = gpa & ~@as(u64, 0xFFF);
+            return switch (page) {
+                0x1000 => 4 * pmm.PAGE_SIZE,
+                0x2000 => 3 * pmm.PAGE_SIZE,
+                0x3000 => 2 * pmm.PAGE_SIZE,
+                0x4000 => 1 * pmm.PAGE_SIZE,
+                0x5000 => 5 * pmm.PAGE_SIZE,
+                else => null,
+            };
+        }
+    };
+
+    @memset(std.mem.asBytes(&TestState.net_test_backing), 0);
+    const hhdm = @intFromPtr(&TestState.net_test_backing);
     var entry = limine.MemmapEntry{
         .base = 0,
-        .length = @sizeOf(@TypeOf(net_test_backing)),
+        .length = @sizeOf(@TypeOf(TestState.net_test_backing)),
         .kind = limine.MEMMAP_USABLE,
     };
     var entries = [_]*limine.MemmapEntry{&entry};
@@ -551,7 +553,7 @@ test "virtio-net cross-page RX/TX chains, DIPC reclaim, and interrupt suppressio
     try std.testing.expect(microvm_registry.start(vmid));
 
     init();
-    gpa_to_hpa_fn = netTestTranslateDiscontiguous;
+    gpa_to_hpa_fn = TestState.netTestTranslateDiscontiguous;
     hhdm_offset = hhdm;
     var table: endpoint_table.EndpointTable = undefined;
     table.init();

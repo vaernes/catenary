@@ -160,21 +160,22 @@ pub fn getStore(vmid: u32) ?*VmEfiVarStore {
     return &stores[idx];
 }
 
-pub fn initDefaultSecureBootStore(vmid: u32, approved_image: []const u8, revoked_image: []const u8) bool {
-    const store = getStore(vmid) orelse return false;
-    if (!store.initialized) {
-        store.* = .{
-            .initialized = true,
-            .secure_boot_enabled = true,
-            .setup_mode = false,
-            .pk_enrolled = true,
-            .kek_enrolled = true,
-        };
+pub fn createDefaultStore(approved_image: []const u8, revoked_image: []const u8) VmEfiVarStore {
+    var store = VmEfiVarStore{
+        .initialized = true,
+        .secure_boot_enabled = true,
+        .setup_mode = false,
+        .pk_enrolled = true,
+        .kek_enrolled = true,
+    };
+    if (approved_image.len > 0) {
+        store.db_count = 1;
+        Sha256.hash(approved_image, &store.db_hashes[0], .{});
     }
-    store.db_count = 1;
-    Sha256.hash(approved_image, &store.db_hashes[0], .{});
-    store.dbx_count = 1;
-    Sha256.hash(revoked_image, &store.dbx_hashes[0], .{});
+    if (revoked_image.len > 0) {
+        store.dbx_count = 1;
+        Sha256.hash(revoked_image, &store.dbx_hashes[0], .{});
+    }
     store.crc32 = VmEfiVarStore.computePayloadCrc(.{
         .boot_order = store.boot_order,
         .boot0001 = store.boot0001,
@@ -182,6 +183,12 @@ pub fn initDefaultSecureBootStore(vmid: u32, approved_image: []const u8, revoked
         .generation = store.generation,
     });
     store.updateStatusFlags();
+    return store;
+}
+
+pub fn initDefaultSecureBootStore(vmid: u32, approved_image: []const u8, revoked_image: []const u8) bool {
+    const store = getStore(vmid) orelse return false;
+    store.* = createDefaultStore(approved_image, revoked_image);
     return true;
 }
 
@@ -203,8 +210,7 @@ pub fn enrollRevokedImage(vmid: u32, image: []const u8) bool {
     return true;
 }
 
-pub fn verifyBootImage(vmid: u32, image: []const u8) SecureBootError!void {
-    const store = getStore(vmid) orelse return error.InvalidVmId;
+pub fn verifyBootImageStore(store: *VmEfiVarStore, image: []const u8) SecureBootError!void {
     if (!store.secure_boot_enabled) {
         store.last_auth_result = 1;
         return;
@@ -238,6 +244,11 @@ pub fn verifyBootImage(vmid: u32, image: []const u8) SecureBootError!void {
         return error.NotInAllowedDb;
     }
     store.last_auth_result = 1;
+}
+
+pub fn verifyBootImage(vmid: u32, image: []const u8) SecureBootError!void {
+    const store = getStore(vmid) orelse return error.InvalidVmId;
+    return verifyBootImageStore(store, image);
 }
 
 pub fn resetForReboot(vmid: u32) void {

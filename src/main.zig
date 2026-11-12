@@ -175,7 +175,6 @@ fn initUartCom1() void {
     outb(0x3FC, 0x03);
 }
 
-var thread_a_id: u32 = undefined;
 var timer_initialized_early: bool = false;
 
 fn printHardeningState(name: []const u8, enabled: bool, supported: bool) void {
@@ -259,23 +258,6 @@ export fn memcpy(dest: [*]u8, src: [*]const u8, n: usize) [*]u8 {
         dest[i] = src[i];
     }
     return dest;
-}
-
-fn threadA() void {
-    arch.cpu.sti();
-    while (true) {
-        if (scheduler.receive() != null) {}
-        scheduler.schedule();
-        arch.cpu.pause();
-    }
-}
-
-fn threadB() void {
-    arch.cpu.sti();
-    while (true) {
-        scheduler.schedule();
-        arch.cpu.pause();
-    }
 }
 
 var hhdm_offset_global: u64 = 0;
@@ -486,21 +468,6 @@ pub export fn _kernel_main() callconv(.c) noreturn {
         }
     } else {
         bootLog("Memmap request failed.\n");
-    }
-
-    if (!build_options.vmm_active) {
-        bootLog("Scheduler: starting demo worker threads.\n");
-        thread_a_id = scheduler.spawn(threadA, "kernel/threadA") catch |err| {
-            bootLog("Spawn A failed: ");
-            bootLog(@errorName(err));
-            bootLog("\n");
-            while (true) arch.cpu.halt();
-        };
-        _ = scheduler.spawn(threadB, "kernel/threadB") catch |err| {
-            bootLog("Spawn B failed: ");
-            bootLog(@errorName(err));
-            bootLog("\n");
-        };
     }
 
     if (!timer_initialized_early) {
